@@ -1,4 +1,10 @@
+import atexit
+import fcntl
 import logging
+import os
+import sys
+
+from telegram.error import Conflict, NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -32,9 +38,72 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("main")
 MY_CHAT_ID = 1617274846
 
+LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
+_lock_file = None
+
+
+def acquire_single_instance_lock():
+    """
+    Не даём запустить второй экземпляр бота: иначе Telegram отдаёт
+    Conflict: terminated by other getUpdates request.
+    """
+    global _lock_file
+    _lock_file = open(LOCK_PATH, "a+")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        other = ""
+        try:
+            _lock_file.seek(0)
+            other = _lock_file.read().strip()
+        except Exception:
+            pass
+        log.error(
+            "❌ Бот уже запущен%s. Второй экземпляр остановлен, чтобы не ловить "
+            "Conflict от Telegram. Проверьте: systemctl status <юнит> и ps aux | grep main.py",
+            f" (PID {other})" if other else ""
+        )
+        sys.exit(1)
+
+    _lock_file.seek(0)
+    _lock_file.truncate()
+    _lock_file.write(str(os.getpid()))
+    _lock_file.flush()
+    atexit.register(_release_lock)
+
+
+def _release_lock():
+    global _lock_file
+    if _lock_file is None:
+        return
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_UN)
+        _lock_file.close()
+    except Exception:
+        pass
+    try:
+        os.unlink(LOCK_PATH)
+    except Exception:
+        pass
+    _lock_file = None
+
 
 async def on_error(update, context):
-    log.exception("Unhandled exception in telegram application", exc_info=context.error)
+    err = context.error
+
+    if isinstance(err, Conflict):
+        # Где-то поднят второй экземпляр бота — стек трейс тут бесполезен
+        log.error(
+            "❌ Conflict: getUpdates перехвачен другим экземпляром бота. "
+            "Оставьте только один процесс (systemctl stop / pkill -f main.py)."
+        )
+        return
+
+    if isinstance(err, NetworkError):
+        log.warning(f"Сетевая ошибка Telegram: {err}")
+        return
+
+    log.exception("Unhandled exception in telegram application", exc_info=err)
 
 
 async def custom_text_handler(update, context):
@@ -53,6 +122,7 @@ async def custom_text_handler(update, context):
 
 
 def main():
+    acquire_single_instance_lock()
     init_db()
 
     if pt.init_trading():
@@ -75,7 +145,7 @@ def main():
     schedule_jobs(app, cid=MY_CHAT_ID)
 
     try:
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         log.info("🛑 Bot stopped by user")
     except Exception:

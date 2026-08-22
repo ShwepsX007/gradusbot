@@ -460,41 +460,101 @@ def get_event_markets(slug: str) -> Optional[dict]:
         return None
 
 
+# Токены без стакана (закрытый/неразмещённый рынок) — не долбим API каждые 20 секунд
+_NO_BOOK_CACHE = {}
+_NO_BOOK_TTL = 600  # секунд
+
+
+def _is_no_orderbook_error(err) -> bool:
+    txt = _extract_error_text(err).lower()
+    return "no orderbook" in txt or "orderbook exists" in txt or "404" in txt
+
+
+def has_orderbook(token_id: str) -> bool:
+    """False, если по токену заведомо нет стакана (запомнено ранее)."""
+    ts = _NO_BOOK_CACHE.get(str(token_id))
+    if ts is None:
+        return True
+    if time.time() - ts > _NO_BOOK_TTL:
+        _NO_BOOK_CACHE.pop(str(token_id), None)
+        return True
+    return False
+
+
+def _mark_no_orderbook(token_id: str, quiet: bool):
+    tid = str(token_id)
+    if not quiet:
+        log.info(f"ℹ️ Для токена {tid[:14]}… стакана нет (рынок закрыт или не размещён на CLOB). "
+                 f"Пропускаю запросы на {_NO_BOOK_TTL // 60} мин.")
+    _NO_BOOK_CACHE[tid] = time.time()
+
+
+def _parse_book_payload(resp) -> Optional[dict]:
+    if hasattr(resp, "bids") and hasattr(resp, "asks"):
+        return {
+            "bids": [{"price": float(b.price), "size": float(b.size)} for b in resp.bids],
+            "asks": [{"price": float(a.price), "size": float(a.size)} for a in resp.asks]
+        }
+    if isinstance(resp, dict):
+        return {
+            "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in resp.get("bids", [])],
+            "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in resp.get("asks", [])]
+        }
+    return None
+
+
 def get_order_book(token_id: str) -> Optional[dict]:
     """
-    Получает реальный стакан (bids и asks) для конкретного токена с Polymarket CLOB.
-    Добавлено для работы со стратегиями.
+    Реальный стакан (bids/asks) по токену.
+    Возвращает None, если стакана нет (404) или запрос не удался.
     """
     global _client
+
+    tid = str(token_id or "").strip()
+    if not tid:
+        return None
+
+    # id токена CLOB — это длинное десятичное число. condition_id (0x...) стаканов не имеет.
+    if tid.startswith("0x") or not tid.isdigit():
+        if has_orderbook(tid):
+            log.info(f"ℹ️ {tid[:14]}… не является CLOB token_id (похоже на condition_id) — стакан не запрашиваю.")
+        _NO_BOOK_CACHE[tid] = time.time()
+        return None
+
+    if not has_orderbook(tid):
+        return None
+
     if _client is None:
         log.error("ClobClient не инициализирован для получения стакана")
         return None
+
     try:
-        resp = _client.get_order_book(str(token_id))
-        if hasattr(resp, "bids") and hasattr(resp, "asks"):
-            return {
-                "bids": [{"price": float(b.price), "size": float(b.size)} for b in resp.bids],
-                "asks": [{"price": float(a.price), "size": float(a.size)} for a in resp.asks]
-            }
-        elif isinstance(resp, dict):
-            return {
-                "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in resp.get("bids", [])],
-                "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in resp.get("asks", [])]
-            }
-        return None
+        book = _parse_book_payload(_client.get_order_book(tid))
+        if book is not None:
+            return book
     except Exception as e:
+        if _is_no_orderbook_error(e):
+            # Штатная ситуация: рынок закрыт/разрешён. HTTP-фолбэк даст тот же 404 — не дублируем.
+            _mark_no_orderbook(tid, quiet=False)
+            return None
         log.warning(f"Ошибка получения стакана через SDK: {e}. Пробую через HTTP...")
-        try:
-            r = requests.get(f"{HOST}/book", params={"token_id": str(token_id)}, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                return {
-                    "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in data.get("bids", [])],
-                    "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in data.get("asks", [])]
-                }
-        except Exception as ex:
-            log.error(f"HTTP ошибка получения стакана: {ex}")
-        return None
+
+    try:
+        r = requests.get(f"{HOST}/book", params={"token_id": tid}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in data.get("bids", [])],
+                "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in data.get("asks", [])]
+            }
+        if r.status_code == 404:
+            _mark_no_orderbook(tid, quiet=False)
+            return None
+        log.warning(f"HTTP /book вернул {r.status_code} для {tid[:14]}…")
+    except Exception as ex:
+        log.error(f"HTTP ошибка получения стакана: {ex}")
+
+    return None
 
 
 # =========================================================

@@ -12,7 +12,7 @@ from database import (
     add_station_history, update_station, get_station_history,
     add_market_history, update_market,
     get_positions, remove_position, add_trade_history,
-    get_bindings, add_position, update_position_size,
+    get_bindings, add_position, update_position_size, update_position_limits,
     get_binding_setting, get_station,
 )
 from utils import fetch_market
@@ -383,6 +383,47 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
     }
 
 
+async def _handle_missing_book(context, cid, pos):
+    """
+    Стакан по позиции недоступен. Пара сбоев подряд — норм, но если рынок закрыт,
+    выключаем авто-SL/TP для этой позиции, чтобы не долбить API и не спамить логи.
+    """
+    key = f"pos_{pos['id']}_nobook"
+    try:
+        misses = int(get_setting(key, "0") or 0) + 1
+    except (TypeError, ValueError):
+        misses = 1
+    set_setting(key, str(misses))
+
+    if misses < 3:
+        return
+
+    info = pt.get_market_info(pos["token_id"])
+    market_dead = bool(info and (info.get("closed") or not info.get("accepting_orders")))
+
+    # Гасим авто-выход: позиция остаётся в трекере, но джоб её больше не трогает
+    update_position_limits(pos["id"], sl=0, tp=0)
+    set_setting(key, "0")
+
+    reason = (
+        "рынок закрыт или уже разрешён" if market_dead
+        else "стакан недоступен (нет ордербука по токену)"
+    )
+    log.info(f"Авто-SL/TP отключён для позиции {pos['id']}: {reason}")
+
+    await context.bot.send_message(
+        chat_id=cid,
+        text=(
+            f"ℹ️ *Авто-SL/TP отключён для позиции*\n\n"
+            f"📌 {pos.get('question', '')}\n"
+            f"Причина: {reason}.\n"
+            f"Позиция осталась в трекере — закройте её вручную или уберите из списка "
+            f"кнопкой «🗑 Убрать из трекера»."
+        ),
+        parse_mode="Markdown"
+    )
+
+
 async def job_positions(context: ContextTypes.DEFAULT_TYPE):
     """
     Автоматический контроль открытых позиций: SL / TP по реальному стакану.
@@ -409,8 +450,13 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
             side = str(pos.get("side", "BUY")).upper()
             exit_side = "SELL" if side == "BUY" else "BUY"
             best_price, _ = _best_price_from_book(pos["token_id"], exit_side)
+
             if best_price is None:
+                # Стакана нет: рынок закрыт/разрешён либо временный сбой API.
+                await _handle_missing_book(context, cid, pos)
                 continue
+
+            set_setting(f"pos_{pos['id']}_nobook", "0")
 
             cur_cents = round(best_price * 100, 1)
 
