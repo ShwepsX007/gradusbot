@@ -1,0 +1,7 @@
+python-telegram-bot[job-queue]>=21.0
+requests
+matplotlib
+py-clob-client-v2>=1.0.1
+eth-account
+web3
+python-dotenv
