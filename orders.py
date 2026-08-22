@@ -9,8 +9,8 @@ from database import (
     get_setting
 )
 
-from bot.state import us
-from bot.keyboards import back
+from state import us
+from keyboards import back
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +103,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.edit_message_text("⏳ Закрываю позицию рыночным FAK...")
 
-        from bot.jobs import execute_exit, _best_price_from_book
+        from jobs import execute_exit, _best_price_from_book
         from database import get_setting as _get_setting, update_position_size
 
         side = str(pos.get("side", "BUY")).upper()

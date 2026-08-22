@@ -16,8 +16,8 @@ from database import (
 import strategies as strategies_mod
 from strategies import STRATEGIES
 
-from bot.state import us
-from bot.keyboards import api_settings_kb, trade_kb, back
+from state import us
+from keyboards import api_settings_kb, trade_kb, back
 
 log = logging.getLogger("bot")
 

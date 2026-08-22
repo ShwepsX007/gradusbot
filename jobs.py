@@ -16,7 +16,7 @@ from database import (
     get_binding_setting, get_station,
 )
 from utils import fetch_market
-from bot.formatters import fetch_station_data, format_bound_markets_block
+from formatters import fetch_station_data, format_bound_markets_block
 from strategies import STRATEGIES, sort_asks, sort_bids
 import polymarket_trading as pt
 

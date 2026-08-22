@@ -2,7 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.keyboards import REPLY_KB
+from keyboards import REPLY_KB
 
 log = logging.getLogger("bot")
 

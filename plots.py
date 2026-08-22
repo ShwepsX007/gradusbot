@@ -4,7 +4,7 @@ from telegram.ext import ContextTypes
 from database import get_markets, get_market, get_stations, get_station, get_station_history, get_market_history
 from utils import generate_plot
 
-from bot.state import icon
+from state import icon
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):

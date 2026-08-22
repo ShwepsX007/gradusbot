@@ -10,10 +10,10 @@ from telegram.ext import (
 from config import TOKEN
 from database import init_db
 
-from bot.handlers.common import cmd_start
-from bot.handlers.text import on_text
-from bot.handlers import on_callback
-from bot.handlers.settings import handle_text_input  # Импортируем обработчик ручного ввода настроек
+from common import cmd_start
+from text import on_text
+from handlers import on_callback
+from settings import handle_text_input  # Импортируем обработчик ручного ввода настроек
 
 import polymarket_trading as pt
 
@@ -71,7 +71,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Подключаем наш умный планировщик из jobs.py
-    from bot.jobs import schedule_jobs
+    from jobs import schedule_jobs
     schedule_jobs(app, cid=MY_CHAT_ID)
 
     try:

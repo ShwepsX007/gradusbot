@@ -7,8 +7,8 @@ from telegram.ext import ContextTypes
 
 from database import get_stations, get_markets, get_market, get_station, get_station_history, get_setting
 from utils import fetch_metar, fetch_weather, fetch_market
-from bot.formatters import format_weather_full, format_bound_markets_block # Добавлен импорт
-from bot.keyboards import chk_kb, back
+from formatters import format_weather_full, format_bound_markets_block # Добавлен импорт
+from keyboards import chk_kb, back
 
 log = logging.getLogger("bot")
 

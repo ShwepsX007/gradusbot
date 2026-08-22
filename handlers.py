@@ -2,20 +2,18 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.state import us
-from bot.handlers.common import send_internal_error
+from state import us
+from common import send_internal_error
 
-from bot.handlers import (
-    menu,
-    stations,
-    markets,
-    checks,
-    trade,
-    orders,
-    settings as settings_h,
-    poly_api,
-    plots,
-)
+import menu
+import stations
+import markets
+import checks
+import trade
+import orders
+import settings as settings_h
+import poly_api
+import plots
 
 log = logging.getLogger("bot")
 

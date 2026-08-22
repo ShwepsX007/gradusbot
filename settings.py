@@ -2,8 +2,8 @@ from telegram import Update, ForceReply
 from telegram.ext import ContextTypes
 import telegram.error
 from database import set_setting, get_setting
-from bot.keyboards import settings_kb, notif_kb
-from bot.jobs import schedule_jobs
+from keyboards import settings_kb, notif_kb
+from jobs import schedule_jobs
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -17,7 +17,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Ключи CheckWX (ВАЖНО: проверяем до общего smet_cwx_) ===
     if d == "smet_cwx_key":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_cwx_api_key"
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -27,7 +27,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if d == "smet_cwx_keys":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_cwx_api_keys"
         cur = get_setting("checkwx_api_keys", "")
         cur_show = cur if cur else "(пусто)"
@@ -90,7 +90,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("smet_pr_"):
         set_setting("metar_pred_window", d[8:])
     elif d == "smet_prman":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_metar_pred_window"
         await context.bot.send_message(
             chat_id=update.effective_chat.id,

@@ -4,8 +4,8 @@ from telegram.ext import ContextTypes
 
 from database import get_markets, get_market, get_setting, add_position
 
-from bot.state import us
-from bot.keyboards import back
+from state import us
+from keyboards import back
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):

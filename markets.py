@@ -11,8 +11,8 @@ from utils import (
     extract_code_from_wu, extract_api_url, extract_code_from_api,
 )
 
-from bot.state import us, icon
-from bot.keyboards import mk_kb, back
+from state import us, icon
+from keyboards import mk_kb, back
 
 
 def _build_toggle_kb(markets):

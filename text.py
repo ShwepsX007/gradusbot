@@ -12,11 +12,11 @@ from utils import (
     extract_code_from_wu, extract_api_url, extract_code_from_api,
 )
 
-from bot.state import us
-from bot.keyboards import (
+from state import us
+from keyboards import (
     REPLY_KB, st_kb, mk_kb, chk_kb, trade_kb, settings_kb, notif_kb, back
 )
-from bot.handlers.common import send_internal_error
+from common import send_internal_error
 
 log = logging.getLogger("bot")
 
