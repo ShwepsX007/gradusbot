@@ -48,6 +48,68 @@ def extract_temp_from_title(text):
     return float(m.group(0)) if m else None
 
 
+def sort_asks(asks):
+    """Аски по возрастанию цены (best ask первый)."""
+    out = []
+    for a in asks or []:
+        try:
+            out.append({"price": float(a["price"]), "size": float(a["size"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(out, key=lambda x: x["price"])
+
+
+def sort_bids(bids):
+    """Биды по убыванию цены (best bid первый)."""
+    out = []
+    for b in bids or []:
+        try:
+            out.append({"price": float(b["price"]), "size": float(b["size"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(out, key=lambda x: x["price"], reverse=True)
+
+
+def walk_book_by_cash(asks, budget_usd, worst_price):
+    """Сколько шар реально возьмём на budget_usd, не выходя за worst_price."""
+    shares = 0.0
+    cash = 0.0
+    for lvl in asks:
+        if worst_price is not None and lvl["price"] > worst_price + 1e-9:
+            break
+        lvl_cash = lvl["price"] * lvl["size"]
+        remaining = budget_usd - cash
+        if remaining <= 1e-9:
+            break
+        if lvl_cash <= remaining:
+            cash += lvl_cash
+            shares += lvl["size"]
+        else:
+            shares += remaining / lvl["price"]
+            cash += remaining
+            break
+    vwap = (cash / shares) if shares > 0 else 0.0
+    return {"shares": round(shares, 4), "cash": round(cash, 4), "vwap": round(vwap, 4)}
+
+
+def walk_book_by_shares(asks, want_shares, worst_price):
+    """Сколько шар доступно в пределах worst_price и по какой средней цене."""
+    shares = 0.0
+    cash = 0.0
+    for lvl in asks:
+        if worst_price is not None and lvl["price"] > worst_price + 1e-9:
+            break
+        take = min(lvl["size"], want_shares - shares)
+        if take <= 0:
+            break
+        shares += take
+        cash += take * lvl["price"]
+        if shares >= want_shares - 1e-9:
+            break
+    vwap = (cash / shares) if shares > 0 else 0.0
+    return {"shares": round(shares, 4), "cash": round(cash, 4), "vwap": round(vwap, 4)}
+
+
 class TemperatureSniperStrategy(BaseStrategy):
     name = "Метео Снайпер (Стакан)"
     description = "Осуществляет вход по реальному аску из стакана, если погодные условия удовлетворены."
@@ -104,45 +166,84 @@ class TemperatureSniperStrategy(BaseStrategy):
             log.warning(f"Стакан для токена {token_id} пуст или временно недоступен.")
             return None
 
-        # Первая строчка асков — это Best Ask (наилучшая цена, по которой мы купим мгновенно)
-        best_ask = book["asks"][0]
-        best_ask_price = float(best_ask["price"])  # Например, 0.54
-        best_ask_size = float(best_ask["size"])    # Доступный объем на этом уровне цен
-
-        ask_cents = best_ask_price * 100.0
-
-        # Контроль цены: если реальный аск хуже нашего порога — пропускаем сделку
-        if ask_cents > entry_threshold:
-            log.info(f"Пропуск: Реальный Best Ask ({ask_cents}¢) превышает установленный порог ({entry_threshold}¢)")
+        asks = sort_asks(book["asks"])
+        if not asks:
             return None
 
-        # Расчет размера позиции
+        best_ask_price = float(asks[0]["price"])
+        best_ask_size = float(asks[0]["size"])
+        ask_cents = best_ask_price * 100.0
+
+        # Худшая допустимая цена = порог входа. Это slippage guard для FOK/FAK.
+        worst_price = entry_threshold / 100.0
+
+        # Контроль цены: если даже лучший аск хуже порога — сделки нет
+        if ask_cents > entry_threshold + 1e-9:
+            log.info(f"Пропуск: Best Ask ({round(ask_cents, 2)}¢) превышает порог ({entry_threshold}¢)")
+            return None
+
+        # Считаем исполнение ПО ВСЕЙ ГЛУБИНЕ стакана до порога, а не только по первому уровню
         if budget_mode == "dollars":
-            actual_size = round(size / best_ask_price, 1)
-            actual_size = max(1.0, actual_size)
+            budget_usd = float(size)
+            fill = walk_book_by_cash(asks, budget_usd, worst_price)
+            if fill["shares"] <= 0:
+                log.info("Пропуск: нет ликвидности в пределах порога цены.")
+                return None
+
+            # Ликвидности не хватает на весь бюджет — FOK гарантированно отклонится,
+            # поэтому уменьшаем сумму до реально доступной.
+            amount_usd = round(min(budget_usd, fill["cash"]), 2)
+            if amount_usd < 1.0:
+                log.info(f"Пропуск: доступный объём в пределах порога слишком мал ({amount_usd}$).")
+                return None
+
+            order_style = "MARKET"          # MarketOrderArgs, amount в долларах
+            order_type = "FOK"
+            est_shares = round(fill["shares"] * (amount_usd / fill["cash"]), 2) if fill["cash"] else 0.0
+            est_price = fill["vwap"]
+            amount = amount_usd
         else:
-            actual_size = size
+            want_shares = float(size)
+            fill = walk_book_by_shares(asks, want_shares, worst_price)
+            if fill["shares"] + 1e-9 < want_shares:
+                log.info(
+                    f"Пропуск: в пределах порога {entry_threshold}¢ доступно только "
+                    f"{fill['shares']} шар из {want_shares} — FOK не исполнится."
+                )
+                return None
 
-        # Логирование нехватки ликвидности
-        if best_ask_size < actual_size:
-            log.warning(f"Ликвидности на Best Ask недостаточно ({best_ask_size} из {actual_size}). Будет частичное исполнение.")
+            order_style = "LIMIT_FOK"       # ровно N шар по цене не хуже порога
+            order_type = "FOK"
+            est_shares = want_shares
+            est_price = fill["vwap"]
+            amount = want_shares
 
-        # Выставляем ордер с проскальзыванием в +1 цент для защиты от мгновенного прострела, но не выше лимита
-        slippage_price = min(best_ask_price + 0.01, entry_threshold / 100.0)
+        est_cents = round(est_price * 100.0, 1)
+
+        if best_ask_size < est_shares:
+            log.info(
+                f"Первый уровень тоньше заявки ({best_ask_size} из {est_shares}) — "
+                f"исполнение уйдёт глубже в стакан, расчётный VWAP {est_cents}¢."
+            )
 
         reason = (
             f"Погодный триггер сработал: {entry_temp}°{unit}. "
-            f"Реальный стакан Best Ask: {round(ask_cents, 1)}¢ <= Порога {entry_threshold}¢. "
-            f"Доступный объем: {best_ask_size}"
+            f"Best Ask {round(ask_cents, 1)}¢, расчётный VWAP по стакану {est_cents}¢ "
+            f"<= порога {entry_threshold}¢. Вход рыночным {order_type}."
         )
 
         return {
             'action': 'BUY',
             'token_id': token_id,
             'side': 'BUY',
-            'price': slippage_price,
-            'expected_fill_cents': int(ask_cents),
-            'size': actual_size,
+            'order_style': order_style,       # MARKET (в $) или LIMIT_FOK (в шарах)
+            'order_type': order_type,         # FOK — всё или ничего
+            'amount': amount,                 # $ для MARKET, шары для LIMIT_FOK
+            'worst_price': worst_price,       # slippage guard, не целевая цена
+            'price': worst_price,             # обратная совместимость
+            'expected_fill_cents': int(round(est_cents)),
+            'expected_vwap_cents': est_cents,
+            'size': est_shares,
             'question': best_option.get("question", market_data.get("name", "")),
             'unit': unit,
             'reason': reason,

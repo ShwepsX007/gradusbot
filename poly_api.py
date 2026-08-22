@@ -43,6 +43,7 @@ def _bind_params(bid):
         "target":       get_binding_setting(bid, "target", "18"),
         "thresh":       get_binding_setting(bid, "thresh", "40"),
         "tp":           get_binding_setting(bid, "tp", "40"),
+        "sl":           get_binding_setting(bid, "sl", "0"),
         "size":         get_binding_setting(bid, "size", "10"),
         "unit":         (get_binding_setting(bid, "unit", "C") or "C").upper(),
         "strategy":     strat,
@@ -92,6 +93,7 @@ def _bind_card(bid):
     msg += (
         f"🚧 Порог входа (макс цена): *{p['thresh']}¢*\n"
         f"💸 Профит (+ к цене): *+{p['tp']}¢*\n"
+        f"🛑 Стоп-лосс (− от цены): *{('-' + str(p['sl']) + '¢') if str(p['sl']) not in ('0', '') else 'выкл'}*\n"
         f"📦 Объём: *{p['size']}* ({bm})\n"
     )
 
@@ -120,7 +122,8 @@ def _bind_card(bid):
 
     kb.append([
         Btn(f"🚧 Порог: {p['thresh']}¢", callback_data=f"stbind_edit_{bid}_thresh"),
-        Btn(f"💸 TP: +{p['tp']}¢", callback_data=f"stbind_edit_{bid}_tp")
+        Btn(f"💸 TP: +{p['tp']}¢", callback_data=f"stbind_edit_{bid}_tp"),
+        Btn(f"🛑 SL: -{p['sl']}¢", callback_data=f"stbind_edit_{bid}_sl")
     ])
 
     bm_label = "» 💵 $ «" if p["budget_mode"] == "dollars" else "💵 $"
@@ -460,7 +463,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bid = int(bid_str)
         except:
             return await q.answer("Ошибка", show_alert=True)
-        if param not in ("target", "thresh", "tp", "size", "entry_temp", "stop_temp"):
+        if param not in ("target", "thresh", "tp", "sl", "size", "entry_temp", "stop_temp"):
             return await q.answer("Неизвестный параметр", show_alert=True)
 
         s["state"] = f"wait_bind_{param}"
@@ -473,7 +476,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "entry_temp": f"🎯 Введите *температуру входа в °{unit}*:",
             "stop_temp":  f"🛑 Введите *стоп температуру в °{unit}* (при достижении — закрытие):",
             "thresh":     "🚧 Введите *порог входа* в центах (1–99):",
-            "tp":         "💸 Введите *профит* в центах (+ к цене входа):",
+            "tp":         "💸 Введите *профит* в центах (+ к цене входа), 0 — выключить:",
+            "sl":         "🛑 Введите *стоп-лосс* в центах (− от цены входа), 0 — выключить:",
             "size":       "📦 Введите *объём* (в шарах или долларах — зависит от выбранного режима):"
         }
         return await _safe_edit(

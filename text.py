@@ -126,9 +126,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     val = float(text.replace(",", "."))
                     if val <= 0:
                         raise ValueError
-                elif param in ("thresh", "tp"):
+                elif param == "thresh":
                     val = int(text)
                     if not (1 <= val <= 99):
+                        raise ValueError
+                elif param in ("tp", "sl"):
+                    val = int(text)
+                    if not (0 <= val <= 99):
                         raise ValueError
                 else:
                     raise ValueError

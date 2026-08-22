@@ -99,6 +99,8 @@ def init_db():
         ("checkwx_default_window", "10"),
         ("checkwx_default_lead", "5"),
         ("market_notifications", "1"),
+        ("pos_interval", "20"),          # Интервал проверки SL/TP по стакану
+        ("exit_slippage_cents", "2"),    # Запас цены для FAK-выхода, центы
         ("demo_mode", "0"),
         ("order_timeout", "20"),
         ("order_retries", "3"),
@@ -272,6 +274,10 @@ def get_position_by_id(pid):
 
 def remove_position(pid):
     with get_db() as c: c.execute("DELETE FROM active_positions WHERE id=?", (pid,))
+
+def update_position_size(pid, size):
+    """Уменьшает объём позиции после частичного исполнения выхода (FAK)."""
+    with get_db() as c: c.execute("UPDATE active_positions SET size=? WHERE id=?", (size, pid))
 
 def update_position_limits(pid, sl, tp):
     with get_db() as c: c.execute("UPDATE active_positions SET sl=?, tp=? WHERE id=?", (sl, tp, pid))

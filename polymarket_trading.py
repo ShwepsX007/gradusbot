@@ -525,8 +525,88 @@ def get_balance() -> Optional[float]:
 # ORDER PLACEMENT CORE
 # =========================================================
 
-def _post_order_with_client(client, token_id, side: str, price: float, size: float):
+def _resolve_order_type(order_type):
+    """
+    Возвращает (enum_or_none, "FOK"/"FAK"/"GTC"/"GTD").
+    Работает даже если в установленной версии SDK нет OrderType.
+    """
+    name = str(order_type or "GTC").upper()
+    if name not in ("GTC", "GTD", "FOK", "FAK"):
+        name = "GTC"
+    try:
+        from py_clob_client_v2.clob_types import OrderType
+        return getattr(OrderType, name), name
+    except Exception:
+        return None, name
+
+
+def _get_tick_size(token_id) -> str:
+    """Тик рынка. Нужен для корректной подписи ордера (FOK/FAK особенно чувствительны)."""
+    global _client
+    try:
+        if _client is not None:
+            ts = _client.get_tick_size(str(token_id))
+            if ts:
+                return str(ts)
+    except Exception as e:
+        log.debug(f"get_tick_size via SDK failed: {e}")
+    try:
+        r = requests.get(f"{HOST}/tick-size", params={"token_id": str(token_id)}, timeout=8)
+        if r.status_code == 200:
+            ts = r.json().get("minimum_tick_size")
+            if ts:
+                return str(ts)
+    except Exception as e:
+        log.debug(f"get_tick_size via HTTP failed: {e}")
+    return "0.01"
+
+
+def _build_partial_options(token_id, neg_risk=None):
+    """PartialCreateOrderOptions(tick_size, neg_risk) — без него neg-risk рынки часто отбивают ордер."""
+    try:
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+    except Exception as e:
+        log.debug(f"PartialCreateOrderOptions unavailable: {e}")
+        return None
+
+    if neg_risk is None:
+        info = get_market_info(token_id)
+        neg_risk = bool(info.get("neg_risk")) if info else False
+
+    try:
+        return PartialCreateOrderOptions(tick_size=_get_tick_size(token_id), neg_risk=bool(neg_risk))
+    except TypeError:
+        try:
+            return PartialCreateOrderOptions(tick_size=_get_tick_size(token_id))
+        except Exception:
+            return None
+
+
+def _call_with_optional_kwargs(fn, *args, **kwargs):
+    """Вызывает метод SDK, отбрасывая kwargs, которых нет в конкретной версии клиента."""
+    try:
+        return fn(*args, **kwargs)
+    except TypeError as e:
+        msg = str(e)
+        dropped = False
+        for key in ("options", "order_type"):
+            if key in kwargs and key in msg:
+                kwargs.pop(key)
+                dropped = True
+        if not dropped and kwargs:
+            kwargs = {}
+            dropped = True
+        if not dropped:
+            raise
+        return fn(*args, **kwargs)
+
+
+def _post_order_with_client(client, token_id, side: str, price: float, size: float, order_type="GTC"):
+    """Лимитный ордер (шары по цене). order_type: GTC (в стакан) / FAK / FOK."""
     from py_clob_client_v2.clob_types import OrderArgsV2
+
+    ot_enum, ot_name = _resolve_order_type(order_type)
+    options = _build_partial_options(token_id)
 
     order_args = OrderArgsV2(
         token_id=str(token_id),
@@ -535,16 +615,23 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
         side=side,
     )
 
+    kwargs = {}
+    if options is not None:
+        kwargs["options"] = options
+    if ot_enum is not None:
+        kwargs["order_type"] = ot_enum
+
     try:
-        result = client.create_and_post_order(order_args)
-        log.info(f"✅ Order placed (create_and_post_order): {result}")
+        result = _call_with_optional_kwargs(client.create_and_post_order, order_args, **kwargs)
+        log.info(f"✅ Order placed (create_and_post_order, {ot_name}): {result}")
         return result
     except Exception as e:
         err1 = e
         log.warning(f"create_and_post_order failed: {e}")
 
     try:
-        order = client.create_order(order_args)
+        create_kwargs = {"options": options} if options is not None else {}
+        order = _call_with_optional_kwargs(client.create_order, order_args, **create_kwargs)
         log.info(f"create_order result type: {type(order)}")
         try:
             maker = getattr(order, "maker", None)
@@ -553,8 +640,11 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
         except:
             pass
 
-        result = client.post_order(order)
-        log.info(f"✅ Order placed (create_order + post_order): {result}")
+        if ot_enum is not None:
+            result = _call_with_optional_kwargs(client.post_order, order, order_type=ot_enum)
+        else:
+            result = client.post_order(order)
+        log.info(f"✅ Order placed (create_order + post_order, {ot_name}): {result}")
         return result
     except Exception as e:
         err2 = e
@@ -563,13 +653,183 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
     raise err2 if 'err2' in locals() else err1
 
 
+def _post_market_order_with_client(client, token_id, side: str, amount: float,
+                                   worst_price: Optional[float], order_type="FOK"):
+    """
+    Настоящий рыночный ордер.
+    amount: для BUY — сумма в USDC, для SELL — количество шар.
+    worst_price: worst-price limit (защита от проскальзывания), НЕ целевая цена.
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgs
+
+    ot_enum, ot_name = _resolve_order_type(order_type)
+    if ot_name not in ("FOK", "FAK"):
+        ot_enum, ot_name = _resolve_order_type("FOK")
+
+    options = _build_partial_options(token_id)
+
+    args_kwargs = {
+        "token_id": str(token_id),
+        "amount": float(amount),
+        "side": side,
+    }
+    if worst_price is not None:
+        args_kwargs["price"] = float(worst_price)
+
+    try:
+        order_args = MarketOrderArgs(**args_kwargs)
+    except TypeError:
+        args_kwargs.pop("price", None)
+        order_args = MarketOrderArgs(**args_kwargs)
+
+    # Часть версий SDK требует order_type прямо в MarketOrderArgs
+    try:
+        if ot_enum is not None and hasattr(order_args, "order_type") and getattr(order_args, "order_type", None) is None:
+            setattr(order_args, "order_type", ot_enum)
+    except Exception:
+        pass
+
+    kwargs = {}
+    if options is not None:
+        kwargs["options"] = options
+    if ot_enum is not None:
+        kwargs["order_type"] = ot_enum
+
+    try:
+        result = _call_with_optional_kwargs(client.create_and_post_market_order, order_args, **kwargs)
+        log.info(f"✅ Market order placed (create_and_post_market_order, {ot_name}): {result}")
+        return result
+    except Exception as e:
+        err1 = e
+        log.warning(f"create_and_post_market_order failed: {e}")
+
+    try:
+        create_kwargs = {"options": options} if options is not None else {}
+        order = _call_with_optional_kwargs(client.create_market_order, order_args, **create_kwargs)
+        if ot_enum is not None:
+            result = _call_with_optional_kwargs(client.post_order, order, order_type=ot_enum)
+        else:
+            result = client.post_order(order)
+        log.info(f"✅ Market order placed (create_market_order + post_order, {ot_name}): {result}")
+        return result
+    except Exception as e:
+        err2 = e
+        log.warning(f"create_market_order + post_order failed: {e}")
+
+    raise err2 if 'err2' in locals() else err1
+
+
+def _parse_fill(resp: dict, side: str) -> dict:
+    """
+    Разбирает ответ CLOB и определяет, был ли РЕАЛЬНЫЙ филл.
+    makingAmount / takingAmount: для BUY making=USDC, taking=шары; для SELL наоборот.
+    """
+    order_id = (
+        resp.get("orderID") or resp.get("orderId")
+        or resp.get("order_id") or resp.get("id") or ""
+    )
+    status = str(resp.get("status") or resp.get("state") or "").lower()
+
+    making = resp.get("makingAmount", resp.get("making_amount"))
+    taking = resp.get("takingAmount", resp.get("taking_amount"))
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    making_f, taking_f = _f(making), _f(taking)
+
+    filled_size = 0.0     # шары
+    filled_cash = 0.0     # USDC
+    avg_price = None
+
+    if side.upper() == "BUY":
+        filled_cash, filled_size = making_f, taking_f
+    else:
+        filled_size, filled_cash = making_f, taking_f
+
+    if filled_size > 0:
+        avg_price = round(filled_cash / filled_size, 4)
+
+    filled = filled_size > 0 or status in ("matched", "filled", "complete", "completed")
+
+    return {
+        "orderID": order_id,
+        "status": status,
+        "matched": filled,
+        "filled": filled,
+        "filled_size": round(filled_size, 4),
+        "filled_cash": round(filled_cash, 4),
+        "avg_price": avg_price,
+        "avg_price_cents": round(avg_price * 100, 1) if avg_price else None,
+        "making": making,
+        "taking": taking,
+    }
+
+
 # =========================================================
 # TRADING
 # =========================================================
 
-def place_order(token_id, side: str, price: float, size: float) -> dict:
+def _execute_with_sig_fallback(sender, side: str, log_label: str) -> dict:
+    """
+    Общий каркас отправки: перебор signature_type, обновление allowance,
+    парсинг филла. sender(client) -> raw response.
+    """
     global _client
 
+    current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+    sig_candidates = []
+    for st in [current_sig, 1, 2, 3, 0]:
+        if st not in sig_candidates:
+            sig_candidates.append(st)
+
+    last_error = None
+
+    for st in sig_candidates:
+        try:
+            log.info(f"\U0001f504 [{log_label}] Пробую отправить ордер через sig_type={st}...")
+
+            client = _build_client(st)
+
+            try:
+                _update_balance_allowance_safe(client)
+            except Exception as e:
+                log.warning(f"allowance update sig_type={st} failed: {e}")
+
+            raw = sender(client)
+
+            try:
+                log.info(f"\U0001f4e9 RAW order response: {raw}")
+            except Exception:
+                pass
+
+            _client = client
+            update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
+            log.info(f"✅ Рабочий sig_type для ордера: {st}")
+
+            resp = raw if isinstance(raw, dict) else _object_to_dict(raw)
+            result = {"success": True, "raw": resp}
+            result.update(_parse_fill(resp, side))
+            return result
+
+        except Exception as e:
+            last_error = e
+            err = _extract_error_text(e)
+            log.warning(f"sig_type={st} order failed: {err}")
+            continue
+
+    return {"error": str(last_error)}
+
+
+def place_order(token_id, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
+    """
+    Лимитный ордер: size шар по цене price.
+    order_type="GTC" — кладётся в стакан (отложник),
+    "FAK"/"FOK" — агрессивный лимитник, исполняется немедленно или отменяется.
+    """
     try:
         if _client is None:
             return {"error": "Trading client not initialized"}
@@ -589,7 +849,7 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
                 size = market_info["min_size"]
                 log.info(f"Size adjusted to minimum: {size}")
 
-        log.info(f"Placing order: {side} {size}@{price} | token={token_id}")
+        log.info(f"Placing {order_type} order: {side} {size}@{price} | token={token_id}")
 
         try:
             _update_balance_allowance_safe(_client)
@@ -597,97 +857,91 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
         except Exception as e:
             log.warning(f"⚠️ Could not update allowance: {e}")
 
-        current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
-        sig_candidates = []
-        for st in [current_sig, 1, 2, 3, 0]:
-            if st not in sig_candidates:
-                sig_candidates.append(st)
-
-        last_error = None
-
-        for st in sig_candidates:
-            try:
-                log.info(f"🔄 Пробую отправить ордер через sig_type={st}...")
-
-                client = _build_client(st)
-
-                try:
-                    _update_balance_allowance_safe(client)
-                except Exception as e:
-                    log.warning(f"allowance update sig_type={st} failed: {e}")
-
-                raw = _post_order_with_client(client, token_id, side, price, size)
-
-                try:
-                    log.info(f"📩 RAW order response: {raw}")
-                except Exception:
-                    pass
-
-                _client = client
-                update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
-                log.info(f"✅ Рабочий sig_type для ордера: {st}")
-
-                resp = raw if isinstance(raw, dict) else {}
-
-                order_id = (
-                    resp.get("orderID")
-                    or resp.get("orderId")
-                    or resp.get("order_id")
-                    or resp.get("id")
-                    or ""
-                )
-
-                status = str(
-                    resp.get("status")
-                    or resp.get("state")
-                    or ""
-                ).lower()
-
-                making = resp.get("makingAmount")
-                taking = resp.get("takingAmount")
-
-                avg_price = None
-                try:
-                    if making is not None and taking is not None:
-                        making_f = float(making)
-                        taking_f = float(taking)
-                        if side == "BUY" and taking_f > 0:
-                            avg_price = making_f / taking_f
-                        elif side == "SELL" and making_f > 0:
-                            avg_price = taking_f / making_f
-                except Exception as e:
-                    log.warning(f"avg price calc failed: {e}")
-
-                matched = False
-                if status in ("matched", "filled", "complete", "completed"):
-                    matched = True
-                if (making not in (None, 0, "0")) and (taking not in (None, 0, "0")):
-                    matched = True
-
-                return {
-                    "success": True,
-                    "raw": resp,
-                    "orderID": order_id,
-                    "status": status,
-                    "matched": matched,
-                    "avg_price": avg_price,
-                    "making": making,
-                    "taking": taking,
-                }
-
-            except Exception as e:
-                last_error = e
-                err = _extract_error_text(e)
-                log.warning(f"sig_type={st} order failed: {err}")
-
-                if "maker address not allowed" in err.lower():
-                    continue
-                continue
-
-        return {"error": str(last_error)}
+        res = _execute_with_sig_fallback(
+            lambda client: _post_order_with_client(client, token_id, side, price, size, order_type),
+            side,
+            f"LIMIT-{str(order_type).upper()}",
+        )
+        res["order_type"] = str(order_type).upper()
+        res["requested_price"] = price
+        res["requested_size"] = size
+        return res
 
     except Exception as e:
         log.error(f"place_order error: {e}")
+        return {"error": str(e)}
+
+
+def place_market_order(token_id, side: str, amount: float,
+                       worst_price: Optional[float] = None,
+                       order_type: str = "FOK") -> dict:
+    """
+    НАСТОЯЩИЙ рыночный ордер по стакану.
+
+    side="BUY"  -> amount в USDC (сколько долларов потратить)
+    side="SELL" -> amount в шарах (сколько штук продать)
+    worst_price -> худшая допустимая цена (slippage guard), 0..1 или центы
+    order_type  -> "FOK" (всё или ничего) / "FAK" (сколько есть, остаток отменить)
+    """
+    try:
+        if _client is None:
+            return {"error": "Trading client not initialized"}
+
+        side = "BUY" if side.upper() == "BUY" else "SELL"
+        amount = float(amount)
+
+        if amount <= 0:
+            return {"error": "Amount must be > 0"}
+
+        if worst_price is not None:
+            worst_price = float(worst_price)
+            if worst_price > 1:
+                worst_price = round(worst_price / 100, 4)
+            worst_price = max(0.001, min(0.999, worst_price))
+
+        market_info = get_market_info(token_id)
+        neg_risk = False
+        if market_info:
+            if not market_info["accepting_orders"]:
+                return {"error": "Market is closed or resolved"}
+            neg_risk = bool(market_info.get("neg_risk"))
+            if side == "SELL" and amount < market_info["min_size"]:
+                log.info(f"SELL amount {amount} меньше min_size {market_info['min_size']}")
+
+        unit = "USDC" if side == "BUY" else "shares"
+        log.info(
+            f"Placing MARKET {order_type} order: {side} {amount} {unit} "
+            f"| worst_price={worst_price} | neg_risk={neg_risk} | token={token_id}"
+        )
+
+        try:
+            _update_balance_allowance_safe(_client)
+        except Exception as e:
+            log.warning(f"⚠️ Could not update allowance: {e}")
+
+        res = _execute_with_sig_fallback(
+            lambda client: _post_market_order_with_client(
+                client, token_id, side, amount, worst_price, order_type
+            ),
+            side,
+            f"MARKET-{str(order_type).upper()}",
+        )
+        res["order_type"] = str(order_type).upper()
+        res["requested_amount"] = amount
+        res["worst_price"] = worst_price
+
+        # FOK/FAK не должны оставлять висящий ордер: нет филла = сделки не было
+        if res.get("success") and not res.get("filled"):
+            res["success"] = False
+            res["error"] = (
+                f"{res['order_type']} не исполнен (нет ликвидности по цене не хуже "
+                f"{worst_price if worst_price is not None else '—'}). Статус: {res.get('status') or 'unknown'}"
+            )
+
+        return res
+
+    except Exception as e:
+        log.error(f"place_market_order error: {e}")
         return {"error": str(e)}
 
 

@@ -101,25 +101,63 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pos:
             return await q.edit_message_text("❌ Позиция не найдена.", reply_markup=KB([back("tr_orders")]))
 
-        await q.edit_message_text("⏳ Закрываю позицию...")
+        await q.edit_message_text("⏳ Закрываю позицию рыночным FAK...")
 
-        if pos["is_demo"] == 1:
-            success = True
+        from bot.jobs import execute_exit, _best_price_from_book
+        from database import get_setting as _get_setting, update_position_size
+
+        side = str(pos.get("side", "BUY")).upper()
+        exit_side = "SELL" if side == "BUY" else "BUY"
+
+        # Отталкиваемся от живого стакана, а не от котировки Gamma
+        best_price, _ = _best_price_from_book(pos["token_id"], exit_side) if pos["is_demo"] != 1 else (None, None)
+        if best_price is None:
+            best_price = close_price / 100.0
+
+        try:
+            slippage = float(_get_setting("exit_slippage_cents", "2")) / 100.0
+        except (TypeError, ValueError):
+            slippage = 0.02
+
+        if exit_side == "SELL":
+            worst_price = max(0.001, best_price - slippage)
         else:
-            import polymarket_trading as pt
-            close_side = "SELL" if pos["side"] == "BUY" else "BUY"
-            res = pt.place_order(pos["token_id"], close_side, close_price / 100.0, pos["size"])
-            success = isinstance(res, dict) and not res.get("error")
-            if not success:
-                return await q.edit_message_text(f"❌ Ошибка закрытия: {res.get('error')}", reply_markup=KB([back("tr_orders")]))
+            worst_price = min(0.999, best_price + slippage)
 
-        if success:
-            ep = pos["entry_price"]
-            diff = (close_price - ep) if pos["side"] == "BUY" else (ep - close_price)
-            pnl = round(diff * pos["size"] / 100.0, 2)
-            add_trade_history(pos["is_demo"], pos["slug"], pos["question"], pos["outcome"], pos["side"], pos["size"], ep, close_price, pnl)
+        res = execute_exit(pos, worst_price, "FAK")
+
+        if not res.get("success"):
+            return await q.edit_message_text(
+                f"❌ Выход не исполнился (FAK):\n`{res.get('error')}`",
+                parse_mode="Markdown", reply_markup=KB([back("tr_orders")])
+            )
+
+        close_cents = res["fill_cents"]
+        closed_size = res.get("filled_size", pos["size"])
+        ep = pos["entry_price"]
+        diff = (close_cents - ep) if side == "BUY" else (ep - close_cents)
+        pnl = round(diff * float(closed_size) / 100.0, 2)
+
+        add_trade_history(
+            pos["is_demo"], pos["slug"], pos["question"], pos["outcome"],
+            pos["side"], closed_size, ep, close_cents, pnl
+        )
+
+        note = ""
+        if res.get("partial"):
+            remaining = round(float(pos["size"]) - float(closed_size), 2)
+            update_position_size(pid, remaining)
+            note = f"\n⚠️ Исполнено частично, в позиции осталось {remaining} шт."
+        else:
             remove_position(pid)
-            return await q.edit_message_text(f"✅ Позиция закрыта!\nPnL: {'+' if pnl > 0 else ''}{pnl}$", reply_markup=KB([back("tr_orders")]))
+
+        return await q.edit_message_text(
+            f"✅ *Позиция закрыта рыночным FAK*\n\n"
+            f"⚡️ Цена исполнения: {close_cents}¢\n"
+            f"📦 Объём: {closed_size} шт.\n"
+            f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$" + note,
+            parse_mode="Markdown", reply_markup=KB([back("tr_orders")])
+        )
 
     if d.startswith("trc_"):
         import polymarket_trading as pt
