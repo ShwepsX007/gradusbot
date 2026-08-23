@@ -35,6 +35,16 @@ def line(title=""):
 
 
 def main():
+    if sys.version_info < (3, 11):
+        line("Версия Python")
+        v = ".".join(str(x) for x in sys.version_info[:3])
+        print(f"  ❌ Запущено на Python {v}, а polymarket-client требует 3.11+.")
+        print("  Поднимите окружение одной командой:")
+        print("      bash setup_python311.sh")
+        print("  и запустите проверку уже из него:")
+        print("      venv311/bin/python poly_wallet_check.py")
+        return 1
+
     pk = env("POLY_PRIVATE_KEY")
     if pk and not pk.startswith("0x"):
         pk = "0x" + pk

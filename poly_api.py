@@ -372,7 +372,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n🧩 *Официальный SDK (polymarket-client)*\n"
             f"Установлен: {'✅' if u.get('installed') else '❌ нет'}\n"
             f"Режим POLY_SDK: `{u.get('mode', 'auto')}`\n"
+            f"Python: {u.get('python', '?')}"
+            f"{'' if u.get('python_ok', True) else ' ⚠️ нужен 3.11+'}\n"
         )
+        if u.get("hint"):
+            txt += f"❗ {u['hint']}\n"
         if u.get("ready"):
             txt += (f"Кошелёк аккаунта: `{u.get('wallet')}`\n"
                     f"Тип: *{u.get('wallet_type')}*\n")

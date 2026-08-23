@@ -125,6 +125,19 @@ def main():
     acquire_single_instance_lock()
     init_db()
 
+    try:
+        import poly_unified as _pu
+        if not _pu.python_ok():
+            log.warning(
+                f"⚠️ Python {_pu.python_version()}: официальный SDK Polymarket "
+                f"(polymarket-client) требует 3.11+. Ордера с Deposit Wallet работать не будут. "
+                f"Поднимите окружение: bash setup_python311.sh"
+            )
+        elif not _pu.available():
+            log.warning("⚠️ polymarket-client не установлен — Deposit Wallet недоступен")
+    except Exception as e:
+        log.warning(f"unified backend probe: {e}")
+
     if pt.init_trading():
         log.info("✅ Trading ready")
     else:

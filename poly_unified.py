@@ -21,6 +21,7 @@
 
 import logging
 import os
+import sys
 from typing import Optional
 
 import config as cfg
@@ -35,6 +36,18 @@ def _env(key: str, default: str = "") -> str:
     return (os.environ.get(key) or getattr(cfg, key, default) or default).strip()
 
 
+MIN_PY = (3, 11)
+
+
+def python_ok() -> bool:
+    """polymarket-client требует Python 3.11 или новее."""
+    return sys.version_info >= MIN_PY
+
+
+def python_version() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+
 def available() -> bool:
     """Установлен ли пакет polymarket-client."""
     try:
@@ -42,6 +55,16 @@ def available() -> bool:
         return True
     except Exception:
         return False
+
+
+def install_hint() -> str:
+    """Что сказать пользователю, если бэкенд недоступен."""
+    if not python_ok():
+        return (f"нужен Python {MIN_PY[0]}.{MIN_PY[1]}+, а бот запущен на {python_version()}. "
+                f"Поднимите новое окружение: bash setup_python311.sh")
+    if not available():
+        return "пакет не установлен: pip install polymarket-client"
+    return ""
 
 
 def enabled() -> bool:
@@ -64,8 +87,8 @@ def last_error() -> Optional[str]:
 def init() -> bool:
     global _client, _last_error
 
-    if not available():
-        _last_error = "пакет polymarket-client не установлен (pip install polymarket-client)"
+    if not python_ok() or not available():
+        _last_error = install_hint() or "пакет polymarket-client не установлен"
         return False
 
     pk = _env("POLY_PRIVATE_KEY")
@@ -299,6 +322,9 @@ def status() -> dict:
     """Короткая сводка для меню диагностики."""
     return {
         "installed": available(),
+        "python": python_version(),
+        "python_ok": python_ok(),
+        "hint": install_hint(),
         "mode": _env("POLY_SDK", "auto").lower(),
         "ready": is_ready(),
         "wallet": get_wallet_address() if is_ready() else None,

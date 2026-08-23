@@ -2,7 +2,7 @@ python-telegram-bot[job-queue]>=21.0
 requests
 matplotlib
 py-clob-client-v2>=1.1.0
-polymarket-client>=0.6.0
+polymarket-client>=0.6.0; python_version >= "3.11"
 eth-account
 web3
 python-dotenv
