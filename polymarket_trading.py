@@ -962,8 +962,15 @@ def wallet_diagnostics() -> dict:
     except Exception as e:
         unified = {"installed": False, "error": str(e)}
 
-    if unified.get("installed") and unified.get("wallet_type") == "DEPOSIT_WALLET":
-        problems = [p for p in problems if "funder" not in p.lower()]
+    if unified.get("ready"):
+        # Ордера идут через официальный SDK: он сам определяет кошелёк,
+        # тип подписи и при необходимости сам выводит L2-креды CLOB.
+        problems = [
+            p for p in problems
+            if "funder" not in p.lower()
+            and "api-ключ" not in p.lower()
+            and "signature_type" not in p.lower()
+        ]
 
     return {
         "unified": unified,

@@ -212,7 +212,8 @@ def _fill_from_response(resp, side: str) -> dict:
     if not ok:
         code = getattr(resp, "code", "unknown")
         msg = getattr(resp, "message", "order rejected")
-        return {"success": False, "error": f"{code}: {msg}", "status": code}
+        return {"success": False, "error": f"{code}: {msg}",
+                "explain": explain_error(f"{code} {msg}"), "status": code}
 
     making = float(getattr(resp, "making_amount", 0) or 0)
     taking = float(getattr(resp, "taking_amount", 0) or 0)
@@ -237,6 +238,22 @@ def _fill_from_response(resp, side: str) -> dict:
         "avg_price_cents": round(avg_price * 100, 1) if avg_price else None,
         "backend": "unified",
     }
+
+
+def explain_error(text: str) -> str:
+    """Человеческое объяснение типовых отказов биржи."""
+    low = (text or "").lower()
+    if "fully filled" in low or "fok" in low and "fill" in low:
+        return ("FOK исполняется только целиком. В стакане не набралось нужного объёма "
+                "по цене не хуже заданной — попробуйте меньший объём, больший допуск "
+                "по цене или FAK (берём сколько есть).")
+    if "no orders found to match" in low or "fak" in low and "fill" in low:
+        return "Встречных заявок нет — по этой цене сейчас никто не торгует."
+    if "not enough balance" in low or "allowance" in low:
+        return "Не хватает залога или не выданы разрешения контрактам."
+    if "min" in low and "size" in low:
+        return "Объём меньше минимального размера ордера для этого рынка."
+    return ""
 
 
 def place_order(token_id, side: str, price: float, size: float,
@@ -281,7 +298,7 @@ def place_order(token_id, side: str, price: float, size: float,
 
     except Exception as e:
         log.error(f"[unified] place_order error: {e}")
-        return {"error": str(e), "backend": "unified"}
+        return {"error": str(e), "explain": explain_error(str(e)), "backend": "unified"}
 
 
 def place_market_order(token_id, side: str, amount: float,
@@ -331,7 +348,7 @@ def place_market_order(token_id, side: str, amount: float,
 
     except Exception as e:
         log.error(f"[unified] place_market_order error: {e}")
-        return {"error": str(e), "backend": "unified"}
+        return {"error": str(e), "explain": explain_error(str(e)), "backend": "unified"}
 
 
 def cancel_order(order_id: str) -> dict:

@@ -252,7 +252,10 @@ async def _station_stop_enter(bid, option):
                 res = {"error": f"FOK не исполнен: нет {size_val} шар дешевле {round(limit_price*100)}¢"}
         ok = bool(res.get("success"))
         if not ok:
-            return f"❌ *Вход не состоялся*\n🎯 {label}\n`{res.get('error')}`"
+            msg = f"❌ Вход не состоялся\n🎯 {label}\n{res.get('error')}"
+            if res.get("explain"):
+                msg += f"\n\n💡 {res['explain']}"
+            return msg
         order_type, order_id = res.get("order_type", "FOK"), res.get("orderID", "—")
         filled_size = float(res.get("filled_size") or 0) or size_val
         fill_cents = int(round(float(res.get("avg_price_cents") or est_price * 100)))
@@ -353,6 +356,8 @@ def _strip_md(text: str) -> str:
     out = str(text)
     for ch in ("*", "`"):
         out = out.replace(ch, "")
+    for esc in ("\\_", "\\*", "\\`", "\\["):
+        out = out.replace(esc, esc[1])
     return out
 
 
@@ -389,43 +394,53 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "trade_diagnose":
         import polymarket_trading as pt
         info = pt.wallet_diagnostics()
-        txt = (
-            "🩺 *Диагностика кошелька Polymarket*\n\n"
-            f"🔑 Подписант (EOA): `{info['eoa'] or '—'}`\n"
-            f"🏦 Кошелёк ордеров (funder): `{info['funder'] or 'НЕ ЗАДАН'}`\n"
-            f"✍️ Тип подписи: *{info['signature_type']}* — {_md(info['sig_name'])}\n"
-            f"🔐 API-ключи: {'✅' if info['has_creds'] else '❌'}\n"
-            f"🤖 Клиент: {'✅ готов' if info['ready'] else '❌ не инициализирован'}\n"
-            f"💰 Баланс: {info['balance'] if info['balance'] is not None else '—'}$\n"
-        )
         u = info.get("unified") or {}
-        txt += (
-            "\n🧩 *Официальный SDK (polymarket-client)*\n"
-            f"Установлен: {'✅' if u.get('installed') else '❌ нет'}\n"
-            f"Режим POLY_SDK: `{u.get('mode', 'auto')}`\n"
+
+        # Без разметки: здесь много имён с подчёркиваниями (POLY_FUNDER и т.п.),
+        # на них Telegram спотыкается, а информация важнее красоты.
+        lines = [
+            "🩺 Диагностика кошелька Polymarket",
+            "",
+            f"🔑 Подписант (EOA): {info['eoa'] or '—'}",
+            f"🏦 Кошелёк ордеров: {info['funder'] or 'не задан'}",
+            f"✍️ Тип подписи: {info['signature_type']} — {info['sig_name']}",
+            f"🤖 Клиент: {'готов ✅' if info['ready'] else 'не инициализирован ❌'}",
+            f"💰 Баланс: {info['balance'] if info['balance'] is not None else '—'}$",
+            "",
+            "🧩 Официальный SDK (polymarket-client)",
+            f"Установлен: {'✅' if u.get('installed') else 'нет ❌'}",
+            f"Режим POLY_SDK: {u.get('mode', 'auto')}",
             f"Python: {u.get('python', '?')}"
-            f"{'' if u.get('python_ok', True) else ' ⚠️ нужен 3.11+'}\n"
-        )
-        if u.get("hint"):
-            txt += f"❗ {_md(u['hint'])}\n"
+            f"{'' if u.get('python_ok', True) else '  ⚠️ нужен 3.11+'}",
+        ]
+
         if u.get("ready"):
-            txt += (f"Кошелёк аккаунта: `{u.get('wallet')}`\n"
-                    f"Тип: *{_md(u.get('wallet_type'))}*\n")
-        elif u.get("error"):
-            txt += f"Ошибка: `{_md(str(u['error'])[:150])}`\n"
+            lines += [
+                f"Кошелёк аккаунта: {u.get('wallet')}",
+                f"Тип кошелька: {u.get('wallet_type')}",
+                "L2-креды CLOB: выводятся автоматически",
+            ]
+        else:
+            lines.append(f"🔐 API-ключи: {'заполнены' if info['has_creds'] else 'не заполнены'}")
+            if u.get("hint"):
+                lines.append(f"❗ {u['hint']}")
+            elif u.get("error"):
+                lines.append(f"Ошибка: {str(u['error'])[:200]}")
 
         if info["problems"]:
-            txt += "\n⚠️ *Проблемы:*\n" + "\n".join(f"• {_md(p)}" for p in info["problems"])
-            txt += (
-                "\n\n💡 Все кошельки Polymarket, созданные с мая 2026, — это Deposit Wallet, "
-                "и старый py-clob-client-v2 их не умеет. Поставьте `polymarket-client`, "
-                "пропишите `POLY_SDK=unified` и адрес кошелька аккаунта в `POLY_FUNDER`. "
-                "Точную конфигурацию покажет `python3 poly_wallet_check.py` на сервере."
-            )
+            lines += ["", "⚠️ Проблемы:"] + [f"• {p}" for p in info["problems"]]
+            lines += [
+                "",
+                "💡 Кошельки Polymarket с мая 2026 — это Deposit Wallet. "
+                "Нужен пакет polymarket-client, POLY_SDK=unified и адрес кошелька "
+                "аккаунта в POLY_FUNDER. Точную конфигурацию покажет "
+                "poly_wallet_check.py на сервере.",
+            ]
         else:
-            txt += "\n✅ Конфигурация выглядит корректно."
+            lines += ["", "✅ Конфигурация корректна, ордера идут через Deposit Wallet."]
+
         return await _safe_edit(
-            q, txt, parse_mode="Markdown",
+            q, "\n".join(lines),
             reply_markup=KB([
                 [Btn("🔄 Переинициализировать", callback_data="trade_reinit")],
                 back("tr_api_menu")

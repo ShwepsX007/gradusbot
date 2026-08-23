@@ -901,7 +901,7 @@ def schedule_jobs(context, cid=None):
         job_stations, interval=si_wu, first=1,
         name="st_wu_job",
         data={"cid": current_cid, "stype": "wunderground"},
-        job_kwargs={"misfire_grace_time": 60}
+        job_kwargs={"misfire_grace_time": 60, "max_instances": 3, "coalesce": True}
     )
     # Джоб тикает часто, но реальные запросы фильтрует metar_poll_due()
     metar_tick = si_metar
@@ -925,23 +925,23 @@ def schedule_jobs(context, cid=None):
         job_stations, interval=metar_tick, first=2,
         name="st_metar_job",
         data={"cid": current_cid, "stype": "metar"},
-        job_kwargs={"misfire_grace_time": 60}
+        job_kwargs={"misfire_grace_time": 60, "max_instances": 3, "coalesce": True}
     )
     jq.run_repeating(
         job_stations, interval=si_cwx, first=3,
         name="st_cwx_job",
         data={"cid": current_cid, "stype": "checkwx"},
-        job_kwargs={"misfire_grace_time": 60}
+        job_kwargs={"misfire_grace_time": 60, "max_instances": 3, "coalesce": True}
     )
     jq.run_repeating(
         job_positions, interval=int(get_setting("pos_interval", "20")), first=7,
         name="pos_job",
         data={"cid": current_cid},
-        job_kwargs={"misfire_grace_time": 30}
+        job_kwargs={"misfire_grace_time": 30, "max_instances": 3, "coalesce": True}
     )
     jq.run_repeating(
         job_markets, interval=smi, first=5,
         name="mk_job",
         data={"cid": current_cid},
-        job_kwargs={"misfire_grace_time": 60}
+        job_kwargs={"misfire_grace_time": 60, "max_instances": 3, "coalesce": True}
     )
