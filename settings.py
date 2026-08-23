@@ -2,8 +2,21 @@ from telegram import Update, ForceReply
 from telegram.ext import ContextTypes
 import telegram.error
 from database import set_setting, get_setting
-from bot.keyboards import settings_kb, notif_kb
-from bot.jobs import schedule_jobs
+from keyboards import settings_kb, notif_kb
+from jobs import schedule_jobs
+
+def _burst_text():
+    on = get_setting("metar_burst", "1") == "1"
+    return (
+        "⚡ *Турбо-окно опроса METAR*\n\n"
+        f"Состояние: *{'включено' if on else 'выключено'}*\n"
+        f"В окне: каждые *{get_setting('metar_burst_interval', '10')}с*\n"
+        f"Вне окна: каждые *{get_setting('metar_interval', '60')}с*\n"
+        f"Окно: с *:{get_setting('metar_burst_from', '45')}* по *:{get_setting('metar_burst_to', '10')}* минуту\n"
+        f"Лимит к AWC: *{get_setting('awc_rate_per_min', '20')}* запросов/мин\n\n"
+        "_METAR выпускается раз в час (обычно :50–:56) плюс внеплановые SPECI. "
+        "Частый опрос имеет смысл только в этом окне._"
+    )
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -17,7 +30,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Ключи CheckWX (ВАЖНО: проверяем до общего smet_cwx_) ===
     if d == "smet_cwx_key":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_cwx_api_key"
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -27,7 +40,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if d == "smet_cwx_keys":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_cwx_api_keys"
         cur = get_setting("checkwx_api_keys", "")
         cur_show = cur if cur else "(пусто)"
@@ -68,6 +81,90 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except telegram.error.BadRequest:
             return
 
+    # === Ручной ввод интервалов ===
+    MANUAL = {
+        "sman_wu":     ("interval",             "📡 Введите интервал опроса WU в секундах (10–3600):"),
+        "sman_metar":  ("metar_interval",       "✈️ Введите интервал опроса METAR (AWC) в секундах (10–3600).\n"
+                                                "_AWC рекомендует не чаще 1 запроса в минуту на поток; безопасный минимум — 30с._"),
+        "sman_cwx":    ("checkwx_interval",     "⚡ Введите интервал опроса CheckWX в секундах (5–3600):"),
+        "sman_mkt":    ("m_interval",           "📊 Введите интервал опроса рынков в секундах (5–3600):"),
+        "sman_burst":  ("metar_burst_interval", "⚡ Введите интервал опроса ВНУТРИ турбо-окна в секундах (5–120).\n"
+                                                "_Меньше 10с имеет смысл только для одной-двух станций._"),
+    }
+    if d in MANUAL:
+        key, prompt = MANUAL[d]
+        from state import us
+        st = us(update.effective_chat.id)
+        st["state"] = f"wait_interval_{key}"
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=prompt, parse_mode="Markdown")
+        return
+
+    if d == "sman_window":
+        from state import us
+        us(update.effective_chat.id)["state"] = "wait_burst_window"
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=("🕐 Введите окно турбо-опроса как *начало-конец* в минутах часа.\n"
+                  "Например `45-10` — с 45-й минуты по 10-ю минуту следующего часа.\n"
+                  "_METAR обычно выходит в :50–:56._"),
+            parse_mode="Markdown"
+        )
+        return
+
+    # === Турбо-окно METAR ===
+    if d == "sburst_menu":
+        from keyboards import burst_kb
+        try:
+            return await q.edit_message_text(_burst_text(), parse_mode="Markdown", reply_markup=burst_kb())
+        except telegram.error.BadRequest:
+            return
+
+    if d == "sburst_toggle":
+        cur = get_setting("metar_burst", "1")
+        set_setting("metar_burst", "0" if cur == "1" else "1")
+        schedule_jobs(context)
+        from keyboards import burst_kb
+        try:
+            return await q.edit_message_text(_burst_text(), parse_mode="Markdown", reply_markup=burst_kb())
+        except telegram.error.BadRequest:
+            return
+
+    if d.startswith("sburst_int_"):
+        set_setting("metar_burst_interval", d[len("sburst_int_"):])
+        schedule_jobs(context)
+        from keyboards import burst_kb
+        try:
+            return await q.edit_message_text(_burst_text(), parse_mode="Markdown", reply_markup=burst_kb())
+        except telegram.error.BadRequest:
+            return
+
+    if d.startswith("sburst_rate_"):
+        set_setting("awc_rate_per_min", d[len("sburst_rate_"):])
+        from keyboards import burst_kb
+        try:
+            return await q.edit_message_text(_burst_text(), parse_mode="Markdown", reply_markup=burst_kb())
+        except telegram.error.BadRequest:
+            return
+
+    if d == "sburst_stats":
+        from utils import awc_status
+        a = awc_status()
+        from keyboards import burst_kb
+        txt = (
+            "📊 *Диагностика AWC*\n\n"
+            f"Запросов за последнюю минуту: *{a['used_last_min']}* из *{a['limit_per_min']}*\n"
+            f"Отложено лимитером: *{a['rejected']}*\n"
+            f"Станций в кэше: *{a['cached_stations']}*\n"
+            f"Блокировка: *{('да, ещё ' + str(a['blocked']) + 'с') if a['blocked'] else 'нет'}*\n"
+            f"Штрафов подряд: *{a['strikes']}*\n"
+            f"Последняя ошибка: `{a['last_error'] or '—'}`\n\n"
+            "_Хардлимит AWC — 100 запросов/мин на IP._"
+        )
+        try:
+            return await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=burst_kb())
+        except telegram.error.BadRequest:
+            return
+
     # === Настройки бота ===
     if d.startswith("su_"):
         set_setting("units", d[3:])
@@ -90,7 +187,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d.startswith("smet_pr_"):
         set_setting("metar_pred_window", d[8:])
     elif d == "smet_prman":
-        from bot.state import us
+        from state import us
         us(update.effective_chat.id)["state"] = "wait_metar_pred_window"
         await context.bot.send_message(
             chat_id=update.effective_chat.id,

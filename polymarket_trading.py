@@ -230,6 +230,16 @@ def init_trading() -> bool:
     global _client
     _client = None
 
+    try:
+        pu = _unified()
+        if pu.available() and pu.forced():
+            log.info("🔧 POLY_SDK=unified — использую официальный SDK polymarket-client")
+            if pu.init():
+                return True
+            log.error(f"❌ unified SDK не поднялся: {pu.last_error()}")
+    except Exception as e:
+        log.warning(f"unified probe failed: {e}")
+
     pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
     funder = _get_env("POLY_FUNDER").strip()
     configured_sig_type = _get_int_env("POLY_SIGNATURE_TYPE", 1)
@@ -307,15 +317,33 @@ def init_trading() -> bool:
             continue
 
     log.error("❌ Ни один sig_type не сработал")
+
+    try:
+        pu = _unified()
+        if pu.available() and pu.enabled() and pu.init():
+            _switch_to_unified("py-clob-client-v2 не смог подключиться")
+            return True
+    except Exception as e:
+        log.warning(f"unified init failed: {e}")
+
     return False
 
 
 def is_ready() -> bool:
-    return _client is not None
+    if _client is not None:
+        return True
+    try:
+        return unified_active() and _unified().is_ready()
+    except Exception:
+        return False
 
 
 def get_wallet_address() -> Optional[str]:
     try:
+        if unified_active():
+            addr = _unified().get_wallet_address()
+            if addr:
+                return addr
         funder = _get_env("POLY_FUNDER").strip()
         sig_type = _get_int_env("POLY_SIGNATURE_TYPE", 1)
         pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
@@ -460,41 +488,107 @@ def get_event_markets(slug: str) -> Optional[dict]:
         return None
 
 
+# Токены без стакана (закрытый/неразмещённый рынок) — не долбим API каждые 20 секунд
+_NO_BOOK_CACHE = {}
+_NO_BOOK_TTL = 600  # секунд
+
+
+def _is_no_orderbook_error(err) -> bool:
+    txt = _extract_error_text(err).lower()
+    return "no orderbook" in txt or "orderbook exists" in txt or "404" in txt
+
+
+def has_orderbook(token_id: str) -> bool:
+    """False, если по токену заведомо нет стакана (запомнено ранее)."""
+    ts = _NO_BOOK_CACHE.get(str(token_id))
+    if ts is None:
+        return True
+    if time.time() - ts > _NO_BOOK_TTL:
+        _NO_BOOK_CACHE.pop(str(token_id), None)
+        return True
+    return False
+
+
+def _mark_no_orderbook(token_id: str, quiet: bool):
+    tid = str(token_id)
+    if not quiet:
+        log.info(f"ℹ️ Для токена {tid[:14]}… стакана нет (рынок закрыт или не размещён на CLOB). "
+                 f"Пропускаю запросы на {_NO_BOOK_TTL // 60} мин.")
+    _NO_BOOK_CACHE[tid] = time.time()
+
+
+def _parse_book_payload(resp) -> Optional[dict]:
+    if hasattr(resp, "bids") and hasattr(resp, "asks"):
+        return {
+            "bids": [{"price": float(b.price), "size": float(b.size)} for b in resp.bids],
+            "asks": [{"price": float(a.price), "size": float(a.size)} for a in resp.asks]
+        }
+    if isinstance(resp, dict):
+        return {
+            "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in resp.get("bids", [])],
+            "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in resp.get("asks", [])]
+        }
+    return None
+
+
 def get_order_book(token_id: str) -> Optional[dict]:
     """
-    Получает реальный стакан (bids и asks) для конкретного токена с Polymarket CLOB.
-    Добавлено для работы со стратегиями.
+    Реальный стакан (bids/asks) по токену.
+    Возвращает None, если стакана нет (404) или запрос не удался.
     """
     global _client
+
+    tid = str(token_id or "").strip()
+    if not tid:
+        return None
+
+    # id токена CLOB — это длинное десятичное число. condition_id (0x...) стаканов не имеет.
+    if tid.startswith("0x") or not tid.isdigit():
+        if has_orderbook(tid):
+            log.info(f"ℹ️ {tid[:14]}… не является CLOB token_id (похоже на condition_id) — стакан не запрашиваю.")
+        _NO_BOOK_CACHE[tid] = time.time()
+        return None
+
+    if not has_orderbook(tid):
+        return None
+
+    # Стакан — публичные данные, ключи не нужны. Если старый SDK-клиент не поднят
+    # (например, работаем через унифицированный бэкенд), просто идём по HTTP ниже.
     if _client is None:
-        log.error("ClobClient не инициализирован для получения стакана")
-        return None
+        return _http_order_book(tid)
+
     try:
-        resp = _client.get_order_book(str(token_id))
-        if hasattr(resp, "bids") and hasattr(resp, "asks"):
-            return {
-                "bids": [{"price": float(b.price), "size": float(b.size)} for b in resp.bids],
-                "asks": [{"price": float(a.price), "size": float(a.size)} for a in resp.asks]
-            }
-        elif isinstance(resp, dict):
-            return {
-                "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in resp.get("bids", [])],
-                "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in resp.get("asks", [])]
-            }
-        return None
+        book = _parse_book_payload(_client.get_order_book(tid))
+        if book is not None:
+            return book
     except Exception as e:
+        if _is_no_orderbook_error(e):
+            # Штатная ситуация: рынок закрыт/разрешён. HTTP-фолбэк даст тот же 404 — не дублируем.
+            _mark_no_orderbook(tid, quiet=False)
+            return None
         log.warning(f"Ошибка получения стакана через SDK: {e}. Пробую через HTTP...")
-        try:
-            r = requests.get(f"{HOST}/book", params={"token_id": str(token_id)}, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                return {
-                    "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in data.get("bids", [])],
-                    "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in data.get("asks", [])]
-                }
-        except Exception as ex:
-            log.error(f"HTTP ошибка получения стакана: {ex}")
-        return None
+
+    return _http_order_book(tid)
+
+
+def _http_order_book(tid: str):
+    """Публичный стакан по HTTP — авторизация не требуется."""
+    try:
+        r = requests.get(f"{HOST}/book", params={"token_id": tid}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "bids": [{"price": float(b["price"]), "size": float(b["size"])} for b in data.get("bids", [])],
+                "asks": [{"price": float(a["price"]), "size": float(a["size"])} for a in data.get("asks", [])]
+            }
+        if r.status_code == 404:
+            _mark_no_orderbook(tid, quiet=False)
+            return None
+        log.warning(f"HTTP /book вернул {r.status_code} для {tid[:14]}…")
+    except Exception as ex:
+        log.error(f"HTTP ошибка получения стакана: {ex}")
+
+    return None
 
 
 # =========================================================
@@ -504,6 +598,8 @@ def get_order_book(token_id: str) -> Optional[dict]:
 def get_balance() -> Optional[float]:
     try:
         if _client is None:
+            if unified_active():
+                return _unified().get_balance()
             return None
 
         data = _get_balance_allowance_safe(_client)
@@ -525,8 +621,88 @@ def get_balance() -> Optional[float]:
 # ORDER PLACEMENT CORE
 # =========================================================
 
-def _post_order_with_client(client, token_id, side: str, price: float, size: float):
+def _resolve_order_type(order_type):
+    """
+    Возвращает (enum_or_none, "FOK"/"FAK"/"GTC"/"GTD").
+    Работает даже если в установленной версии SDK нет OrderType.
+    """
+    name = str(order_type or "GTC").upper()
+    if name not in ("GTC", "GTD", "FOK", "FAK"):
+        name = "GTC"
+    try:
+        from py_clob_client_v2.clob_types import OrderType
+        return getattr(OrderType, name), name
+    except Exception:
+        return None, name
+
+
+def _get_tick_size(token_id) -> str:
+    """Тик рынка. Нужен для корректной подписи ордера (FOK/FAK особенно чувствительны)."""
+    global _client
+    try:
+        if _client is not None:
+            ts = _client.get_tick_size(str(token_id))
+            if ts:
+                return str(ts)
+    except Exception as e:
+        log.debug(f"get_tick_size via SDK failed: {e}")
+    try:
+        r = requests.get(f"{HOST}/tick-size", params={"token_id": str(token_id)}, timeout=8)
+        if r.status_code == 200:
+            ts = r.json().get("minimum_tick_size")
+            if ts:
+                return str(ts)
+    except Exception as e:
+        log.debug(f"get_tick_size via HTTP failed: {e}")
+    return "0.01"
+
+
+def _build_partial_options(token_id, neg_risk=None):
+    """PartialCreateOrderOptions(tick_size, neg_risk) — без него neg-risk рынки часто отбивают ордер."""
+    try:
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+    except Exception as e:
+        log.debug(f"PartialCreateOrderOptions unavailable: {e}")
+        return None
+
+    if neg_risk is None:
+        info = get_market_info(token_id)
+        neg_risk = bool(info.get("neg_risk")) if info else False
+
+    try:
+        return PartialCreateOrderOptions(tick_size=_get_tick_size(token_id), neg_risk=bool(neg_risk))
+    except TypeError:
+        try:
+            return PartialCreateOrderOptions(tick_size=_get_tick_size(token_id))
+        except Exception:
+            return None
+
+
+def _call_with_optional_kwargs(fn, *args, **kwargs):
+    """Вызывает метод SDK, отбрасывая kwargs, которых нет в конкретной версии клиента."""
+    try:
+        return fn(*args, **kwargs)
+    except TypeError as e:
+        msg = str(e)
+        dropped = False
+        for key in ("options", "order_type"):
+            if key in kwargs and key in msg:
+                kwargs.pop(key)
+                dropped = True
+        if not dropped and kwargs:
+            kwargs = {}
+            dropped = True
+        if not dropped:
+            raise
+        return fn(*args, **kwargs)
+
+
+def _post_order_with_client(client, token_id, side: str, price: float, size: float, order_type="GTC"):
+    """Лимитный ордер (шары по цене). order_type: GTC (в стакан) / FAK / FOK."""
     from py_clob_client_v2.clob_types import OrderArgsV2
+
+    ot_enum, ot_name = _resolve_order_type(order_type)
+    options = _build_partial_options(token_id)
 
     order_args = OrderArgsV2(
         token_id=str(token_id),
@@ -535,16 +711,23 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
         side=side,
     )
 
+    kwargs = {}
+    if options is not None:
+        kwargs["options"] = options
+    if ot_enum is not None:
+        kwargs["order_type"] = ot_enum
+
     try:
-        result = client.create_and_post_order(order_args)
-        log.info(f"✅ Order placed (create_and_post_order): {result}")
+        result = _call_with_optional_kwargs(client.create_and_post_order, order_args, **kwargs)
+        log.info(f"✅ Order placed (create_and_post_order, {ot_name}): {result}")
         return result
     except Exception as e:
         err1 = e
         log.warning(f"create_and_post_order failed: {e}")
 
     try:
-        order = client.create_order(order_args)
+        create_kwargs = {"options": options} if options is not None else {}
+        order = _call_with_optional_kwargs(client.create_order, order_args, **create_kwargs)
         log.info(f"create_order result type: {type(order)}")
         try:
             maker = getattr(order, "maker", None)
@@ -553,8 +736,11 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
         except:
             pass
 
-        result = client.post_order(order)
-        log.info(f"✅ Order placed (create_order + post_order): {result}")
+        if ot_enum is not None:
+            result = _call_with_optional_kwargs(client.post_order, order, order_type=ot_enum)
+        else:
+            result = client.post_order(order)
+        log.info(f"✅ Order placed (create_order + post_order, {ot_name}): {result}")
         return result
     except Exception as e:
         err2 = e
@@ -563,12 +749,368 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
     raise err2 if 'err2' in locals() else err1
 
 
+def _post_market_order_with_client(client, token_id, side: str, amount: float,
+                                   worst_price: Optional[float], order_type="FOK"):
+    """
+    Настоящий рыночный ордер.
+    amount: для BUY — сумма в USDC, для SELL — количество шар.
+    worst_price: worst-price limit (защита от проскальзывания), НЕ целевая цена.
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgs
+
+    ot_enum, ot_name = _resolve_order_type(order_type)
+    if ot_name not in ("FOK", "FAK"):
+        ot_enum, ot_name = _resolve_order_type("FOK")
+
+    options = _build_partial_options(token_id)
+
+    args_kwargs = {
+        "token_id": str(token_id),
+        "amount": float(amount),
+        "side": side,
+    }
+    if worst_price is not None:
+        args_kwargs["price"] = float(worst_price)
+
+    try:
+        order_args = MarketOrderArgs(**args_kwargs)
+    except TypeError:
+        args_kwargs.pop("price", None)
+        order_args = MarketOrderArgs(**args_kwargs)
+
+    # Часть версий SDK требует order_type прямо в MarketOrderArgs
+    try:
+        if ot_enum is not None and hasattr(order_args, "order_type") and getattr(order_args, "order_type", None) is None:
+            setattr(order_args, "order_type", ot_enum)
+    except Exception:
+        pass
+
+    kwargs = {}
+    if options is not None:
+        kwargs["options"] = options
+    if ot_enum is not None:
+        kwargs["order_type"] = ot_enum
+
+    try:
+        result = _call_with_optional_kwargs(client.create_and_post_market_order, order_args, **kwargs)
+        log.info(f"✅ Market order placed (create_and_post_market_order, {ot_name}): {result}")
+        return result
+    except Exception as e:
+        err1 = e
+        log.warning(f"create_and_post_market_order failed: {e}")
+
+    try:
+        create_kwargs = {"options": options} if options is not None else {}
+        order = _call_with_optional_kwargs(client.create_market_order, order_args, **create_kwargs)
+        if ot_enum is not None:
+            result = _call_with_optional_kwargs(client.post_order, order, order_type=ot_enum)
+        else:
+            result = client.post_order(order)
+        log.info(f"✅ Market order placed (create_market_order + post_order, {ot_name}): {result}")
+        return result
+    except Exception as e:
+        err2 = e
+        log.warning(f"create_market_order + post_order failed: {e}")
+
+    raise err2 if 'err2' in locals() else err1
+
+
+def _parse_fill(resp: dict, side: str) -> dict:
+    """
+    Разбирает ответ CLOB и определяет, был ли РЕАЛЬНЫЙ филл.
+    makingAmount / takingAmount: для BUY making=USDC, taking=шары; для SELL наоборот.
+    """
+    order_id = (
+        resp.get("orderID") or resp.get("orderId")
+        or resp.get("order_id") or resp.get("id") or ""
+    )
+    status = str(resp.get("status") or resp.get("state") or "").lower()
+
+    making = resp.get("makingAmount", resp.get("making_amount"))
+    taking = resp.get("takingAmount", resp.get("taking_amount"))
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    making_f, taking_f = _f(making), _f(taking)
+
+    filled_size = 0.0     # шары
+    filled_cash = 0.0     # USDC
+    avg_price = None
+
+    if side.upper() == "BUY":
+        filled_cash, filled_size = making_f, taking_f
+    else:
+        filled_size, filled_cash = making_f, taking_f
+
+    if filled_size > 0:
+        avg_price = round(filled_cash / filled_size, 4)
+
+    filled = filled_size > 0 or status in ("matched", "filled", "complete", "completed")
+
+    return {
+        "orderID": order_id,
+        "status": status,
+        "matched": filled,
+        "filled": filled,
+        "filled_size": round(filled_size, 4),
+        "filled_cash": round(filled_cash, 4),
+        "avg_price": avg_price,
+        "avg_price_cents": round(avg_price * 100, 1) if avg_price else None,
+        "making": making,
+        "taking": taking,
+    }
+
+
+# =========================================================
+# ДИАГНОСТИКА КОШЕЛЬКА (CLOB V2 deposit wallet)
+# =========================================================
+
+WALLET_ERRORS = {
+    "maker address not allowed": (
+        "Кошелёк не допущен к торговле через API.\n"
+        "CLOB V2 принимает ордера только от *депозит-кошелька* Polymarket. "
+        "Голый EOA (signature_type=0) сервер отклоняет всегда.\n\n"
+        "Что сделать:\n"
+        "1. На polymarket.com → Deposit скопируйте адрес депозит-кошелька.\n"
+        "2. Пропишите его в `POLY_FUNDER`.\n"
+        "3. Поставьте `POLY_SIGNATURE_TYPE=3` (депозит-кошелёк) или `=2` (Gnosis Safe / MetaMask-прокси).\n"
+        "4. Пересоздайте API-ключи (кнопка «Проверить API ключи»).\n"
+        "5. Убедитесь, что залог лежит в *pUSD*, а не в USDC.e."
+    ),
+    "order signer address has to be": (
+        "API-ключ выписан на подписанта (EOA), а ордер подписывается от имени "
+        "депозит-кошелька — сервер требует, чтобы это был один адрес.\n\n"
+        "Это известный баг `py-clob-client-v2` при signature_type=3. "
+        "Пересоздайте API-ключи для того же кошелька; если не помогает — "
+        "переключитесь на signature_type=2 с адресом прокси-кошелька в `POLY_FUNDER`."
+    ),
+    "not enough balance": (
+        "Недостаточно средств или не выданы разрешения (allowance).\n"
+        "В V2 залог должен быть в *pUSD*, а не в USDC.e, "
+        "и должны быть одобрены контракты V2-биржи."
+    ),
+    "invalid signature": (
+        "Подпись не принята. Обычно это рассинхрон часов сервера (>60с) "
+        "или устаревший клиент. Проверьте NTP и версию py-clob-client-v2."
+    ),
+}
+
+
+def classify_order_error(err_text: str):
+    """Понятное объяснение для типовых отказов CLOB. None — если не распознали."""
+    low = (err_text or "").lower()
+    for needle, explain in WALLET_ERRORS.items():
+        if needle in low:
+            return explain
+    return None
+
+
+def _is_fatal_wallet_error(err_text: str) -> bool:
+    """
+    Такие ошибки не зависят от signature_type: перебирать варианты бессмысленно,
+    только теряем секунды (критично при аварийном выходе из позиции).
+    """
+    low = (err_text or "").lower()
+    return ("maker address not allowed" in low
+            or "order signer address has to be" in low)
+
+
+def wallet_diagnostics() -> dict:
+    """Сводка по конфигурации кошелька для меню «Диагностика»."""
+    pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
+    funder = _get_env("POLY_FUNDER").strip()
+    sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+
+    eoa = None
+    if pk:
+        try:
+            eoa = Account.from_key(pk).address
+        except Exception:
+            eoa = None
+
+    problems = []
+    if not pk:
+        problems.append("не задан POLY_PRIVATE_KEY")
+    if not funder:
+        problems.append("не задан POLY_FUNDER — без него бот подписывает от голого EOA, "
+                        "а CLOB V2 такие ордера отклоняет")
+    elif not _is_valid_eth_address(funder):
+        problems.append("POLY_FUNDER не похож на адрес (0x + 40 символов)")
+    elif eoa and funder.lower() == eoa.lower():
+        problems.append("POLY_FUNDER совпадает с адресом подписанта — проверьте, что это "
+                        "именно адрес кошелька аккаунта из профиля polymarket.com")
+    if sig == 0 and funder:
+        problems.append("POLY_SIGNATURE_TYPE=0 (голый EOA) при заданном funder — "
+                        "поставьте 3 (депозит-кошелёк) или 2 (Gnosis Safe)")
+    if sig in (1, 2, 3) and not funder:
+        problems.append(f"POLY_SIGNATURE_TYPE={sig} требует POLY_FUNDER")
+    if not (_get_env("POLY_API_KEY") and _get_env("POLY_API_SECRET") and _get_env("POLY_API_PASSPHRASE")):
+        problems.append("не заполнены API-ключи (key / secret / passphrase)")
+
+    balance = None
+    try:
+        balance = get_balance()
+    except Exception:
+        balance = None
+
+    try:
+        unified = _unified().status()
+    except Exception as e:
+        unified = {"installed": False, "error": str(e)}
+
+    if unified.get("ready"):
+        # Ордера идут через официальный SDK: он сам определяет кошелёк,
+        # тип подписи и при необходимости сам выводит L2-креды CLOB.
+        problems = [
+            p for p in problems
+            if "funder" not in p.lower()
+            and "api-ключ" not in p.lower()
+            and "signature_type" not in p.lower()
+        ]
+
+    return {
+        "unified": unified,
+        "eoa": eoa,
+        "funder": funder or None,
+        "signature_type": sig,
+        "sig_name": {0: "EOA", 1: "Magic/email прокси", 2: "Gnosis Safe",
+                     3: "депозит-кошелёк (1271)"}.get(sig, str(sig)),
+        "has_creds": bool(_get_env("POLY_API_KEY")),
+        "ready": is_ready(),
+        "balance": balance,
+        "problems": problems,
+    }
+
+
+
+# =========================================================
+# ВЫБОР БЭКЕНДА ИСПОЛНЕНИЯ (py-clob-client-v2 / унифицированный SDK)
+# =========================================================
+
+_UNIFIED_FALLBACK = False   # включается автоматически после отказа кошелька
+
+
+def _unified():
+    import poly_unified as pu
+    return pu
+
+
+def _use_unified_first() -> bool:
+    """Сразу идти через новый SDK: режим unified или уже был отказ кошелька."""
+    try:
+        pu = _unified()
+    except Exception:
+        return False
+    if not pu.available():
+        return False
+    return pu.forced() or _UNIFIED_FALLBACK
+
+
+def _unified_retry_allowed() -> bool:
+    """Можно ли после отказа кошелька повторить через новый SDK."""
+    try:
+        pu = _unified()
+    except Exception:
+        return False
+    return pu.available() and pu.enabled()
+
+
+def _switch_to_unified(reason: str):
+    global _UNIFIED_FALLBACK
+    if not _UNIFIED_FALLBACK:
+        _UNIFIED_FALLBACK = True
+        log.warning(f"🔁 Переключаюсь на унифицированный SDK Polymarket: {reason}")
+
+
+def unified_active() -> bool:
+    return _UNIFIED_FALLBACK or _use_unified_first()
+
+
 # =========================================================
 # TRADING
 # =========================================================
 
-def place_order(token_id, side: str, price: float, size: float) -> dict:
+def _execute_with_sig_fallback(sender, side: str, log_label: str) -> dict:
+    """
+    Общий каркас отправки: перебор signature_type, обновление allowance,
+    парсинг филла. sender(client) -> raw response.
+    """
     global _client
+
+    current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+    funder = _get_env("POLY_FUNDER").strip()
+
+    sig_candidates = []
+    for st in [current_sig, 3, 2, 1, 0]:
+        if st in sig_candidates:
+            continue
+        if st in (1, 2, 3) and not funder:
+            continue          # прокси-типы без funder бессмысленны
+        sig_candidates.append(st)
+    if not sig_candidates:
+        sig_candidates = [0]
+
+    last_error = None
+
+    for st in sig_candidates:
+        try:
+            log.info(f"\U0001f504 [{log_label}] Пробую отправить ордер через sig_type={st}...")
+
+            client = _build_client(st)
+
+            try:
+                _update_balance_allowance_safe(client)
+            except Exception as e:
+                log.warning(f"allowance update sig_type={st} failed: {e}")
+
+            raw = sender(client)
+
+            try:
+                log.info(f"\U0001f4e9 RAW order response: {raw}")
+            except Exception:
+                pass
+
+            _client = client
+            update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
+            log.info(f"✅ Рабочий sig_type для ордера: {st}")
+
+            resp = raw if isinstance(raw, dict) else _object_to_dict(raw)
+            result = {"success": True, "raw": resp}
+            result.update(_parse_fill(resp, side))
+            return result
+
+        except Exception as e:
+            last_error = e
+            err = _extract_error_text(e)
+            log.warning(f"sig_type={st} order failed: {err}")
+
+            if _is_fatal_wallet_error(err):
+                # Отказ на уровне кошелька: другие signature_type дадут то же самое.
+                # Не тратим секунды на перебор — это критично при аварийном выходе.
+                log.error("⛔ Отказ на уровне кошелька — перебор sig_type прекращён")
+                return {
+                    "error": err,
+                    "wallet_error": True,
+                    "explain": classify_order_error(err),
+                }
+            continue
+
+    err_text = _extract_error_text(last_error)
+    return {"error": err_text, "explain": classify_order_error(err_text)}
+
+
+def place_order(token_id, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
+    """
+    Лимитный ордер: size шар по цене price.
+    order_type="GTC" — кладётся в стакан (отложник),
+    "FAK"/"FOK" — агрессивный лимитник, исполняется немедленно или отменяется.
+    """
+    if _use_unified_first():
+        return _unified().place_order(token_id, side, price, size, order_type)
 
     try:
         if _client is None:
@@ -589,7 +1131,7 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
                 size = market_info["min_size"]
                 log.info(f"Size adjusted to minimum: {size}")
 
-        log.info(f"Placing order: {side} {size}@{price} | token={token_id}")
+        log.info(f"Placing {order_type} order: {side} {size}@{price} | token={token_id}")
 
         try:
             _update_balance_allowance_safe(_client)
@@ -597,97 +1139,102 @@ def place_order(token_id, side: str, price: float, size: float) -> dict:
         except Exception as e:
             log.warning(f"⚠️ Could not update allowance: {e}")
 
-        current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
-        sig_candidates = []
-        for st in [current_sig, 1, 2, 3, 0]:
-            if st not in sig_candidates:
-                sig_candidates.append(st)
+        res = _execute_with_sig_fallback(
+            lambda client: _post_order_with_client(client, token_id, side, price, size, order_type),
+            side,
+            f"LIMIT-{str(order_type).upper()}",
+        )
+        if res.get("wallet_error") and _unified_retry_allowed():
+            _switch_to_unified(res.get("error", "maker address not allowed"))
+            return _unified().place_order(token_id, side, price, size, order_type)
 
-        last_error = None
-
-        for st in sig_candidates:
-            try:
-                log.info(f"🔄 Пробую отправить ордер через sig_type={st}...")
-
-                client = _build_client(st)
-
-                try:
-                    _update_balance_allowance_safe(client)
-                except Exception as e:
-                    log.warning(f"allowance update sig_type={st} failed: {e}")
-
-                raw = _post_order_with_client(client, token_id, side, price, size)
-
-                try:
-                    log.info(f"📩 RAW order response: {raw}")
-                except Exception:
-                    pass
-
-                _client = client
-                update_env_and_config({"POLY_SIGNATURE_TYPE": str(st)})
-                log.info(f"✅ Рабочий sig_type для ордера: {st}")
-
-                resp = raw if isinstance(raw, dict) else {}
-
-                order_id = (
-                    resp.get("orderID")
-                    or resp.get("orderId")
-                    or resp.get("order_id")
-                    or resp.get("id")
-                    or ""
-                )
-
-                status = str(
-                    resp.get("status")
-                    or resp.get("state")
-                    or ""
-                ).lower()
-
-                making = resp.get("makingAmount")
-                taking = resp.get("takingAmount")
-
-                avg_price = None
-                try:
-                    if making is not None and taking is not None:
-                        making_f = float(making)
-                        taking_f = float(taking)
-                        if side == "BUY" and taking_f > 0:
-                            avg_price = making_f / taking_f
-                        elif side == "SELL" and making_f > 0:
-                            avg_price = taking_f / making_f
-                except Exception as e:
-                    log.warning(f"avg price calc failed: {e}")
-
-                matched = False
-                if status in ("matched", "filled", "complete", "completed"):
-                    matched = True
-                if (making not in (None, 0, "0")) and (taking not in (None, 0, "0")):
-                    matched = True
-
-                return {
-                    "success": True,
-                    "raw": resp,
-                    "orderID": order_id,
-                    "status": status,
-                    "matched": matched,
-                    "avg_price": avg_price,
-                    "making": making,
-                    "taking": taking,
-                }
-
-            except Exception as e:
-                last_error = e
-                err = _extract_error_text(e)
-                log.warning(f"sig_type={st} order failed: {err}")
-
-                if "maker address not allowed" in err.lower():
-                    continue
-                continue
-
-        return {"error": str(last_error)}
+        res["order_type"] = str(order_type).upper()
+        res["requested_price"] = price
+        res["requested_size"] = size
+        return res
 
     except Exception as e:
         log.error(f"place_order error: {e}")
+        return {"error": str(e)}
+
+
+def place_market_order(token_id, side: str, amount: float,
+                       worst_price: Optional[float] = None,
+                       order_type: str = "FOK") -> dict:
+    """
+    НАСТОЯЩИЙ рыночный ордер по стакану.
+
+    side="BUY"  -> amount в USDC (сколько долларов потратить)
+    side="SELL" -> amount в шарах (сколько штук продать)
+    worst_price -> худшая допустимая цена (slippage guard), 0..1 или центы
+    order_type  -> "FOK" (всё или ничего) / "FAK" (сколько есть, остаток отменить)
+    """
+    if _use_unified_first():
+        return _unified().place_market_order(token_id, side, amount, worst_price, order_type)
+
+    try:
+        if _client is None:
+            return {"error": "Trading client not initialized"}
+
+        side = "BUY" if side.upper() == "BUY" else "SELL"
+        amount = float(amount)
+
+        if amount <= 0:
+            return {"error": "Amount must be > 0"}
+
+        if worst_price is not None:
+            worst_price = float(worst_price)
+            if worst_price > 1:
+                worst_price = round(worst_price / 100, 4)
+            worst_price = max(0.001, min(0.999, worst_price))
+
+        market_info = get_market_info(token_id)
+        neg_risk = False
+        if market_info:
+            if not market_info["accepting_orders"]:
+                return {"error": "Market is closed or resolved"}
+            neg_risk = bool(market_info.get("neg_risk"))
+            if side == "SELL" and amount < market_info["min_size"]:
+                log.info(f"SELL amount {amount} меньше min_size {market_info['min_size']}")
+
+        unit = "USDC" if side == "BUY" else "shares"
+        log.info(
+            f"Placing MARKET {order_type} order: {side} {amount} {unit} "
+            f"| worst_price={worst_price} | neg_risk={neg_risk} | token={token_id}"
+        )
+
+        try:
+            _update_balance_allowance_safe(_client)
+        except Exception as e:
+            log.warning(f"⚠️ Could not update allowance: {e}")
+
+        res = _execute_with_sig_fallback(
+            lambda client: _post_market_order_with_client(
+                client, token_id, side, amount, worst_price, order_type
+            ),
+            side,
+            f"MARKET-{str(order_type).upper()}",
+        )
+        if res.get("wallet_error") and _unified_retry_allowed():
+            _switch_to_unified(res.get("error", "maker address not allowed"))
+            return _unified().place_market_order(token_id, side, amount, worst_price, order_type)
+
+        res["order_type"] = str(order_type).upper()
+        res["requested_amount"] = amount
+        res["worst_price"] = worst_price
+
+        # FOK/FAK не должны оставлять висящий ордер: нет филла = сделки не было
+        if res.get("success") and not res.get("filled"):
+            res["success"] = False
+            res["error"] = (
+                f"{res['order_type']} не исполнен (нет ликвидности по цене не хуже "
+                f"{worst_price if worst_price is not None else '—'}). Статус: {res.get('status') or 'unknown'}"
+            )
+
+        return res
+
+    except Exception as e:
+        log.error(f"place_market_order error: {e}")
         return {"error": str(e)}
 
 
@@ -714,6 +1261,8 @@ def get_open_orders() -> list:
 
     try:
         if _client is None:
+            if unified_active():
+                return _unified().get_open_orders()
             return []
 
         try:
@@ -741,6 +1290,9 @@ def cancel_order(order_id: str) -> dict:
         order_id = str(order_id or "").strip()
         if not order_id or order_id == "?":
             return {"error": "Invalid order id"}
+
+        if unified_active():
+            return _unified().cancel_order(order_id)
 
         current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
         sig_candidates = []
@@ -794,6 +1346,8 @@ def cancel_order(order_id: str) -> dict:
 
 def cancel_all() -> dict:
     try:
+        if unified_active():
+            return _unified().cancel_all()
         if _client is None:
             return {"error": "Not initialized"}
         return _client.cancel_all()

@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.state import us
+from state import us
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):

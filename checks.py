@@ -7,8 +7,8 @@ from telegram.ext import ContextTypes
 
 from database import get_stations, get_markets, get_market, get_station, get_station_history, get_setting
 from utils import fetch_metar, fetch_weather, fetch_market
-from bot.formatters import format_weather_full, format_bound_markets_block # Добавлен импорт
-from bot.keyboards import chk_kb, back
+from formatters import format_weather_full, format_bound_markets_block # Добавлен импорт
+from keyboards import chk_kb, back
 
 log = logging.getLogger("bot")
 
@@ -315,9 +315,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except telegram.error.BadRequest:
                 pass
             return
-        msg = f"📊 *{md['title']}*\n\n"
-        for o in md["options"]:
-            msg += f"🔹 {o['label']}: `{o['prob']}%`\n"
+        from formatters import format_market_options, get_last_probs
+        lines = format_market_options(md, get_last_probs(mk["slug"]))
+        msg = f"📊 *{md['title']}*\n\n" + "\n".join(lines) + "\n"
         try:
             await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=KB([back("chk_menu")]))
         except telegram.error.BadRequest:

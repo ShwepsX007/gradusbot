@@ -20,10 +20,47 @@ def _fmt_diff(diff):
         return f"{round(d, 1):+}"
     except: return str(diff)
 
+def format_market_options(md, last_probs=None, indent=""):
+    """
+    Единый рендер списка исходов рынка со стрелками тренда.
+    Используется и в проверке станции, и в проверке рынка, и в уведомлениях.
+    """
+    last_probs = last_probs or {}
+    lines = []
+    for o in md.get("options", []):
+        lbl = o.get("label", "?")
+        prob = o.get("prob")
+        old = last_probs.get(lbl)
+
+        if prob is None or prob == "?":
+            lines.append(f"{indent}🔹 {lbl}: нет цены")
+            continue
+        if old is None or old == "?":
+            lines.append(f"{indent}🔹 {lbl}: 🆕 {prob}%")
+            continue
+        try:
+            diff = float(prob) - float(old)
+        except (TypeError, ValueError):
+            diff = 0
+        if diff > 0:
+            lines.append(f"{indent}🔹 {lbl}: {old}% → {prob}% 📈 ({_fmt_diff(diff)}%)")
+        elif diff < 0:
+            lines.append(f"{indent}🔹 {lbl}: {old}% → {prob}% 📉 ({_fmt_diff(diff)}%)")
+        else:
+            lines.append(f"{indent}🔹 {lbl}: {old}% → {prob}% ➡️ (0%)")
+    return lines
+
+
+def get_last_probs(slug):
+    db_market = get_market_by_slug(slug) if slug else None
+    return (db_market.get("last_probs") if db_market else {}) or {}
+
+
 def format_bound_markets_block(station_id, limit=None):
     try:
         bindings = get_bindings(station_id)
-        if not bindings: return ""
+        if not bindings:
+            return ""
         shown = bindings[:limit] if limit is not None else bindings
         lines = ["", "📎 Привязанные рынки:"]
         for b in shown:
@@ -31,24 +68,17 @@ def format_bound_markets_block(station_id, limit=None):
             title = b.get("market_name") or slug or "Без названия"
             md = fetch_market(slug)
             if not md or not md.get("options"):
-                lines.append(f"📊 {title}: нет данных"); continue
-            db_market = get_market_by_slug(slug) if slug else None
-            last_probs = (db_market.get("last_probs") if db_market else {}) or {}
+                lines.append(f"📊 {title}: нет данных")
+                continue
             lines.append(f"📊 {title}")
-            for o in md["options"]:
-                lbl = o.get("label", "?"); prob = o.get("prob"); old = last_probs.get(lbl)
-                if prob is None or prob == "?":
-                    lines.append(f"   🔹 {lbl}: ?"); continue
-                if old is None:
-                    lines.append(f"   🔹 {lbl}: 🆕 {prob}%"); continue
-                try: diff = float(prob) - float(old)
-                except: diff = 0
-                if diff > 0: lines.append(f"   🔹 {lbl}: {old}% → {prob}% 📈 ({_fmt_diff(diff)}%)")
-                elif diff < 0: lines.append(f"   🔹 {lbl}: {old}% → {prob}% 📉 ({_fmt_diff(diff)}%)")
-                else: lines.append(f"   🔹 {lbl}: {old}% → {prob}% ➡️ (0%)")
-        if limit is not None and len(bindings) - limit > 0: lines.append(f"…и ещё {len(bindings) - limit}")
+            lines.extend(format_market_options(md, get_last_probs(slug), indent="   "))
+        if limit is not None and len(bindings) - limit > 0:
+            lines.append(f"…и ещё {len(bindings) - limit}")
         return "\n".join(lines)
-    except: return ""
+    except Exception as e:
+        log.warning(f"format_bound_markets_block error: {e}")
+        return ""
+
 
 def format_weather_full(data, units="C"):
     from utils import format_temp

@@ -12,11 +12,11 @@ from utils import (
     extract_code_from_wu, extract_api_url, extract_code_from_api,
 )
 
-from bot.state import us
-from bot.keyboards import (
+from state import us
+from keyboards import (
     REPLY_KB, st_kb, mk_kb, chk_kb, trade_kb, settings_kb, notif_kb, back
 )
-from bot.handlers.common import send_internal_error
+from common import send_internal_error
 
 log = logging.getLogger("bot")
 
@@ -111,6 +111,56 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=KB([back("tr_api_menu")])
             )
         
+        # === Ручной ввод интервалов опроса ===
+        if state and state.startswith("wait_interval_"):
+            key = state[len("wait_interval_"):]
+            limits = {
+                "interval": (10, 3600, 30),
+                "metar_interval": (10, 3600, 30),
+                "checkwx_interval": (5, 3600, 10),
+                "m_interval": (5, 3600, 10),
+                "metar_burst_interval": (5, 120, 10),
+            }
+            lo, hi, safe = limits.get(key, (5, 3600, 30))
+            try:
+                val = int(float(text.replace(",", ".")))
+            except ValueError:
+                return await update.message.reply_text("❌ Введите целое число секунд.")
+            if not (lo <= val <= hi):
+                return await update.message.reply_text(f"❌ Допустимый диапазон: {lo}–{hi} секунд.")
+
+            set_setting(key, str(val))
+            s["state"] = None
+
+            warn = ""
+            if val < safe:
+                warn = (
+                    f"\n\n⚠️ {val}с — это агрессивно. Рекомендуемый минимум {safe}с. "
+                    f"При частых 429 бот сам уйдёт в паузу."
+                )
+            from jobs import schedule_jobs
+            schedule_jobs(context)
+            return await update.message.reply_text(
+                f"✅ Интервал сохранён: *{val}с*{warn}", parse_mode="Markdown",
+                reply_markup=KB([back("back_main")])
+            )
+
+        # === Окно турбо-опроса METAR ===
+        if state == "wait_burst_window":
+            raw = text.replace(" ", "").replace(":", "").replace("—", "-").replace("–", "-")
+            try:
+                a, b = raw.split("-")
+                start, end = int(a) % 60, int(b) % 60
+            except (ValueError, AttributeError):
+                return await update.message.reply_text("❌ Формат: `45-10`", parse_mode="Markdown")
+            set_setting("metar_burst_from", str(start))
+            set_setting("metar_burst_to", str(end))
+            s["state"] = None
+            return await update.message.reply_text(
+                f"✅ Турбо-окно: с *:{start}* по *:{end}* минуту часа.",
+                parse_mode="Markdown", reply_markup=KB([back("back_main")])
+            )
+
         # === Ввод параметров стратегии для связки ===
         if state and state.startswith("wait_bind_"):
             param = state[len("wait_bind_"):]
@@ -122,13 +172,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if param in ("target", "entry_temp", "stop_temp"):
                     val = float(text.replace(",", "."))
+                    if param == "stop_temp" and val == 0:
+                        val = 0  # 0 = авто-расчёт стопа по корзине входа
                 elif param == "size":
                     val = float(text.replace(",", "."))
                     if val <= 0:
                         raise ValueError
-                elif param in ("thresh", "tp"):
+                elif param == "thresh":
                     val = int(text)
                     if not (1 <= val <= 99):
+                        raise ValueError
+                elif param in ("tp", "sl"):
+                    val = int(text)
+                    if not (0 <= val <= 99):
                         raise ValueError
                 else:
                     raise ValueError
@@ -268,6 +324,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         
+        # === Персональные окна METAR ===
+        _MET_STATES = {
+            "wait_metar_m1":     ("m1",     0, 59, "🎯 Первый выпуск: :{v:02d}"),
+            "wait_metar_m2":     ("m2",     0, 59, "🎯 Второй выпуск: :{v:02d}"),
+            "wait_metar_window": ("window", 1, 30, "➕ Держим частый опрос {v} мин после выпуска"),
+            "wait_metar_lead":   ("lead",   0, 15, "➖ Начинаем за {v} мин до выпуска"),
+            "wait_metar_fast":   ("fast",   5, 120, "⚡ В окне опрашиваем каждые {v}с"),
+        }
+        if state in _MET_STATES:
+            key, lo, hi, ok_msg = _MET_STATES[state]
+            try:
+                val = int(float(text.replace(",", ".")))
+            except ValueError:
+                return await update.message.reply_text(f"❌ Введите число от {lo} до {hi}")
+            if not (lo <= val <= hi):
+                return await update.message.reply_text(f"❌ Введите число от {lo} до {hi}")
+            sid = s.get("met_edit_sid")
+            if not sid:
+                s["state"] = None
+                return await update.message.reply_text("❌ Станция потерялась, откройте меню заново.")
+            set_setting(f"st_{sid}_metar_{key}", str(val))
+            s["state"] = None
+            from stations import _metar_win_text, _metar_win_kb
+            return await update.message.reply_text(
+                "✅ " + ok_msg.format(v=val) + "\n\n" + _metar_win_text(sid),
+                parse_mode="Markdown", reply_markup=_metar_win_kb(sid)
+            )
+
         if state == "wait_cwx_minute":
             try:
                 val = int(text)
