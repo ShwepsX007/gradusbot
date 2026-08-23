@@ -327,7 +327,9 @@ class TemperatureSniperStrategy(BaseStrategy):
                 return None
 
             order_style = "MARKET"          # MarketOrderArgs, amount в долларах
-            order_type = "FOK"
+            # Погодные рынки часто тонкие: FOK валится, если нельзя забрать
+            # весь бюджет целиком. FAK берёт доступный объём и отменяет остаток.
+            order_type = "FAK"
             est_shares = round(fill["shares"] * (amount_usd / fill["cash"]), 2) if fill["cash"] else 0.0
             est_price = fill["vwap"]
             amount = amount_usd

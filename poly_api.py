@@ -51,6 +51,7 @@ def _bind_params(bid):
         "entry_temp":   get_binding_setting(bid, "entry_temp", "17"),
         "stop_temp":    get_binding_setting(bid, "stop_temp", "0"),
         "entry_type":   get_binding_setting(bid, "entry_type", "market"),
+        "market_order_type": get_binding_setting(bid, "market_order_type", "FAK"),
         "blocked":      get_binding_setting(bid, "blocked", "0"),
         "blocked_reason": get_binding_setting(bid, "blocked_reason", ""),
     }
@@ -101,12 +102,13 @@ def _bind_card(bid):
     if strat in ("station_stop", "market_maker"):
         stop_manual = str(p["stop_temp"]) not in ("0", "", "None")
         stop_txt = f"{p['stop_temp']}°{unit}" if stop_manual else "авто (по корзине входа)"
-        et = "⚡️ По рынку (FOK)" if p["entry_type"] == "market" else "📋 Отложником (GTC)"
+        et = (f"⚡️ По рынку ({p.get('market_order_type', 'FAK')})"
+              if p["entry_type"] == "market" else "📋 Отложником (GTC)")
 
         msg += (
             f"🛑 Стоп-температура: *{stop_txt}*\n"
             f"🚪 Способ входа: *{et}*\n"
-            f"🚧 Цена отложника: *{p['thresh']}¢*\n"
+            f"🚧 Макс цена входа: *{p['thresh']}¢*\n"
             f"💸 TP: *+{p['tp']}¢* | SL: *{('-' + str(p['sl']) + '¢') if str(p['sl']) not in ('0', '') else 'выкл'}*\n"
             f"📦 Объём: *{p['size']}* ({bm})\n"
         )
@@ -129,7 +131,7 @@ def _bind_card(bid):
         ])
         kb.append([
             Btn(f"🛑 Стоп: {stop_txt}", callback_data=f"stbind_edit_{bid}_stop_temp"),
-            Btn(f"🚧 Цена: {p['thresh']}¢", callback_data=f"stbind_edit_{bid}_thresh"),
+            Btn(f"🚧 Макс цена: {p['thresh']}¢", callback_data=f"stbind_edit_{bid}_thresh"),
         ])
         kb.append([
             Btn(f"💸 TP: +{p['tp']}¢", callback_data=f"stbind_edit_{bid}_tp"),
@@ -241,11 +243,11 @@ async def _station_stop_enter(bid, option):
     if demo:
         shares = round(size_val / est_price, 2) if p["budget_mode"] == "dollars" else size_val
         fill_cents = int(round(est_price * 100))
-        ok, order_type, order_id = True, ("FOK" if entry_type == "market" else "GTC"), f"DEMO-{bid}"
+        ok, order_type, order_id = True, (p.get("market_order_type", "FAK") if entry_type == "market" else "GTC"), f"DEMO-{bid}"
         filled_size = shares
     elif entry_type == "market":
         if p["budget_mode"] == "dollars":
-            res = pt.place_market_order(token_id, "BUY", size_val, limit_price, "FOK")
+            res = pt.place_market_order(token_id, "BUY", size_val, limit_price, p.get("market_order_type", "FAK"))
         else:
             res = pt.place_order(token_id, "BUY", limit_price, size_val, "FOK")
             if res.get("success") and not res.get("filled"):
@@ -256,7 +258,7 @@ async def _station_stop_enter(bid, option):
             if res.get("explain"):
                 msg += f"\n\n💡 {res['explain']}"
             return msg
-        order_type, order_id = res.get("order_type", "FOK"), res.get("orderID", "—")
+        order_type, order_id = res.get("order_type", p.get("market_order_type", "FAK")), res.get("orderID", "—")
         filled_size = float(res.get("filled_size") or 0) or size_val
         fill_cents = int(round(float(res.get("avg_price_cents") or est_price * 100)))
     else:
@@ -298,7 +300,8 @@ async def _station_stop_enter(bid, option):
     )
 
     mode_label = "🎮 ДЕМО" if demo else "💰 РЕАЛ"
-    kind = "рыночный FOK" if entry_type == "market" else f"отложник GTC по {round(limit_price*100)}¢"
+    kind = (f"рыночный {p.get('market_order_type', 'FAK')}"
+            if entry_type == "market" else f"отложник GTC по {round(limit_price*100)}¢")
     arrow = "выше" if p["direction"] == "up" else "ниже"
 
     return (
@@ -693,7 +696,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         s[f"stopenter_{bid}"] = tradable
         p = _bind_params(bid)
-        et = "⚡️ по рынку (FOK)" if p["entry_type"] == "market" else f"📋 отложником по {p['thresh']}¢"
+        et = (f"⚡️ по рынку ({p.get('market_order_type', 'FAK')})"
+              if p["entry_type"] == "market" else f"📋 отложником по {p['thresh']}¢")
 
         kb = []
         lines = [f"🎯 *Вход в рынок* — {et}", f"📊 {b['market_name']}", "", "Выберите температурную корзину:"]
