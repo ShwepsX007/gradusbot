@@ -330,11 +330,20 @@ def init_trading() -> bool:
 
 
 def is_ready() -> bool:
-    return _client is not None
+    if _client is not None:
+        return True
+    try:
+        return unified_active() and _unified().is_ready()
+    except Exception:
+        return False
 
 
 def get_wallet_address() -> Optional[str]:
     try:
+        if unified_active():
+            addr = _unified().get_wallet_address()
+            if addr:
+                return addr
         funder = _get_env("POLY_FUNDER").strip()
         sig_type = _get_int_env("POLY_SIGNATURE_TYPE", 1)
         pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
@@ -543,9 +552,10 @@ def get_order_book(token_id: str) -> Optional[dict]:
     if not has_orderbook(tid):
         return None
 
+    # Стакан — публичные данные, ключи не нужны. Если старый SDK-клиент не поднят
+    # (например, работаем через унифицированный бэкенд), просто идём по HTTP ниже.
     if _client is None:
-        log.error("ClobClient не инициализирован для получения стакана")
-        return None
+        return _http_order_book(tid)
 
     try:
         book = _parse_book_payload(_client.get_order_book(tid))
@@ -558,6 +568,11 @@ def get_order_book(token_id: str) -> Optional[dict]:
             return None
         log.warning(f"Ошибка получения стакана через SDK: {e}. Пробую через HTTP...")
 
+    return _http_order_book(tid)
+
+
+def _http_order_book(tid: str):
+    """Публичный стакан по HTTP — авторизация не требуется."""
     try:
         r = requests.get(f"{HOST}/book", params={"token_id": tid}, timeout=10)
         if r.status_code == 200:
@@ -583,6 +598,8 @@ def get_order_book(token_id: str) -> Optional[dict]:
 def get_balance() -> Optional[float]:
     try:
         if _client is None:
+            if unified_active():
+                return _unified().get_balance()
             return None
 
         data = _get_balance_allowance_safe(_client)
@@ -1237,6 +1254,8 @@ def get_open_orders() -> list:
 
     try:
         if _client is None:
+            if unified_active():
+                return _unified().get_open_orders()
             return []
 
         try:
@@ -1264,6 +1283,9 @@ def cancel_order(order_id: str) -> dict:
         order_id = str(order_id or "").strip()
         if not order_id or order_id == "?":
             return {"error": "Invalid order id"}
+
+        if unified_active():
+            return _unified().cancel_order(order_id)
 
         current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
         sig_candidates = []
@@ -1317,6 +1339,8 @@ def cancel_order(order_id: str) -> dict:
 
 def cancel_all() -> dict:
     try:
+        if unified_active():
+            return _unified().cancel_all()
         if _client is None:
             return {"error": "Not initialized"}
         return _client.cancel_all()

@@ -33,7 +33,12 @@ _last_error = None
 
 
 def _env(key: str, default: str = "") -> str:
-    return (os.environ.get(key) or getattr(cfg, key, default) or default).strip()
+    val = os.environ.get(key) or getattr(cfg, key, "") or ""
+    if not val and key.startswith("POLY_"):
+        # допускаем имена без префикса: RELAYER_API_KEY и т.п.
+        short = key[len("POLY_"):]
+        val = os.environ.get(short) or getattr(cfg, short, "") or ""
+    return (val or default).strip()
 
 
 MIN_PY = (3, 11)
@@ -332,3 +337,38 @@ def status() -> dict:
         "relayer_key": bool(_env("POLY_RELAYER_API_KEY")),
         "error": _last_error,
     }
+def get_open_orders() -> list:
+    """Открытые ордера в формате, который уже понимает бот."""
+    c = client()
+    if not c:
+        return []
+    try:
+        out = []
+        for o in c.list_open_orders().iter_items():
+            out.append({
+                "id": str(getattr(o, "id", "") or ""),
+                "side": str(getattr(o, "side", "?")),
+                "price": float(getattr(o, "price", 0) or 0),
+                "original_size": float(getattr(o, "original_size", 0) or 0),
+                "size_matched": float(getattr(o, "size_matched", 0) or 0),
+                "token_id": str(getattr(o, "token_id", "") or ""),
+                "market": str(getattr(o, "condition_id", "") or ""),
+                "outcome": str(getattr(o, "outcome", "") or ""),
+                "order_type": str(getattr(o, "order_type", "") or ""),
+                "status": str(getattr(o, "status", "") or ""),
+            })
+        return out
+    except Exception as e:
+        log.warning(f"[unified] get_open_orders error: {e}")
+        return []
+
+
+def cancel_all() -> dict:
+    c = client()
+    if not c:
+        return {"error": f"unified client not ready: {_last_error}"}
+    try:
+        c.cancel_all()
+        return {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
