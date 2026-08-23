@@ -122,6 +122,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if param in ("target", "entry_temp", "stop_temp"):
                     val = float(text.replace(",", "."))
+                    if param == "stop_temp" and val == 0:
+                        val = 0  # 0 = авто-расчёт стопа по корзине входа
                 elif param == "size":
                     val = float(text.replace(",", "."))
                     if val <= 0:

@@ -13,11 +13,15 @@ from database import (
     add_market_history, update_market,
     get_positions, remove_position, add_trade_history,
     get_bindings, add_position, update_position_size, update_position_limits,
-    get_binding_setting, get_station,
+    get_binding_setting, set_binding_setting, get_station,
+    get_positions_by_station, position_meta,
 )
 from utils import fetch_market, format_temp, format_temp_delta
 from formatters import fetch_station_data, format_bound_markets_block
-from strategies import STRATEGIES, sort_asks, sort_bids
+from strategies import (
+    STRATEGIES, sort_asks, sort_bids,
+    stop_triggered, convert_station_temp, c_to_f,
+)
 import polymarket_trading as pt
 
 log = logging.getLogger("bot")
@@ -94,6 +98,10 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
             current_temp = float(st_data["temp"])
             old_temp = st.get("last_temp")
 
+            # ⚡ ПРИОРИТЕТ №1: аварийный выход по сигналу станции.
+            # Выполняется ДО уведомлений и любой другой логики — счёт идёт на секунды.
+            stop_reports = await run_station_stops(st, current_temp)
+
             stype = st.get("station_type")
             always_metar = (
                 get_setting("metar_always_notify", "0") == "1"
@@ -145,6 +153,12 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
 
+            for rep in stop_reports:
+                try:
+                    await context.bot.send_message(chat_id=cid, text=rep, parse_mode="Markdown")
+                except Exception as e:
+                    log.warning(f"Не удалось отправить отчёт о стопе: {e}")
+
             add_station_history(st["id"], current_temp)
             update_station(st["id"], last_temp=current_temp)
 
@@ -183,8 +197,13 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                 bid = b["id"]
                 if get_binding_setting(bid, "enabled", "0") != "1":
                     continue
+                if get_binding_setting(bid, "blocked", "0") == "1":
+                    continue
                 strat_id = get_binding_setting(bid, "strategy", "temperature_sniper")
                 if strat_id not in STRATEGIES:
+                    continue
+                # Метео Стоп входит только вручную, автосигналов у него нет
+                if strat_id in ("station_stop", "market_maker"):
                     continue
 
                 kwargs = {
@@ -255,7 +274,14 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                         1 if demo_mode else 0,
                         market_slug, signal["token_id"], "BUY", filled_size,
                         sl_val, tp_val, fill_cents,
-                        signal["question"], "YES"
+                        signal["question"], "YES",
+                        meta={
+                            "strategy": strat_id,
+                            "binding_id": bid,
+                            "station_id": st["id"],
+                            "outcome_label": signal.get("outcome_label", ""),
+                            "market_unit": signal.get("market_unit", "C"),
+                        }
                     )
 
                     mode_label = "🎮 ДЕМО" if demo_mode else "💰 РЕАЛ"
@@ -395,6 +421,136 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
     }
 
 
+# =========================================================
+# МЕТЕО СТОП: срочный выход по сигналу станции
+# =========================================================
+
+def panic_exit(pos, market_unit_temp=None):
+    """
+    Максимально быстрый выход из позиции рыночным FAK.
+    Цена-потолок опускается на panic_slippage_cents ниже лучшего бида,
+    чтобы смести несколько уровней стакана и не остаться в бумаге.
+    """
+    token_id = pos["token_id"]
+    side = str(pos.get("side", "BUY")).upper()
+    exit_side = "SELL" if side == "BUY" else "BUY"
+
+    best_price, _ = _best_price_from_book(token_id, exit_side)
+
+    try:
+        panic = float(get_setting("panic_slippage_cents", "5")) / 100.0
+    except (TypeError, ValueError):
+        panic = 0.05
+
+    if best_price is None:
+        if pos.get("is_demo") == 1:
+            best_price = float(pos.get("entry_price", 50)) / 100.0
+        else:
+            return {"success": False, "error": "стакан недоступен, выйти не удалось"}
+
+    if exit_side == "SELL":
+        worst_price = max(0.01, best_price - panic)
+    else:
+        worst_price = min(0.99, best_price + panic)
+
+    res = execute_exit(pos, worst_price, "FAK")
+    res["best_price_cents"] = round(best_price * 100, 1)
+    return res
+
+
+async def run_station_stops(st, current_temp_c):
+    """
+    Проверяет все позиции стратегии «Метео Стоп», привязанные к этой станции.
+    Если температура ушла в опасную сторону — НЕМЕДЛЕННО продаёт по рынку,
+    и только потом возвращает тексты отчётов (отправка сообщений — после сделки).
+    """
+    reports = []
+
+    try:
+        positions = get_positions_by_station(st["id"])
+    except Exception as e:
+        log.error(f"run_station_stops: не удалось получить позиции: {e}")
+        return reports
+
+    for pos in positions:
+        try:
+            meta = position_meta(pos)
+            if meta.get("strategy") != "station_stop":
+                continue
+
+            direction = meta.get("direction", "up")
+            stop_temp = meta.get("stop_temp")
+            market_unit = (meta.get("market_unit") or "C").upper()
+
+            if stop_temp is None:
+                continue
+
+            temp_market = convert_station_temp(current_temp_c, market_unit)
+            if not stop_triggered(temp_market, stop_temp, direction):
+                continue
+
+            # === СНАЧАЛА СДЕЛКА ===
+            t0 = time.time()
+            res = panic_exit(pos)
+            elapsed = round(time.time() - t0, 2)
+
+            bid = meta.get("binding_id")
+            arrow = "выше" if direction == "up" else "ниже"
+            temp_txt = f"{current_temp_c:.1f}°C / {c_to_f(current_temp_c):.1f}°F"
+
+            if not res.get("success"):
+                reports.append(
+                    f"🚨 *СТОП ПО СТАНЦИИ — ВЫЙТИ НЕ УДАЛОСЬ*\n\n"
+                    f"📌 {pos.get('question', '')}\n"
+                    f"🎯 Исход: {meta.get('outcome_label', '—')}\n"
+                    f"🌡 {temp_txt} — {arrow} стопа {stop_temp}°{market_unit}\n"
+                    f"❌ `{res.get('error')}`\n"
+                    f"Закройте позицию вручную!"
+                )
+                continue
+
+            close_cents = res["fill_cents"]
+            closed_size = res.get("filled_size", pos["size"])
+            ep = float(pos["entry_price"])
+            diff = (close_cents - ep) if str(pos.get("side", "BUY")).upper() == "BUY" else (ep - close_cents)
+            pnl = round(diff * float(closed_size) / 100.0, 2)
+
+            add_trade_history(
+                pos["is_demo"], pos["slug"], pos["question"], pos["outcome"],
+                pos["side"], closed_size, ep, close_cents, pnl
+            )
+
+            note = ""
+            if res.get("partial"):
+                remaining = round(float(pos["size"]) - float(closed_size), 2)
+                update_position_size(pos["id"], remaining)
+                note = f"\n⚠️ Частично: остаток {remaining} шт. добьём на следующем тике."
+            else:
+                remove_position(pos["id"])
+
+            # Блокируем связку: в этот рынок больше не входим
+            if bid:
+                set_binding_setting(bid, "blocked", "1")
+                set_binding_setting(bid, "blocked_reason", "station_stop")
+
+            reports.append(
+                f"🚨 *СТОП ПО СТАНЦИИ — ПОЗИЦИЯ ЗАКРЫТА*\n\n"
+                f"📌 {pos.get('question', '')}\n"
+                f"🎯 Исход: {meta.get('outcome_label', '—')}\n"
+                f"🌡 Станция: {temp_txt} — {arrow} стопа {stop_temp}°{market_unit}\n"
+                f"⚡️ Продано рыночным FAK по {close_cents}¢ "
+                f"(лучший бид был {res.get('best_price_cents')}¢), за {elapsed} с\n"
+                f"📦 Объём: {closed_size} шт.\n"
+                f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$\n"
+                f"🔒 Связка заблокирована — повторных входов не будет." + note
+            )
+
+        except Exception as e:
+            log.error(f"run_station_stops: ошибка по позиции {pos.get('id')}: {e}", exc_info=True)
+
+    return reports
+
+
 async def _handle_missing_book(context, cid, pos):
     """
     Стакан по позиции недоступен. Пара сбоев подряд — норм, но если рынок закрыт,
@@ -530,6 +686,15 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
             else:
                 remove_position(pos["id"])
 
+            # После срабатывания TP/SL в этот рынок больше не входим
+            meta = position_meta(pos)
+            bind_id = meta.get("binding_id")
+            blocked_note = ""
+            if bind_id and not res.get("partial"):
+                set_binding_setting(bind_id, "blocked", "1")
+                set_binding_setting(bind_id, "blocked_reason", kind.lower())
+                blocked_note = "\n🔒 Связка заблокирована — повторных входов не будет."
+
             icon = "🛑" if kind == "SL" else "🎯"
             mode_label = "🎮 ДЕМО" if pos["is_demo"] == 1 else "💰 РЕАЛ"
             await context.bot.send_message(
@@ -539,7 +704,7 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
                     f"📌 {pos.get('question', '')}\n"
                     f"⚡️ Рыночный FAK по {close_cents}¢ (уровень {level}¢)\n"
                     f"📦 Объём: {closed_size} шт.\n"
-                    f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$" + partial_note
+                    f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$" + blocked_note + partial_note
                 ),
                 parse_mode="Markdown"
             )

@@ -82,7 +82,7 @@ def init_db():
         );
     """)
 
-    for col in ["is_demo INTEGER DEFAULT 0", "question TEXT", "outcome TEXT"]:
+    for col in ["is_demo INTEGER DEFAULT 0", "question TEXT", "outcome TEXT", "meta TEXT"]:
         try: c.execute(f"ALTER TABLE active_positions ADD COLUMN {col}")
         except: pass
 
@@ -260,9 +260,39 @@ def get_market_by_slug(slug):
         return None
 
 # ============== POSITIONS ==============
-def add_position(is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome):
+def add_position(is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome, meta=None):
+    """meta — произвольный JSON-словарь стратегии (связка, стоп-температура, корзина)."""
+    meta_json = json.dumps(meta, ensure_ascii=False) if isinstance(meta, dict) else (meta or None)
     with get_db() as c:
-        c.execute("INSERT INTO active_positions (is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome))
+        return c.execute(
+            "INSERT INTO active_positions (is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome, meta) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (is_demo, slug, token_id, side, size, sl, tp, entry_price, question, outcome, meta_json)
+        ).lastrowid
+
+
+def position_meta(pos):
+    """Безопасно достаёт meta позиции как словарь."""
+    raw = (pos or {}).get("meta")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def get_positions_by_station(station_id):
+    """Позиции, открытые стратегией по конкретной станции (по meta.station_id)."""
+    out = []
+    for p in get_positions():
+        m = position_meta(p)
+        if m.get("station_id") == station_id:
+            out.append(p)
+    return out
 
 def get_positions():
     with get_db() as c: return [dict(r) for r in c.execute("SELECT * FROM active_positions").fetchall()]

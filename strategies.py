@@ -386,45 +386,62 @@ class TemperatureSniperStrategy(BaseStrategy):
         }
 
 
-class SimpleMarketMakerStrategy(BaseStrategy):
-    name = "Базовый Маркет-Мейкер (Стакан)"
-    description = "Заготовка под ММ. Позволяет работать со спредом, выставляя bids и asks на основе стакана."
+class StationStopStrategy(BaseStrategy):
+    """
+    Метео Стоп: вход в рынок вручную (кнопкой), выход — по сигналу станции.
+
+    Смысл: мы сидим в температурной корзине (например 16°C). Если станция показала,
+    что температура ушла в сторону, при которой наша корзина уже не сыграет,
+    надо выскочить из стакана раньше, чем это сделают остальные.
+    """
+
+    name = "Метео Стоп (выход по станции)"
+    description = (
+        "Вход в выбранную корзину вручную (по рынку или отложником). "
+        "Выход: тейк-профит, стоп-лосс или срочная продажа по сигналу станции."
+    )
 
     def analyze_market(self, market_data: dict, station_data: dict, order_books: dict) -> Optional[dict]:
-        """
-        Сюда вы можете зашить логику маркет-мейкера.
-        Вам доступны:
-        - order_books[token_id]['bids'] -> список уровней покупки
-        - order_books[token_id]['asks'] -> список уровней продажи
-        """
-        options = market_data.get("options", [])
-        if not options:
-            return None
-        
-        token_id = options[0].get("token_yes")
-        book = order_books.get(token_id)
-        
-        if not book or not book.get("bids") or not book.get("asks"):
-            return None
-            
-        best_bid = float(book["bids"][0]["price"])
-        best_ask = float(book["asks"][0]["price"])
-        spread = best_ask - best_bid
-        
-        # Ваша будущая ММ логика расчёта сеток лимитных ордеров:
-        if spread >= 0.02:
-            pass
-            
+        # Автовхода нет — вход выполняется кнопкой «Войти в рынок»
         return None
+
+
+def auto_stop_temp(bucket, direction):
+    """
+    Температура стопа из корзины, в которую мы вошли (в единицах рынка).
+      корзина 70-71°F, direction=up   -> стоп 72 (стало теплее — корзина не сыграет)
+      корзина 70-71°F, direction=down -> стоп 69
+      корзина '84°F or higher', up    -> стопа сверху нет
+    Возвращает None, если в эту сторону корзина не может «сломаться».
+    """
+    if not bucket:
+        return None
+    lo, hi, _ = bucket
+    if direction == "up":
+        return None if hi == float("inf") else hi + 1.0
+    return None if lo == float("-inf") else lo - 1.0
+
+
+def stop_triggered(temp_market, stop_temp, direction):
+    """
+    Сработал ли стоп. Сравниваем по округлённому градусу — рынки резолвятся по целым.
+    """
+    if temp_market is None or stop_temp is None:
+        return False
+    t = round(float(temp_market))
+    if direction == "up":
+        return t >= float(stop_temp) - 1e-9
+    return t <= float(stop_temp) + 1e-9
 
 
 # Регистрация стратегий
 STRATEGIES = {
-    "front_runner": TemperatureSniperStrategy,
     "temperature_sniper": TemperatureSniperStrategy,
-    "market_maker": SimpleMarketMakerStrategy,
-    "station_stop": TemperatureSniperStrategy # Добавлен алиас для обратной совместимости
+    "front_runner": TemperatureSniperStrategy,   # алиас для обратной совместимости
+    "station_stop": StationStopStrategy,
+    "market_maker": StationStopStrategy,         # старый id заменённой заготовки ММ
 }
+
 
 def get_strategies_list():
     """Возвращает список стратегий для отображения в Telegram."""
