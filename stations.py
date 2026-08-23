@@ -92,7 +92,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def edit_text(text, **kwargs):
         try: return await q.edit_message_text(text, **kwargs)
         except telegram.error.BadRequest as e:
-            if "Message is not modified" in str(e): return q.message
+            msg = str(e)
+            if "Message is not modified" in msg: return q.message
+            if "parse entities" in msg:
+                # кривая разметка (например, подчёркивания в названии) — шлём без неё
+                plain = dict(kwargs)
+                plain.pop("parse_mode", None)
+                clean = str(text).replace("*", "").replace("`", "")
+                try: return await q.edit_message_text(clean, **plain)
+                except telegram.error.BadRequest: return q.message
             raise
 
     if d == "st_cwx_win":

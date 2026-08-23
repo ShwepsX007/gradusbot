@@ -312,17 +312,48 @@ async def _station_stop_enter(bid, option):
 
 
 async def _safe_edit(q, text, **kwargs):
-    """edit_message_text c подавлением 'Message is not modified'."""
+    """
+    edit_message_text c подавлением 'Message is not modified' и страховкой
+    от кривой разметки: если Telegram не смог разобрать Markdown
+    (например, из-за подчёркиваний в именах переменных), отправляем как есть.
+    """
     try:
         return await q.edit_message_text(text, **kwargs)
     except telegram.error.BadRequest as e:
-        if "Message is not modified" in str(e):
+        msg = str(e)
+        if "Message is not modified" in msg:
             try:
                 await q.answer()
             except Exception:
                 pass
             return
+        if "parse entities" in msg or "parse_mode" in msg:
+            log.warning(f"Markdown не разобран ({msg}) — отправляю без разметки")
+            plain = dict(kwargs)
+            plain.pop("parse_mode", None)
+            try:
+                return await q.edit_message_text(_strip_md(text), **plain)
+            except telegram.error.BadRequest as e2:
+                if "Message is not modified" in str(e2):
+                    return
+                raise
         raise
+
+
+def _md(text) -> str:
+    """Экранируем markdown-символы в подставляемых значениях (POLY_FUNDER и т.п.)."""
+    out = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+def _strip_md(text: str) -> str:
+    """Убираем markdown-символы, чтобы текст читался без разметки."""
+    out = str(text)
+    for ch in ("*", "`"):
+        out = out.replace(ch, "")
+    return out
 
 
 # =========================================================
@@ -362,7 +393,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🩺 *Диагностика кошелька Polymarket*\n\n"
             f"🔑 Подписант (EOA): `{info['eoa'] or '—'}`\n"
             f"🏦 Кошелёк ордеров (funder): `{info['funder'] or 'НЕ ЗАДАН'}`\n"
-            f"✍️ Тип подписи: *{info['signature_type']}* — {info['sig_name']}\n"
+            f"✍️ Тип подписи: *{info['signature_type']}* — {_md(info['sig_name'])}\n"
             f"🔐 API-ключи: {'✅' if info['has_creds'] else '❌'}\n"
             f"🤖 Клиент: {'✅ готов' if info['ready'] else '❌ не инициализирован'}\n"
             f"💰 Баланс: {info['balance'] if info['balance'] is not None else '—'}$\n"
@@ -376,15 +407,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{'' if u.get('python_ok', True) else ' ⚠️ нужен 3.11+'}\n"
         )
         if u.get("hint"):
-            txt += f"❗ {u['hint']}\n"
+            txt += f"❗ {_md(u['hint'])}\n"
         if u.get("ready"):
             txt += (f"Кошелёк аккаунта: `{u.get('wallet')}`\n"
-                    f"Тип: *{u.get('wallet_type')}*\n")
+                    f"Тип: *{_md(u.get('wallet_type'))}*\n")
         elif u.get("error"):
-            txt += f"Ошибка: `{str(u['error'])[:150]}`\n"
+            txt += f"Ошибка: `{_md(str(u['error'])[:150])}`\n"
 
         if info["problems"]:
-            txt += "\n⚠️ *Проблемы:*\n" + "\n".join(f"• {p}" for p in info["problems"])
+            txt += "\n⚠️ *Проблемы:*\n" + "\n".join(f"• {_md(p)}" for p in info["problems"])
             txt += (
                 "\n\n💡 Все кошельки Polymarket, созданные с мая 2026, — это Deposit Wallet, "
                 "и старый py-clob-client-v2 их не умеет. Поставьте `polymarket-client`, "
