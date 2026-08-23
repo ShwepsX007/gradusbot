@@ -110,6 +110,110 @@ def walk_book_by_shares(asks, want_shares, worst_price):
     return {"shares": round(shares, 4), "cash": round(cash, 4), "vwap": round(vwap, 4)}
 
 
+RANGE_RE = re.compile(
+    r'(-?\d+(?:\.\d+)?)\s*(?:°|deg)?\s*[cf]?\s*(?:-|–|—|to)\s*(-?\d+(?:\.\d+)?)',
+    re.IGNORECASE
+)
+UNIT_RE = re.compile(r'°?\s*(?<![a-z])([cf])(?![a-z])', re.IGNORECASE)
+
+BELOW_WORDS = ("or below", "or lower", "or less", "below", "under", "and below", "or colder")
+ABOVE_WORDS = ("or higher", "or above", "or more", "above", "over", "and above", "or warmer")
+
+
+def detect_label_unit(text):
+    """Единица измерения из подписи исхода: 'F', 'C' или None."""
+    if not text:
+        return None
+    low = text.lower()
+    if "°f" in low or "fahrenheit" in low:
+        return "F"
+    if "°c" in low or "celsius" in low:
+        return "C"
+    m = UNIT_RE.search(low)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def detect_market_unit(options, default=None):
+    """Единица рынка по большинству подписей исходов (рынки Polymarket по погоде обычно в °F)."""
+    votes = {"F": 0, "C": 0}
+    for o in options or []:
+        u = detect_label_unit(o.get("label") or o.get("question") or "")
+        if u in votes:
+            votes[u] += 1
+    if votes["F"] or votes["C"]:
+        return "F" if votes["F"] >= votes["C"] else "C"
+    return default
+
+
+def parse_option_bucket(text):
+    """
+    Разбирает подпись исхода в интервал температур.
+      '65°F or below' -> (-inf, 65)
+      '66-67°F'       -> (66, 67)
+      '84°F or higher'-> (84, +inf)
+      'Above 30C'     -> (30, +inf)
+      '72°F'          -> (72, 72)
+    Возвращает (lo, hi, unit) или None.
+    """
+    if not text:
+        return None
+    low = text.strip().lower()
+    unit = detect_label_unit(low)
+
+    m = RANGE_RE.search(low)
+    if m:
+        lo, hi = float(m.group(1)), float(m.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+        return (lo, hi, unit)
+
+    nums = NUM_RE.findall(low)
+    if not nums:
+        return None
+    val = float(nums[0])
+
+    if any(w in low for w in BELOW_WORDS):
+        return (float("-inf"), val, unit)
+    if any(w in low for w in ABOVE_WORDS):
+        return (val, float("inf"), unit)
+
+    return (val, val, unit)
+
+
+def bucket_contains(bucket, temp):
+    """
+    Рынки погоды резолвятся по целым градусам, поэтому сравниваем округлённое значение.
+    '66-67°F' покрывает 66 и 67 градусов.
+    """
+    if bucket is None or temp is None:
+        return False
+    lo, hi, _ = bucket
+    t = round(float(temp))
+    return lo - 1e-9 <= t <= hi + 1e-9
+
+
+def bucket_label(bucket, unit):
+    lo, hi, _ = bucket
+    u = f"°{unit}" if unit else ""
+    if lo == float("-inf"):
+        return f"{_num(hi)}{u} и ниже"
+    if hi == float("inf"):
+        return f"{_num(lo)}{u} и выше"
+    if lo == hi:
+        return f"{_num(lo)}{u}"
+    return f"{_num(lo)}–{_num(hi)}{u}"
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else f"{f:g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
 class TemperatureSniperStrategy(BaseStrategy):
     name = "Метео Снайпер (Стакан)"
     description = "Осуществляет вход по реальному аску из стакана, если погодные условия удовлетворены."
@@ -121,43 +225,68 @@ class TemperatureSniperStrategy(BaseStrategy):
         entry_threshold = float(self.params.get("thresh", 55.0))  # Максимальная цена в центах
         budget_mode = self.params.get("budget_mode", "dollars")  # dollars / shares
         size = float(self.params.get("size", 10.0))
-        unit = self.params.get("unit", "C").upper()
+        unit = (self.params.get("unit", "C") or "C").upper()   # единица ЦЕЛИ, заданной пользователем
 
         current_temp_c = station_data.get("temp")
         if current_temp_c is None:
             return None
 
-        entry_temp = convert_station_temp(current_temp_c, unit)
-        
-        # Проверка триггера погоды
-        trigger_fired = False
-        if direction == "up" and entry_temp >= target_temp:
-            trigger_fired = True
-        elif direction == "down" and entry_temp <= target_temp:
-            trigger_fired = True
+        # Температура в единицах цели — для проверки триггера.
+        # Округляем до 0.1, иначе 21.1°C = 69.98°F не пройдёт цель «70°F».
+        entry_temp = round(convert_station_temp(current_temp_c, unit), 1)
 
+        trigger_fired = (
+            (direction == "up" and entry_temp >= target_temp) or
+            (direction == "down" and entry_temp <= target_temp)
+        )
         if not trigger_fired:
             return None
 
-        # Поиск нужной опции рынка (YES токена под наше условие)
         options = market_data.get("options", [])
+        if not options:
+            return None
+
+        # Единица РЫНКА определяется по его же подписям: '72-73°F' -> F, 'Above 30C' -> C
+        market_unit = detect_market_unit(options, default=unit)
+        market_temp = convert_station_temp(current_temp_c, market_unit)
+
+        # 1) Диапазонные рынки: ищем корзину, в которую попадает текущая температура
         best_option = None
+        best_bucket = None
         for o in options:
-            q = o.get("label", "").lower() or o.get("question", "").lower()
-            t = extract_temp_from_title(q)
-            if t is not None:
-                if direction == "up" and ("above" in q or "higher" in q) and entry_temp >= t:
-                    best_option = o
+            label = o.get("label") or o.get("question") or ""
+            bucket = parse_option_bucket(label)
+            if bucket and bucket_contains(bucket, market_temp):
+                best_option, best_bucket = o, bucket
+                break
+
+        # 2) Фолбэк для рынков вида 'Above X' / 'Below X' без корзин
+        if best_option is None:
+            for o in options:
+                label = (o.get("label") or o.get("question") or "").lower()
+                t = extract_temp_from_title(label)
+                if t is None:
+                    continue
+                if direction == "up" and any(w in label for w in ABOVE_WORDS) and market_temp >= t:
+                    best_option, best_bucket = o, (t, float("inf"), market_unit)
                     break
-                if direction == "down" and ("below" in q or "lower" in q) and entry_temp <= t:
-                    best_option = o
+                if direction == "down" and any(w in label for w in BELOW_WORDS) and market_temp <= t:
+                    best_option, best_bucket = o, (float("-inf"), t, market_unit)
                     break
 
         if not best_option:
+            log.info(
+                f"Нет подходящего исхода: температура {round(market_temp, 1)}°{market_unit} "
+                f"не попала ни в одну корзину рынка."
+            )
             return None
 
-        token_id = best_option.get("token_yes") or best_option.get("condition_id")
+        token_id = best_option.get("token_yes")
         if not token_id:
+            log.warning(
+                f"У исхода «{best_option.get('label', '?')}» нет CLOB token_yes — "
+                f"вход невозможен (стакана по condition_id не существует)."
+            )
             return None
 
         # --- НЕПРЕРЫВНАЯ РАБОТА СО СТАКАНОМ ---
@@ -226,9 +355,14 @@ class TemperatureSniperStrategy(BaseStrategy):
                 f"исполнение уйдёт глубже в стакан, расчётный VWAP {est_cents}¢."
             )
 
+        temp_c = float(current_temp_c)
+        temp_both = f"{temp_c:.1f}°C / {c_to_f(temp_c):.1f}°F"
+
         reason = (
-            f"Погодный триггер сработал: {entry_temp}°{unit}. "
-            f"Best Ask {round(ask_cents, 1)}¢, расчётный VWAP по стакану {est_cents}¢ "
+            f"Температура {temp_both} попала в исход «{best_option.get('label', '?')}» "
+            f"({bucket_label(best_bucket, market_unit)}). "
+            f"Цель {_num(target_temp)}°{unit} пройдена. "
+            f"Best Ask {round(ask_cents, 1)}¢, VWAP по стакану {est_cents}¢ "
             f"<= порога {entry_threshold}¢. Вход рыночным {order_type}."
         )
 
@@ -246,6 +380,8 @@ class TemperatureSniperStrategy(BaseStrategy):
             'size': est_shares,
             'question': best_option.get("question", market_data.get("name", "")),
             'unit': unit,
+            'market_unit': market_unit,
+            'outcome_label': best_option.get('label', ''),
             'reason': reason,
         }
 

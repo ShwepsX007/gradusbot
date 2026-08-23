@@ -315,9 +315,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except telegram.error.BadRequest:
                 pass
             return
-        msg = f"📊 *{md['title']}*\n\n"
-        for o in md["options"]:
-            msg += f"🔹 {o['label']}: `{o['prob']}%`\n"
+        from formatters import format_market_options, get_last_probs
+        lines = format_market_options(md, get_last_probs(mk["slug"]))
+        msg = f"📊 *{md['title']}*\n\n" + "\n".join(lines) + "\n"
         try:
             await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=KB([back("chk_menu")]))
         except telegram.error.BadRequest:

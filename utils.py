@@ -284,7 +284,29 @@ def fetch_market(slug):
             if prices and len(prices) > 0: prob = _to_percent(prices[0])
             elif m.get("probability") is not None: prob = _to_percent(m.get("probability"))
             if prob is None: prob = 0 if is_closed else "?"
-            opts.append({"label": label, "prob": prob})
+
+            # CLOB token ids нужны стратегиям: по ним берётся стакан и отправляется ордер
+            tids = _as_list(m.get("clobTokenIds"))
+            outcomes = [str(x).strip().lower() for x in _as_list(m.get("outcomes"))]
+            yes_idx, no_idx = 0, 1
+            if len(outcomes) >= 2 and "yes" in outcomes and "no" in outcomes:
+                yes_idx, no_idx = outcomes.index("yes"), outcomes.index("no")
+            token_yes = str(tids[yes_idx]) if len(tids) > yes_idx else None
+            token_no = str(tids[no_idx]) if len(tids) > no_idx else None
+
+            active = m.get("active")
+            if active is None: active = not bool(m.get("closed", False))
+
+            opts.append({
+                "label": label,
+                "prob": prob,
+                "token_yes": token_yes,
+                "token_no": token_no,
+                "question": m.get("question") or label,
+                "active": bool(active),
+                "accepting_orders": bool(m.get("acceptingOrders", active)),
+                "neg_risk": bool(m.get("negRisk", False)),
+            })
 
         return {"title": data.get("title") or data.get("question") or slug, "options": opts, "closed": is_closed}
     except: return None

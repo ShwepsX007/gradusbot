@@ -15,7 +15,7 @@ from database import (
     get_bindings, add_position, update_position_size, update_position_limits,
     get_binding_setting, get_station,
 )
-from utils import fetch_market
+from utils import fetch_market, format_temp, format_temp_delta
 from formatters import fetch_station_data, format_bound_markets_block
 from strategies import STRATEGIES, sort_asks, sort_bids
 import polymarket_trading as pt
@@ -105,26 +105,32 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
             should_notify = notify_stations and (temp_changed or always_metar or first_time)
 
             if should_notify:
+                # Единицы берём из общих настроек: "C", "F" или "B" (обе сразу),
+                # ровно как в ручной проверке станции.
+                units = get_setting("units", "B") or "B"
+
                 if old_temp is None:
-                    old_temp_f = current_temp
-                    diff = 0.0
-                    trend_emoji, diff_str = ("🆕", "первое")
+                    old_temp_c = current_temp
+                    trend_emoji = "🆕"
+                    diff_str = "первое измерение"
                 else:
-                    old_temp_f = float(old_temp)
-                    diff = current_temp - old_temp_f
+                    old_temp_c = float(old_temp)
+                    diff = current_temp - old_temp_c
                     if diff > 0:
-                        trend_emoji, diff_str = ("📈", f"+{diff:.1f}")
+                        trend_emoji = "📈"
                     elif diff < 0:
-                        trend_emoji, diff_str = ("📉", f"{diff:.1f}")
+                        trend_emoji = "📉"
                     else:
-                        trend_emoji, diff_str = ("➡️", "без изменений")
+                        trend_emoji = "➡️"
+                    diff_str = (
+                        format_temp_delta(old_temp_c, current_temp, units)
+                        if diff else "без изменений"
+                    )
 
                 try:
                     bound_text = format_bound_markets_block(st["id"])
-                except:
+                except Exception:
                     bound_text = ""
-                bindings = get_bindings(st["id"])
-                unit = get_binding_setting(bindings[0]["id"], "unit", "C") if bindings else "C"
 
                 title = (
                     "🌡 *Обновление METAR*"
@@ -133,7 +139,8 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                 )
                 msg = (
                     f"{title}: {st.get('name', 'Станция')}\n"
-                    f"{trend_emoji} Было: `{old_temp_f}°{unit}` ➡️ Стало: `{current_temp}°{unit}` ({diff_str})\n\n"
+                    f"{trend_emoji} Было: `{format_temp(old_temp_c, units)}` "
+                    f"➡️ Стало: `{format_temp(current_temp, units)}` ({diff_str})\n\n"
                     f"{bound_text}"
                 )
                 await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
@@ -194,14 +201,18 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                 if not market_data or not market_data.get("options"):
                     continue
 
+                # Стаканы тянем только для торгуемых исходов с валидным CLOB token_id
                 order_books = {}
                 for opt in market_data.get("options", []):
-                    token_id = opt.get("token_yes") or opt.get("condition_id")
-                    if token_id:
-                        book = pt.get_order_book(token_id)
-                        if book:
-                            order_books[token_id] = book
-                        await asyncio.sleep(0.05)
+                    token_id = opt.get("token_yes")
+                    if not token_id or not opt.get("active", True):
+                        continue
+                    if not pt.has_orderbook(token_id):
+                        continue
+                    book = pt.get_order_book(token_id)
+                    if book:
+                        order_books[token_id] = book
+                    await asyncio.sleep(0.05)
 
                 signal = strategy_inst.analyze_market(market_data, {"temp": current_temp}, order_books)
                 if signal and signal.get("action") == "BUY":
@@ -254,6 +265,7 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                     msg = (
                         f"🚀 *Вход в позицию ({mode_label})*\n\n"
                         f"📌 *Рынок:* {signal['question']}\n"
+                        f"🎯 *Исход:* {signal.get('outcome_label') or '—'}\n"
                         f"⚡️ *Тип ордера:* рыночный {res.get('order_type', 'FOK')}\n"
                         f"📊 *Цена факт. исполнения:* {fill_cents}¢ "
                         f"(потолок {round(signal['worst_price'] * 100)}¢)\n"
