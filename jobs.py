@@ -46,19 +46,62 @@ def fmt_metar_temp(val):
 _LAST_METAR_POLL = {}   # station_id -> timestamp
 
 
+def _int_setting(key, default):
+    try:
+        v = get_setting(key, None)
+        if v is None or str(v).strip() == "":
+            return default
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _minute_in_window(minute, center, lead, window):
+    """Попадает ли минута часа в окно [center-lead ; center+window]."""
+    start = (center - lead) % 60
+    end = (center + window) % 60
+    if start <= end:
+        return start <= minute <= end
+    return minute >= start or minute <= end
+
+
+def station_metar_window(sid):
+    """
+    Персональное окно выпуска METAR для станции.
+    Возвращает (настроено?, in_window, fast_interval).
+
+    У разных аэропортов свои минуты выпуска, и часто сводка приходит
+    дважды в час (например Париж :25 и :55). Поэтому окна два.
+    """
+    m1 = _int_setting(f"st_{sid}_metar_m1", -1)
+    m2 = _int_setting(f"st_{sid}_metar_m2", -1)
+    if m1 < 0 and m2 < 0:
+        return False, False, None
+
+    lead = _int_setting(f"st_{sid}_metar_lead", 3)
+    window = _int_setting(f"st_{sid}_metar_window", 8)
+    fast = _int_setting(f"st_{sid}_metar_fast",
+                        _int_setting("metar_burst_interval", 10))
+
+    minute = datetime.now(timezone.utc).minute
+    hit = False
+    for center in (m1, m2):
+        if 0 <= center <= 59 and _minute_in_window(minute, center, lead, window):
+            hit = True
+            break
+    return True, hit, max(5, fast)
+
+
 def _in_burst_window(now_utc=None):
     """
-    METAR выпускается раз в час (обычно :50–:56) плюс внеплановые SPECI.
-    Внутри окна опрашиваем часто, вне окна — редко: и сигнал ловим быстро,
-    и лишнюю нагрузку на AWC не создаём.
+    Глобальное турбо-окно: METAR выпускается раз в час (обычно :50–:56)
+    плюс внеплановые SPECI. Внутри окна опрашиваем часто, вне окна — редко.
+    Используется для станций, у которых нет персонального окна.
     """
     if get_setting("metar_burst", "1") != "1":
         return False
-    try:
-        start = int(get_setting("metar_burst_from", "45")) % 60
-        end = int(get_setting("metar_burst_to", "10")) % 60
-    except (TypeError, ValueError):
-        start, end = 45, 10
+    start = _int_setting("metar_burst_from", 45) % 60
+    end = _int_setting("metar_burst_to", 10) % 60
 
     minute = (now_utc or datetime.now(timezone.utc)).minute
     if start <= end:
@@ -67,18 +110,18 @@ def _in_burst_window(now_utc=None):
 
 
 def metar_poll_due(station_id):
-    """Пора ли опрашивать эту METAR-станцию с учётом турбо-окна."""
+    """Пора ли опрашивать эту METAR-станцию с учётом окна выпуска сводки."""
     now = time.time()
 
-    def _int(key, default):
-        try:
-            return int(float(get_setting(key, str(default)) or default))
-        except (TypeError, ValueError):
-            return default
+    slow = max(5, _int_setting("metar_interval", 60))
+    configured, in_window, fast = station_metar_window(station_id)
 
-    burst = _in_burst_window()
-    need = _int("metar_burst_interval", 10) if burst else _int("metar_interval", 60)
-    need = max(5, need)
+    if configured:
+        burst = in_window
+        need = fast if in_window else slow
+    else:
+        burst = _in_burst_window()
+        need = max(5, _int_setting("metar_burst_interval", 10)) if burst else slow
 
     last = _LAST_METAR_POLL.get(station_id, 0)
     if now - last < need:
@@ -305,6 +348,7 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                                 f"⚠️ *Вход не состоялся ({signal.get('order_type', 'FOK')})*\n"
                                 f"📌 {signal.get('question', '')}\n"
                                 f"`{res.get('error')}`"
+                                + (f"\n\n💡 {res['explain']}" if res.get("explain") else "")
                             ),
                             parse_mode="Markdown"
                         )
@@ -419,7 +463,8 @@ def execute_entry(signal: dict, demo_mode: bool) -> dict:
                             f"{round(worst_price * 100)}¢"}
 
     if res.get("error") or not res.get("success"):
-        return {"success": False, "error": res.get("error", "unknown error")}
+        return {"success": False, "error": res.get("error", "unknown error"),
+                "explain": res.get("explain")}
 
     filled_size = float(res.get("filled_size") or 0)
     fill_cents = res.get("avg_price_cents")
@@ -463,7 +508,8 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
         )
 
     if res.get("error") or not res.get("success"):
-        return {"success": False, "error": res.get("error", "unknown error")}
+        return {"success": False, "error": res.get("error", "unknown error"),
+                "explain": res.get("explain")}
 
     fill_cents = res.get("avg_price_cents") or round(worst_price * 100, 1)
     return {
@@ -560,7 +606,8 @@ async def run_station_stops(st, current_temp_c):
                     f"🎯 Исход: {meta.get('outcome_label', '—')}\n"
                     f"🌡 {temp_txt} — {arrow} стопа {stop_temp}°{market_unit}\n"
                     f"❌ `{res.get('error')}`\n"
-                    f"Закройте позицию вручную!"
+                    + (f"💡 {res['explain']}\n" if res.get("explain") else "")
+                    + "Закройте позицию вручную!"
                 )
                 continue
 
@@ -717,6 +764,7 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
                         f"📌 {pos.get('question', '')}\n"
                         f"Текущий bid: {cur_cents}¢ | Уровень: {level}¢\n"
                         f"`{res.get('error')}`"
+                        + (f"\n\n💡 {res['explain']}" if res.get("explain") else "")
                     ),
                     parse_mode="Markdown"
                 )
@@ -857,11 +905,21 @@ def schedule_jobs(context, cid=None):
     )
     # Джоб тикает часто, но реальные запросы фильтрует metar_poll_due()
     metar_tick = si_metar
+    fast_candidates = []
     if get_setting("metar_burst", "1") == "1":
-        try:
-            metar_tick = max(5, min(si_metar, int(get_setting("metar_burst_interval", "10"))))
-        except (TypeError, ValueError):
-            metar_tick = si_metar
+        fast_candidates.append(_int_setting("metar_burst_interval", 10))
+    try:
+        from database import get_stations as _gs
+        for _st in _gs():
+            if _st.get("station_type") != "metar":
+                continue
+            configured, _, fast = station_metar_window(_st["id"])
+            if configured and fast:
+                fast_candidates.append(fast)
+    except Exception as e:
+        log.warning(f"metar tick scan failed: {e}")
+    if fast_candidates:
+        metar_tick = max(5, min([si_metar] + fast_candidates))
 
     jq.run_repeating(
         job_stations, interval=metar_tick, first=2,

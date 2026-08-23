@@ -357,11 +357,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "trade_diagnose":
         import polymarket_trading as pt
+        info = pt.wallet_diagnostics()
+        txt = (
+            "🩺 *Диагностика кошелька Polymarket*\n\n"
+            f"🔑 Подписант (EOA): `{info['eoa'] or '—'}`\n"
+            f"🏦 Кошелёк ордеров (funder): `{info['funder'] or 'НЕ ЗАДАН'}`\n"
+            f"✍️ Тип подписи: *{info['signature_type']}* — {info['sig_name']}\n"
+            f"🔐 API-ключи: {'✅' if info['has_creds'] else '❌'}\n"
+            f"🤖 Клиент: {'✅ готов' if info['ready'] else '❌ не инициализирован'}\n"
+            f"💰 Баланс: {info['balance'] if info['balance'] is not None else '—'}$\n"
+        )
+        if info["problems"]:
+            txt += "\n⚠️ *Проблемы:*\n" + "\n".join(f"• {p}" for p in info["problems"])
+            txt += (
+                "\n\n💡 CLOB V2 принимает ордера только от депозит-кошелька Polymarket. "
+                "Адрес берётся из окна Deposit на polymarket.com и кладётся в `POLY_FUNDER`, "
+                "тип подписи — 3 (депозит-кошелёк) или 2 (Gnosis Safe). Залог должен быть в pUSD."
+            )
+        else:
+            txt += "\n✅ Конфигурация выглядит корректно."
         return await _safe_edit(
-            q,
-            f"🔍 *Диагностика Polymarket*\n🔑 EOA: `{pt.get_eoa_address()}`\n"
-            f"🤖 Клиент: {'✅ ОК' if pt.is_ready() else '❌ Ошибка'}",
-            parse_mode="Markdown",
+            q, txt, parse_mode="Markdown",
             reply_markup=KB([
                 [Btn("🔄 Переинициализировать", callback_data="trade_reinit")],
                 back("tr_api_menu")

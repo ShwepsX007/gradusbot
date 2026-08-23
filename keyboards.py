@@ -22,7 +22,8 @@ def st_kb():
         [Btn("🔄 Вкл/Выкл", callback_data="st_toggle"),
          Btn("✏️ Переименовать", callback_data="st_rename")],
         [Btn("🗑 Удалить", callback_data="st_delete")],
-        [Btn("⚡ Окно CheckWX", callback_data="st_cwx_win")],
+        [Btn("⚡ Окно CheckWX", callback_data="st_cwx_win"),
+         Btn("✈️ Окна METAR", callback_data="st_met_win")],
         back("back_main")
     ])
 
@@ -72,6 +73,7 @@ def api_settings_kb():
     retries = get_setting("order_retries", "3")
     return KB([
         [Btn("📝 Проверить API ключи", callback_data="chk_api")],
+        [Btn("🩺 Диагностика кошелька", callback_data="trade_diagnose")],
         [Btn(f"⏱ Таймаут ордера: {timeout}с", callback_data="set_order_timeout"),
          Btn(f"🔁 Попыток входа: {retries}", callback_data="set_order_retries")],
         back("tr_back")

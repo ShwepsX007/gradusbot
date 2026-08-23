@@ -324,6 +324,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         
+        # === Персональные окна METAR ===
+        _MET_STATES = {
+            "wait_metar_m1":     ("m1",     0, 59, "🎯 Первый выпуск: :{v:02d}"),
+            "wait_metar_m2":     ("m2",     0, 59, "🎯 Второй выпуск: :{v:02d}"),
+            "wait_metar_window": ("window", 1, 30, "➕ Держим частый опрос {v} мин после выпуска"),
+            "wait_metar_lead":   ("lead",   0, 15, "➖ Начинаем за {v} мин до выпуска"),
+            "wait_metar_fast":   ("fast",   5, 120, "⚡ В окне опрашиваем каждые {v}с"),
+        }
+        if state in _MET_STATES:
+            key, lo, hi, ok_msg = _MET_STATES[state]
+            try:
+                val = int(float(text.replace(",", ".")))
+            except ValueError:
+                return await update.message.reply_text(f"❌ Введите число от {lo} до {hi}")
+            if not (lo <= val <= hi):
+                return await update.message.reply_text(f"❌ Введите число от {lo} до {hi}")
+            sid = s.get("met_edit_sid")
+            if not sid:
+                s["state"] = None
+                return await update.message.reply_text("❌ Станция потерялась, откройте меню заново.")
+            set_setting(f"st_{sid}_metar_{key}", str(val))
+            s["state"] = None
+            from stations import _metar_win_text, _metar_win_kb
+            return await update.message.reply_text(
+                "✅ " + ok_msg.format(v=val) + "\n\n" + _metar_win_text(sid),
+                parse_mode="Markdown", reply_markup=_metar_win_kb(sid)
+            )
+
         if state == "wait_cwx_minute":
             try:
                 val = int(text)

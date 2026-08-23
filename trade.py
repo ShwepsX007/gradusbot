@@ -98,7 +98,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             import polymarket_trading as pt
             res = pt.place_order(token_id, side, price, size)
             if isinstance(res, dict) and res.get("error"):
-                return await q.edit_message_text(f"❌ Ошибка:\n`{res['error']}`", parse_mode="Markdown", reply_markup=KB([back("tr_back")]))
+                msg = f"❌ Ошибка:\n`{res['error']}`"
+                if res.get("explain"):
+                    msg += f"\n\n💡 {res['explain']}"
+                return await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=KB([back("tr_back")]))
             order_id = res.get("orderID", "unknown") if isinstance(res, dict) else "unknown"
             success = res.get("success", False) if isinstance(res, dict) else True
 

@@ -2,7 +2,7 @@ import logging
 from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as KB
 from telegram.ext import ContextTypes
 import telegram.error
-from database import (get_stations, get_station, update_station, delete_station, get_market_by_slug, add_market, add_binding, get_bindings, get_setting, add_station)
+from database import (get_stations, get_station, update_station, delete_station, get_market_by_slug, add_market, add_binding, get_bindings, get_setting, set_setting, add_station)
 from utils import format_temp, search_markets
 from state import us, icon
 from keyboards import st_kb, back
@@ -13,6 +13,71 @@ def _build_toggle_kb(stations):
     kb = [[Btn(f"{'✅' if st.get('enabled') else '❌'} {icon(st)} {st['name']}", callback_data=f"st_tog_{st['id']}")] for st in stations]
     kb.append(back("st_menu"))
     return KB(kb)
+
+def _metar_int(key, default):
+    try:
+        v = get_setting(key, None)
+        if v is None or str(v).strip() == "":
+            return default
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _metar_win_short(sid):
+    m1 = _metar_int(f"st_{sid}_metar_m1", -1)
+    m2 = _metar_int(f"st_{sid}_metar_m2", -1)
+    if m1 < 0 and m2 < 0:
+        return "общее окно"
+    parts = [f":{m:02d}" for m in (m1, m2) if 0 <= m <= 59]
+    return " и ".join(parts)
+
+
+def _metar_win_text(sid):
+    st = get_station(sid)
+    name = st["name"] if st else f"#{sid}"
+    m1 = _metar_int(f"st_{sid}_metar_m1", -1)
+    m2 = _metar_int(f"st_{sid}_metar_m2", -1)
+    lead = _metar_int(f"st_{sid}_metar_lead", 3)
+    window = _metar_int(f"st_{sid}_metar_window", 8)
+    fast = _metar_int(f"st_{sid}_metar_fast", _metar_int("metar_burst_interval", 10))
+    slow = _metar_int("metar_interval", 60)
+
+    lines = [f"✈️ *{name}*", ""]
+    if m1 < 0 and m2 < 0:
+        lines.append("Персональные окна не заданы — работает общее турбо-окно.")
+    else:
+        for i, m in enumerate((m1, m2), 1):
+            if 0 <= m <= 59:
+                lines.append(f"Окно {i}: с :{(m - lead) % 60:02d} до :{(m + window) % 60:02d} "
+                             f"(выпуск :{m:02d})")
+        lines.append("")
+        lines.append(f"В окне: каждые *{fast}с* · вне окна: каждые *{slow}с*")
+    return "\n".join(lines)
+
+
+def _metar_win_kb(sid):
+    m1 = _metar_int(f"st_{sid}_metar_m1", -1)
+    m2 = _metar_int(f"st_{sid}_metar_m2", -1)
+    lead = _metar_int(f"st_{sid}_metar_lead", 3)
+    window = _metar_int(f"st_{sid}_metar_window", 8)
+    fast = _metar_int(f"st_{sid}_metar_fast", _metar_int("metar_burst_interval", 10))
+
+    def mm(v):
+        return f":{v:02d}" if 0 <= v <= 59 else "—"
+
+    kb = [
+        [Btn(f"🎯 Выпуск 1: {mm(m1)}", callback_data=f"st_met_m1_{sid}"),
+         Btn(f"🎯 Выпуск 2: {mm(m2)}", callback_data=f"st_met_m2_{sid}")],
+        [Btn(f"+ После: {window}м", callback_data=f"st_met_o_{sid}"),
+         Btn(f"- Заранее: {lead}м", callback_data=f"st_met_l_{sid}"),
+         Btn(f"⚡ В окне: {fast}с", callback_data=f"st_met_f_{sid}")],
+        [Btn("🚫 Убрать второе окно", callback_data=f"st_met_clr2_{sid}")],
+        [Btn("♻️ Сбросить на общее окно", callback_data=f"st_met_off_{sid}")],
+        [Btn("⬅️ Назад", callback_data="st_met_win")],
+    ]
+    return KB(kb)
+
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -88,6 +153,60 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s["state"] = "wait_cwx_lead"
         s["cwx_edit_sid"] = sid
         return await edit_text("➖ Введите за сколько минут до METAR начинать опрос (0-15):")
+
+    # =====================================================
+    # Персональные окна выпуска METAR (до двух в час)
+    # =====================================================
+    if d == "st_met_win":
+        sts = [st for st in get_stations() if st.get("station_type") == "metar"]
+        if not sts:
+            return await edit_text("Нет METAR станций.", reply_markup=st_kb())
+        kb = []
+        for st in sts:
+            kb.append([Btn(f"✈️ {st['name']} — {_metar_win_short(st['id'])}",
+                           callback_data=f"st_met_w_{st['id']}")])
+        kb.append(back("st_menu"))
+        return await edit_text(
+            "✈️ *Окна выпуска METAR*\n\n"
+            "У каждого аэропорта своя минута выпуска сводки, и часто она приходит "
+            "*дважды в час* — например Париж :25 и :55, а другая станция :08 и :38.\n\n"
+            "Внутри окна бот опрашивает станцию часто, вне окна — по обычному интервалу. "
+            "Если окна не заданы, работает общее турбо-окно из настроек.",
+            parse_mode="Markdown",
+            reply_markup=KB(kb)
+        )
+
+    if d.startswith("st_met_w_"):
+        sid = int(d[len("st_met_w_"):])
+        return await edit_text(_metar_win_text(sid), parse_mode="Markdown",
+                               reply_markup=_metar_win_kb(sid))
+
+    if d.startswith("st_met_off_"):
+        sid = int(d[len("st_met_off_"):])
+        for k in ("m1", "m2"):
+            set_setting(f"st_{sid}_metar_{k}", "-1")
+        return await edit_text(_metar_win_text(sid), parse_mode="Markdown",
+                               reply_markup=_metar_win_kb(sid))
+
+    if d.startswith("st_met_clr2_"):
+        sid = int(d[len("st_met_clr2_"):])
+        set_setting(f"st_{sid}_metar_m2", "-1")
+        return await edit_text(_metar_win_text(sid), parse_mode="Markdown",
+                               reply_markup=_metar_win_kb(sid))
+
+    _MET_EDIT = {
+        "st_met_m1_": ("wait_metar_m1",     "🎯 Введите *первую* минуту часа (0–59), когда выходит METAR этой станции:"),
+        "st_met_m2_": ("wait_metar_m2",     "🎯 Введите *вторую* минуту часа (0–59). Данные часто приходят дважды в час:"),
+        "st_met_o_":  ("wait_metar_window", "➕ Сколько минут после выпуска продолжать частый опрос (1–30)?"),
+        "st_met_l_":  ("wait_metar_lead",   "➖ За сколько минут до выпуска начинать частый опрос (0–15)?"),
+        "st_met_f_":  ("wait_metar_fast",   "⚡ Интервал опроса внутри окна в секундах (5–120):"),
+    }
+    for pref, (state, prompt) in _MET_EDIT.items():
+        if d.startswith(pref):
+            sid = int(d[len(pref):])
+            s["state"] = state
+            s["met_edit_sid"] = sid
+            return await edit_text(prompt, parse_mode="Markdown")
 
     if d == "st_menu":
         return await edit_text("🌡 *Станции*", parse_mode="Markdown", reply_markup=st_kb())

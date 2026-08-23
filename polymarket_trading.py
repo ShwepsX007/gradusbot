@@ -830,6 +830,112 @@ def _parse_fill(resp: dict, side: str) -> dict:
 
 
 # =========================================================
+# ДИАГНОСТИКА КОШЕЛЬКА (CLOB V2 deposit wallet)
+# =========================================================
+
+WALLET_ERRORS = {
+    "maker address not allowed": (
+        "Кошелёк не допущен к торговле через API.\n"
+        "CLOB V2 принимает ордера только от *депозит-кошелька* Polymarket. "
+        "Голый EOA (signature_type=0) сервер отклоняет всегда.\n\n"
+        "Что сделать:\n"
+        "1. На polymarket.com → Deposit скопируйте адрес депозит-кошелька.\n"
+        "2. Пропишите его в `POLY_FUNDER`.\n"
+        "3. Поставьте `POLY_SIGNATURE_TYPE=3` (депозит-кошелёк) или `=2` (Gnosis Safe / MetaMask-прокси).\n"
+        "4. Пересоздайте API-ключи (кнопка «Проверить API ключи»).\n"
+        "5. Убедитесь, что залог лежит в *pUSD*, а не в USDC.e."
+    ),
+    "order signer address has to be": (
+        "API-ключ выписан на подписанта (EOA), а ордер подписывается от имени "
+        "депозит-кошелька — сервер требует, чтобы это был один адрес.\n\n"
+        "Это известный баг `py-clob-client-v2` при signature_type=3. "
+        "Пересоздайте API-ключи для того же кошелька; если не помогает — "
+        "переключитесь на signature_type=2 с адресом прокси-кошелька в `POLY_FUNDER`."
+    ),
+    "not enough balance": (
+        "Недостаточно средств или не выданы разрешения (allowance).\n"
+        "В V2 залог должен быть в *pUSD*, а не в USDC.e, "
+        "и должны быть одобрены контракты V2-биржи."
+    ),
+    "invalid signature": (
+        "Подпись не принята. Обычно это рассинхрон часов сервера (>60с) "
+        "или устаревший клиент. Проверьте NTP и версию py-clob-client-v2."
+    ),
+}
+
+
+def classify_order_error(err_text: str):
+    """Понятное объяснение для типовых отказов CLOB. None — если не распознали."""
+    low = (err_text or "").lower()
+    for needle, explain in WALLET_ERRORS.items():
+        if needle in low:
+            return explain
+    return None
+
+
+def _is_fatal_wallet_error(err_text: str) -> bool:
+    """
+    Такие ошибки не зависят от signature_type: перебирать варианты бессмысленно,
+    только теряем секунды (критично при аварийном выходе из позиции).
+    """
+    low = (err_text or "").lower()
+    return ("maker address not allowed" in low
+            or "order signer address has to be" in low)
+
+
+def wallet_diagnostics() -> dict:
+    """Сводка по конфигурации кошелька для меню «Диагностика»."""
+    pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
+    funder = _get_env("POLY_FUNDER").strip()
+    sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+
+    eoa = None
+    if pk:
+        try:
+            eoa = Account.from_key(pk).address
+        except Exception:
+            eoa = None
+
+    problems = []
+    if not pk:
+        problems.append("не задан POLY_PRIVATE_KEY")
+    if not funder:
+        problems.append("не задан POLY_FUNDER — без него бот подписывает от голого EOA, "
+                        "а CLOB V2 такие ордера отклоняет")
+    elif not _is_valid_eth_address(funder):
+        problems.append("POLY_FUNDER не похож на адрес (0x + 40 символов)")
+    elif eoa and funder.lower() == eoa.lower():
+        problems.append("POLY_FUNDER совпадает с EOA — нужен адрес депозит-кошелька "
+                        "из окна Deposit на polymarket.com, а не адрес подписанта")
+    if sig == 0 and funder:
+        problems.append("POLY_SIGNATURE_TYPE=0 (голый EOA) при заданном funder — "
+                        "поставьте 3 (депозит-кошелёк) или 2 (Gnosis Safe)")
+    if sig in (1, 2, 3) and not funder:
+        problems.append(f"POLY_SIGNATURE_TYPE={sig} требует POLY_FUNDER")
+    if not (_get_env("POLY_API_KEY") and _get_env("POLY_API_SECRET") and _get_env("POLY_API_PASSPHRASE")):
+        problems.append("не заполнены API-ключи (key / secret / passphrase)")
+
+    balance = None
+    try:
+        balance = get_balance()
+    except Exception:
+        balance = None
+
+    return {
+        "eoa": eoa,
+        "funder": funder or None,
+        "signature_type": sig,
+        "sig_name": {0: "EOA", 1: "Magic/email прокси", 2: "Gnosis Safe",
+                     3: "депозит-кошелёк (1271)"}.get(sig, str(sig)),
+        "has_creds": bool(_get_env("POLY_API_KEY")),
+        "ready": is_ready(),
+        "balance": balance,
+        "problems": problems,
+    }
+
+
+
+# =========================================================
 # TRADING
 # =========================================================
 
@@ -841,10 +947,17 @@ def _execute_with_sig_fallback(sender, side: str, log_label: str) -> dict:
     global _client
 
     current_sig = _get_int_env("POLY_SIGNATURE_TYPE", 1)
+    funder = _get_env("POLY_FUNDER").strip()
+
     sig_candidates = []
-    for st in [current_sig, 1, 2, 3, 0]:
-        if st not in sig_candidates:
-            sig_candidates.append(st)
+    for st in [current_sig, 3, 2, 1, 0]:
+        if st in sig_candidates:
+            continue
+        if st in (1, 2, 3) and not funder:
+            continue          # прокси-типы без funder бессмысленны
+        sig_candidates.append(st)
+    if not sig_candidates:
+        sig_candidates = [0]
 
     last_error = None
 
@@ -879,9 +992,20 @@ def _execute_with_sig_fallback(sender, side: str, log_label: str) -> dict:
             last_error = e
             err = _extract_error_text(e)
             log.warning(f"sig_type={st} order failed: {err}")
+
+            if _is_fatal_wallet_error(err):
+                # Отказ на уровне кошелька: другие signature_type дадут то же самое.
+                # Не тратим секунды на перебор — это критично при аварийном выходе.
+                log.error("⛔ Отказ на уровне кошелька — перебор sig_type прекращён")
+                return {
+                    "error": err,
+                    "wallet_error": True,
+                    "explain": classify_order_error(err),
+                }
             continue
 
-    return {"error": str(last_error)}
+    err_text = _extract_error_text(last_error)
+    return {"error": err_text, "explain": classify_order_error(err_text)}
 
 
 def place_order(token_id, side: str, price: float, size: float, order_type: str = "GTC") -> dict:
