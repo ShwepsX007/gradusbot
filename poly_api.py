@@ -367,12 +367,25 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 Клиент: {'✅ готов' if info['ready'] else '❌ не инициализирован'}\n"
             f"💰 Баланс: {info['balance'] if info['balance'] is not None else '—'}$\n"
         )
+        u = info.get("unified") or {}
+        txt += (
+            "\n🧩 *Официальный SDK (polymarket-client)*\n"
+            f"Установлен: {'✅' if u.get('installed') else '❌ нет'}\n"
+            f"Режим POLY_SDK: `{u.get('mode', 'auto')}`\n"
+        )
+        if u.get("ready"):
+            txt += (f"Кошелёк аккаунта: `{u.get('wallet')}`\n"
+                    f"Тип: *{u.get('wallet_type')}*\n")
+        elif u.get("error"):
+            txt += f"Ошибка: `{str(u['error'])[:150]}`\n"
+
         if info["problems"]:
             txt += "\n⚠️ *Проблемы:*\n" + "\n".join(f"• {p}" for p in info["problems"])
             txt += (
-                "\n\n💡 CLOB V2 принимает ордера только от депозит-кошелька Polymarket. "
-                "Адрес берётся из окна Deposit на polymarket.com и кладётся в `POLY_FUNDER`, "
-                "тип подписи — 3 (депозит-кошелёк) или 2 (Gnosis Safe). Залог должен быть в pUSD."
+                "\n\n💡 Все кошельки Polymarket, созданные с мая 2026, — это Deposit Wallet, "
+                "и старый py-clob-client-v2 их не умеет. Поставьте `polymarket-client`, "
+                "пропишите `POLY_SDK=unified` и адрес кошелька аккаунта в `POLY_FUNDER`. "
+                "Точную конфигурацию покажет `python3 poly_wallet_check.py` на сервере."
             )
         else:
             txt += "\n✅ Конфигурация выглядит корректно."

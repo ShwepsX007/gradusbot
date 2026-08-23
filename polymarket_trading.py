@@ -230,6 +230,16 @@ def init_trading() -> bool:
     global _client
     _client = None
 
+    try:
+        pu = _unified()
+        if pu.available() and pu.forced():
+            log.info("🔧 POLY_SDK=unified — использую официальный SDK polymarket-client")
+            if pu.init():
+                return True
+            log.error(f"❌ unified SDK не поднялся: {pu.last_error()}")
+    except Exception as e:
+        log.warning(f"unified probe failed: {e}")
+
     pk = _normalize_pk(_get_env("POLY_PRIVATE_KEY"))
     funder = _get_env("POLY_FUNDER").strip()
     configured_sig_type = _get_int_env("POLY_SIGNATURE_TYPE", 1)
@@ -307,6 +317,15 @@ def init_trading() -> bool:
             continue
 
     log.error("❌ Ни один sig_type не сработал")
+
+    try:
+        pu = _unified()
+        if pu.available() and pu.enabled() and pu.init():
+            _switch_to_unified("py-clob-client-v2 не смог подключиться")
+            return True
+    except Exception as e:
+        log.warning(f"unified init failed: {e}")
+
     return False
 
 
@@ -905,8 +924,8 @@ def wallet_diagnostics() -> dict:
     elif not _is_valid_eth_address(funder):
         problems.append("POLY_FUNDER не похож на адрес (0x + 40 символов)")
     elif eoa and funder.lower() == eoa.lower():
-        problems.append("POLY_FUNDER совпадает с EOA — нужен адрес депозит-кошелька "
-                        "из окна Deposit на polymarket.com, а не адрес подписанта")
+        problems.append("POLY_FUNDER совпадает с адресом подписанта — проверьте, что это "
+                        "именно адрес кошелька аккаунта из профиля polymarket.com")
     if sig == 0 and funder:
         problems.append("POLY_SIGNATURE_TYPE=0 (голый EOA) при заданном funder — "
                         "поставьте 3 (депозит-кошелёк) или 2 (Gnosis Safe)")
@@ -921,7 +940,16 @@ def wallet_diagnostics() -> dict:
     except Exception:
         balance = None
 
+    try:
+        unified = _unified().status()
+    except Exception as e:
+        unified = {"installed": False, "error": str(e)}
+
+    if unified.get("installed") and unified.get("wallet_type") == "DEPOSIT_WALLET":
+        problems = [p for p in problems if "funder" not in p.lower()]
+
     return {
+        "unified": unified,
         "eoa": eoa,
         "funder": funder or None,
         "signature_type": sig,
@@ -933,6 +961,49 @@ def wallet_diagnostics() -> dict:
         "problems": problems,
     }
 
+
+
+# =========================================================
+# ВЫБОР БЭКЕНДА ИСПОЛНЕНИЯ (py-clob-client-v2 / унифицированный SDK)
+# =========================================================
+
+_UNIFIED_FALLBACK = False   # включается автоматически после отказа кошелька
+
+
+def _unified():
+    import poly_unified as pu
+    return pu
+
+
+def _use_unified_first() -> bool:
+    """Сразу идти через новый SDK: режим unified или уже был отказ кошелька."""
+    try:
+        pu = _unified()
+    except Exception:
+        return False
+    if not pu.available():
+        return False
+    return pu.forced() or _UNIFIED_FALLBACK
+
+
+def _unified_retry_allowed() -> bool:
+    """Можно ли после отказа кошелька повторить через новый SDK."""
+    try:
+        pu = _unified()
+    except Exception:
+        return False
+    return pu.available() and pu.enabled()
+
+
+def _switch_to_unified(reason: str):
+    global _UNIFIED_FALLBACK
+    if not _UNIFIED_FALLBACK:
+        _UNIFIED_FALLBACK = True
+        log.warning(f"🔁 Переключаюсь на унифицированный SDK Polymarket: {reason}")
+
+
+def unified_active() -> bool:
+    return _UNIFIED_FALLBACK or _use_unified_first()
 
 
 # =========================================================
@@ -1014,6 +1085,9 @@ def place_order(token_id, side: str, price: float, size: float, order_type: str 
     order_type="GTC" — кладётся в стакан (отложник),
     "FAK"/"FOK" — агрессивный лимитник, исполняется немедленно или отменяется.
     """
+    if _use_unified_first():
+        return _unified().place_order(token_id, side, price, size, order_type)
+
     try:
         if _client is None:
             return {"error": "Trading client not initialized"}
@@ -1046,6 +1120,10 @@ def place_order(token_id, side: str, price: float, size: float, order_type: str 
             side,
             f"LIMIT-{str(order_type).upper()}",
         )
+        if res.get("wallet_error") and _unified_retry_allowed():
+            _switch_to_unified(res.get("error", "maker address not allowed"))
+            return _unified().place_order(token_id, side, price, size, order_type)
+
         res["order_type"] = str(order_type).upper()
         res["requested_price"] = price
         res["requested_size"] = size
@@ -1067,6 +1145,9 @@ def place_market_order(token_id, side: str, amount: float,
     worst_price -> худшая допустимая цена (slippage guard), 0..1 или центы
     order_type  -> "FOK" (всё или ничего) / "FAK" (сколько есть, остаток отменить)
     """
+    if _use_unified_first():
+        return _unified().place_market_order(token_id, side, amount, worst_price, order_type)
+
     try:
         if _client is None:
             return {"error": "Trading client not initialized"}
@@ -1110,6 +1191,10 @@ def place_market_order(token_id, side: str, amount: float,
             side,
             f"MARKET-{str(order_type).upper()}",
         )
+        if res.get("wallet_error") and _unified_retry_allowed():
+            _switch_to_unified(res.get("error", "maker address not allowed"))
+            return _unified().place_market_order(token_id, side, amount, worst_price, order_type)
+
         res["order_type"] = str(order_type).upper()
         res["requested_amount"] = amount
         res["worst_price"] = worst_price
