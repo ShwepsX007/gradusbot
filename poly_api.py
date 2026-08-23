@@ -183,7 +183,7 @@ async def _station_stop_enter(bid, option):
     from database import add_position, get_setting as _gs
     from strategies import (
         parse_option_bucket, detect_market_unit, auto_stop_temp,
-        convert_station_temp, sort_asks,
+        convert_station_temp, sort_asks, book_depth,
     )
 
     b = get_binding(bid)
@@ -231,6 +231,7 @@ async def _station_stop_enter(bid, option):
     limit_price = max(0.01, min(0.99, thresh_cents / 100.0))
 
     entry_type = p["entry_type"]
+    note = ""
 
     # ---- расчёт цены и объёма
     book = pt.get_order_book(token_id) if not demo else None
@@ -244,12 +245,40 @@ async def _station_stop_enter(bid, option):
         ok, order_type, order_id = True, ("FOK" if entry_type == "market" else "GTC"), f"DEMO-{bid}"
         filled_size = shares
     elif entry_type == "market":
+        # Стакан тоньше заявки — FOK умрёт целиком. Считаем реальную глубину заранее.
+        depth_shares, depth_cash, best_ask = book_depth(book, limit_price, "BUY")
+        want_cash = size_val if p["budget_mode"] == "dollars" else size_val * limit_price
+        partial_ok = _gs("entry_partial", "1") == "1"
+
+        if depth_shares <= 0 and book:
+            best_txt = f"{round(best_ask * 100)}¢" if best_ask else "нет заявок"
+            return (f"❌ Вход не состоялся\n🎯 {label}\n"
+                    f"В стакане нет предложений дешевле {round(limit_price * 100)}¢ "
+                    f"(лучший аск: {best_txt}).\n\n"
+                    f"💡 Поднимите порог входа или войдите отложником.")
+
+        if book and depth_cash + 1e-9 < want_cash:
+            if not partial_ok:
+                return (f"❌ Вход не состоялся\n🎯 {label}\n"
+                        f"В стакане до {round(limit_price * 100)}¢ всего "
+                        f"{depth_shares:g} шт. на {depth_cash:.2f}$, а нужно {want_cash:.2f}$.\n\n"
+                        f"💡 Уменьшите объём, поднимите порог входа "
+                        f"или включите частичный вход в настройках.")
+            note = (f"\n⚠️ Стакан тоньше заявки: взял {depth_cash:.2f}$ "
+                    f"вместо {want_cash:.2f}$")
+
         if p["budget_mode"] == "dollars":
-            res = pt.place_market_order(token_id, "BUY", size_val, limit_price, "FOK")
+            amount = min(size_val, depth_cash) if book else size_val
+            # FAK берёт сколько есть — так частичный вход не превращается в отказ
+            res = pt.place_market_order(token_id, "BUY", round(amount, 2), limit_price,
+                                        "FOK" if amount >= size_val - 1e-9 else "FAK")
         else:
-            res = pt.place_order(token_id, "BUY", limit_price, size_val, "FOK")
+            shares_want = min(size_val, depth_shares) if book else size_val
+            res = pt.place_order(token_id, "BUY", limit_price, shares_want,
+                                 "FOK" if shares_want >= size_val - 1e-9 else "FAK")
             if res.get("success") and not res.get("filled"):
-                res = {"error": f"FOK не исполнен: нет {size_val} шар дешевле {round(limit_price*100)}¢"}
+                res = {"error": f"Не исполнено: нет {size_val:g} шар дешевле "
+                                f"{round(limit_price*100)}¢"}
         ok = bool(res.get("success"))
         if not ok:
             msg = f"❌ Вход не состоялся\n🎯 {label}\n{res.get('error')}"
@@ -298,7 +327,8 @@ async def _station_stop_enter(bid, option):
     )
 
     mode_label = "🎮 ДЕМО" if demo else "💰 РЕАЛ"
-    kind = "рыночный FOK" if entry_type == "market" else f"отложник GTC по {round(limit_price*100)}¢"
+    kind = (f"рыночный {order_type}" if entry_type == "market"
+            else f"отложник GTC по {round(limit_price*100)}¢")
     arrow = "выше" if p["direction"] == "up" else "ниже"
 
     return (
@@ -309,7 +339,8 @@ async def _station_stop_enter(bid, option):
         f"💲 Цена: {fill_cents}¢ | 📦 Объём: {filled_size} шт.\n"
         f"🆔 `{str(order_id)[:14]}`\n\n"
         f"🛑 Стоп по станции: *{stop_temp}°{market_unit}* и {arrow} ({stop_src})\n"
-        f"💸 TP: {tp_abs or '—'}¢ | SL: {sl_abs or '—'}¢\n\n"
+        f"💸 TP: {tp_abs or '—'}¢ | SL: {sl_abs or '—'}¢"
+        f"{note}\n\n"
         f"_При сигнале станции позиция будет продана по рынку немедленно._"
     )
 

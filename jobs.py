@@ -19,7 +19,7 @@ from database import (
 from utils import fetch_market, format_temp, format_temp_delta
 from formatters import fetch_station_data, format_bound_markets_block
 from strategies import (
-    STRATEGIES, sort_asks, sort_bids,
+    STRATEGIES, sort_asks, sort_bids, book_depth,
     stop_triggered, convert_station_temp, c_to_f,
 )
 import polymarket_trading as pt
@@ -454,6 +454,25 @@ def execute_entry(signal: dict, demo_mode: bool) -> dict:
         }
 
     if order_style == "MARKET":
+        # Заранее смотрим, сколько реально лежит в стакане не дороже worst_price:
+        # FOK на весь объём при тонком стакане просто умрёт целиком.
+        book = pt.get_order_book(token_id)
+        depth_shares, depth_cash, best_ask = book_depth(book, worst_price, "BUY")
+
+        if depth_shares <= 0 and book:
+            best_txt = f"{round(best_ask * 100)}¢" if best_ask else "стакан пуст"
+            return {"success": False,
+                    "error": f"нет предложений дешевле {round(worst_price * 100)}¢ ({best_txt})"}
+
+        if book and depth_cash + 1e-9 < amount:
+            if get_setting("entry_partial", "1") != "1":
+                return {"success": False,
+                        "error": (f"в стакане до {round(worst_price * 100)}¢ всего "
+                                  f"{depth_cash:.2f}$, а нужно {amount:.2f}$")}
+            log.info(f"Стакан тоньше заявки: беру {depth_cash:.2f}$ вместо {amount:.2f}$")
+            amount = round(depth_cash, 2)
+            order_type = "FAK"
+
         res = pt.place_market_order(token_id, "BUY", amount, worst_price, order_type)
     else:
         res = pt.place_order(token_id, "BUY", worst_price, amount, order_type)

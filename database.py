@@ -106,6 +106,7 @@ def init_db():
         ("metar_burst_interval", "10"),  # Интервал опроса внутри окна, сек
         ("metar_burst_from", "45"),      # Минута часа: начало окна
         ("metar_burst_to", "10"),        # Минута часа: конец окна
+        ("entry_partial", "1"),          # Разрешить частичный вход, если стакан тоньше заявки
         ("exit_slippage_cents", "2"),    # Запас цены для FAK-выхода, центы
         ("demo_mode", "0"),
         ("order_timeout", "20"),

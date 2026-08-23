@@ -453,3 +453,33 @@ def get_strategies_list():
             seen.add(v)
             unique_strats.append({"id": k, "name": v.name, "desc": v.description})
     return unique_strats
+
+def book_depth(book, limit_price, side="BUY"):
+    """
+    Сколько реально можно взять в стакане по цене не хуже limit_price.
+    BUY  -> считаем аски не дороже limit_price
+    SELL -> считаем биды не дешевле limit_price
+    Возвращает (шары, деньги, лучшая_цена).
+    """
+    if not book:
+        return 0.0, 0.0, None
+
+    if str(side).upper() == "SELL":
+        levels = sort_bids(book.get("bids"))
+        fits = lambda price: price >= limit_price
+    else:
+        levels = sort_asks(book.get("asks"))
+        fits = lambda price: price <= limit_price
+
+    best = levels[0]["price"] if levels else None
+
+    shares = 0.0
+    cash = 0.0
+    for lvl in levels:
+        price, size = float(lvl["price"]), float(lvl["size"])
+        if not fits(price):
+            break
+        shares += size
+        cash += size * price
+
+    return round(shares, 4), round(cash, 4), best
