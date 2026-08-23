@@ -53,6 +53,17 @@ def python_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
 
+def _looks_like_address(addr: str) -> bool:
+    a = (addr or "").strip()
+    if not a.startswith("0x") or len(a) != 42:
+        return False
+    try:
+        int(a[2:], 16)
+        return True
+    except ValueError:
+        return False
+
+
 def available() -> bool:
     """Установлен ли пакет polymarket-client."""
     try:
@@ -115,8 +126,19 @@ def init() -> bool:
             kwargs["wallet"] = wallet
 
         if relayer_key and relayer_addr:
-            from polymarket import RelayerApiKey
-            kwargs["api_key"] = RelayerApiKey(key=relayer_key, address=relayer_addr)
+            # Битый адрес не должен ронять подключение: без relayer-ключа
+            # торговля работает, недоступны только газлесс-операции с кошельком.
+            if not _looks_like_address(relayer_addr):
+                log.warning(
+                    f"⚠️ POLY_RELAYER_API_KEY_ADDRESS не похож на адрес "
+                    f"({relayer_addr!r}) — нужен 0x и 40 hex-символов. Ключ пропущен."
+                )
+            else:
+                try:
+                    from polymarket import RelayerApiKey
+                    kwargs["api_key"] = RelayerApiKey(key=relayer_key, address=relayer_addr)
+                except Exception as e:
+                    log.warning(f"⚠️ Relayer-ключ не применён: {e}")
 
         creds_key = _env("POLY_API_KEY")
         creds_secret = _env("POLY_API_SECRET")

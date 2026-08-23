@@ -90,8 +90,12 @@ def main():
         try:
             from polymarket import RelayerApiKey
             kwargs["api_key"] = RelayerApiKey(key=relayer_key, address=relayer_addr)
+            print("  Relayer-ключ: применён")
         except Exception as e:
             print(f"  ⚠️ Relayer-ключ не применён: {e}")
+            print("     POLY_RELAYER_API_KEY_ADDRESS должен быть полным адресом:")
+            print("     0x и ровно 40 символов (Signer Address из окна создания ключа).")
+            print("     Без него торговля работает, недоступны только газлесс-операции.")
 
     try:
         client = SecureClient.create(**kwargs)
