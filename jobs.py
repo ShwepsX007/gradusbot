@@ -482,29 +482,49 @@ def execute_entry(signal: dict, demo_mode: bool) -> dict:
     }
 
 
+def _bounded_int_setting(key: str, default: int, min_value: int = 1, max_value: int = 20) -> int:
+    try:
+        value = int(float(get_setting(key, str(default))))
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _bounded_float_setting(key: str, default: float, min_value: float = 0.0, max_value: float = 10.0) -> float:
+    try:
+        value = float(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
 def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict:
     """
     Выход из позиции рыночным ордером.
     FAK: заберём столько, сколько есть в стакане по цене не хуже worst_price,
     остаток отменяется (в отличие от FOK не рискуем остаться в позиции целиком).
     """
+    requested_size = float(pos["size"])
+
     if pos.get("is_demo") == 1:
         return {
             "success": True,
             "demo": True,
-            "filled_size": float(pos["size"]),
+            "filled_size": requested_size,
+            "filled_cash": round(requested_size * worst_price, 4),
             "fill_cents": int(round(worst_price * 100)),
+            "partial": False,
         }
 
     close_side = "SELL" if str(pos.get("side", "BUY")).upper() == "BUY" else "BUY"
 
     if close_side == "SELL":
         # amount в шарах
-        res = pt.place_market_order(pos["token_id"], "SELL", float(pos["size"]), worst_price, order_type)
+        res = pt.place_market_order(pos["token_id"], "SELL", requested_size, worst_price, order_type)
     else:
         # закрытие шорта — покупаем обратно, amount в долларах
         res = pt.place_market_order(
-            pos["token_id"], "BUY", round(float(pos["size"]) * worst_price, 2), worst_price, order_type
+            pos["token_id"], "BUY", round(requested_size * worst_price, 2), worst_price, order_type
         )
 
     if res.get("error") or not res.get("success"):
@@ -512,13 +532,30 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
                 "explain": res.get("explain")}
 
     fill_cents = res.get("avg_price_cents") or round(worst_price * 100, 1)
+    filled_size = float(res.get("filled_size") or 0)
+
+    # Если SDK подтвердил исполнение, но не вернул численный объём, оставляем
+    # старое поведение: считаем, что закрывали весь запрошенный размер. Для
+    # py-clob-client-v2/unified обычно filled_size приходит, поэтому частичный
+    # FAK будет обработан корректно.
+    if filled_size <= 0 and res.get("filled"):
+        filled_size = requested_size
+
+    filled_size = min(filled_size, requested_size)
+    filled_cash = res.get("filled_cash")
+    try:
+        filled_cash = float(filled_cash) if filled_cash is not None else round(filled_size * float(fill_cents) / 100.0, 4)
+    except (TypeError, ValueError):
+        filled_cash = round(filled_size * float(fill_cents) / 100.0, 4)
+
     return {
         "success": True,
         "demo": False,
         "order_id": res.get("orderID", "unknown"),
-        "filled_size": float(res.get("filled_size") or pos["size"]),
+        "filled_size": filled_size,
+        "filled_cash": filled_cash,
         "fill_cents": int(round(float(fill_cents))),
-        "partial": float(res.get("filled_size") or 0) + 1e-9 < float(pos["size"]),
+        "partial": filled_size + 1e-9 < requested_size,
     }
 
 
@@ -529,34 +566,135 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
 def panic_exit(pos, market_unit_temp=None):
     """
     Максимально быстрый выход из позиции рыночным FAK.
-    Цена-потолок опускается на panic_slippage_cents ниже лучшего бида,
-    чтобы смести несколько уровней стакана и не остаться в бумаге.
+
+    Для метео-стопа делаем несколько попыток: погодные рынки тонкие, поэтому
+    первый FAK может забрать только часть стакана или вообще не найти
+    ликвидность. Каждая новая попытка заново смотрит стакан и продаёт остаток.
+
+    Настройки в БД:
+      panic_exit_attempts          — сколько FAK-попыток, дефолт 5;
+      panic_exit_retry_delay_sec   — пауза между попытками, дефолт 0.4с;
+      panic_slippage_cents         — насколько ниже best bid разрешить SELL.
     """
     token_id = pos["token_id"]
     side = str(pos.get("side", "BUY")).upper()
     exit_side = "SELL" if side == "BUY" else "BUY"
 
-    best_price, _ = _best_price_from_book(token_id, exit_side)
+    attempts = _bounded_int_setting("panic_exit_attempts", 5, 1, 20)
+    retry_delay = _bounded_float_setting("panic_exit_retry_delay_sec", 0.4, 0.0, 5.0)
+    panic = _bounded_float_setting("panic_slippage_cents", 5.0, 0.0, 99.0) / 100.0
 
-    try:
-        panic = float(get_setting("panic_slippage_cents", "5")) / 100.0
-    except (TypeError, ValueError):
-        panic = 0.05
+    remaining = float(pos["size"])
+    total_filled = 0.0
+    total_cash = 0.0
+    order_ids = []
+    best_price_seen = None
+    last_error = None
+    last_explain = None
 
-    if best_price is None:
-        if pos.get("is_demo") == 1:
-            best_price = float(pos.get("entry_price", 50)) / 100.0
+    for attempt in range(1, attempts + 1):
+        if remaining <= 1e-9:
+            break
+
+        best_price, _ = _best_price_from_book(token_id, exit_side)
+
+        if best_price is None:
+            if pos.get("is_demo") == 1:
+                best_price = float(pos.get("entry_price", 50)) / 100.0
+            else:
+                last_error = "стакан недоступен, выйти не удалось"
+                log.warning(
+                    f"panic_exit attempt {attempt}/{attempts}: стакан недоступен "
+                    f"token={token_id}, remaining={remaining}"
+                )
+                if attempt < attempts and retry_delay > 0:
+                    time.sleep(retry_delay)
+                continue
+
+        best_price_seen = best_price if best_price_seen is None else best_price_seen
+
+        if exit_side == "SELL":
+            worst_price = max(0.001, best_price - panic)
         else:
-            return {"success": False, "error": "стакан недоступен, выйти не удалось"}
+            worst_price = min(0.999, best_price + panic)
 
-    if exit_side == "SELL":
-        worst_price = max(0.01, best_price - panic)
-    else:
-        worst_price = min(0.99, best_price + panic)
+        attempt_pos = dict(pos)
+        attempt_pos["size"] = remaining
 
-    res = execute_exit(pos, worst_price, "FAK")
-    res["best_price_cents"] = round(best_price * 100, 1)
-    return res
+        log.warning(
+            f"panic_exit attempt {attempt}/{attempts}: {exit_side} "
+            f"remaining={remaining} worst={round(worst_price * 100, 2)}¢ "
+            f"best={round(best_price * 100, 2)}¢"
+        )
+
+        res = execute_exit(attempt_pos, worst_price, "FAK")
+
+        if not res.get("success"):
+            last_error = res.get("error", "unknown error")
+            last_explain = res.get("explain")
+            log.warning(f"panic_exit attempt {attempt}/{attempts} failed: {last_error}")
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+            continue
+
+        filled = min(float(res.get("filled_size") or 0), remaining)
+        if filled <= 1e-9:
+            last_error = "FAK не исполнил ни одной доли"
+            log.warning(f"panic_exit attempt {attempt}/{attempts}: zero fill")
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+            continue
+
+        total_filled += filled
+        filled_cash = res.get("filled_cash")
+        if filled_cash:
+            try:
+                total_cash += float(filled_cash)
+            except (TypeError, ValueError):
+                total_cash += filled * float(res.get("fill_cents", round(worst_price * 100))) / 100.0
+        else:
+            total_cash += filled * float(res.get("fill_cents", round(worst_price * 100))) / 100.0
+
+        if res.get("order_id"):
+            order_ids.append(str(res.get("order_id")))
+
+        remaining = max(0.0, remaining - filled)
+        log.warning(
+            f"panic_exit attempt {attempt}/{attempts} filled={filled}, "
+            f"remaining={remaining}"
+        )
+
+        if remaining <= 1e-9:
+            break
+        if attempt < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+
+    if total_filled <= 1e-9:
+        return {
+            "success": False,
+            "error": last_error or "FAK не исполнился после всех попыток",
+            "explain": last_explain,
+            "attempts": attempts,
+            "best_price_cents": round(best_price_seen * 100, 1) if best_price_seen else None,
+        }
+
+    avg_price = total_cash / total_filled if total_filled > 0 and total_cash > 0 else None
+    fill_cents = round(avg_price * 100) if avg_price else round((best_price_seen or 0) * 100)
+
+    return {
+        "success": True,
+        "demo": pos.get("is_demo") == 1,
+        "order_id": ",".join(order_ids) if order_ids else "unknown",
+        "filled_size": round(total_filled, 4),
+        "filled_cash": round(total_cash, 4),
+        "fill_cents": int(fill_cents),
+        "partial": remaining > 1e-9,
+        "remaining_size": round(remaining, 4),
+        "attempts": attempts,
+        "attempts_used": min(attempts, attempt if 'attempt' in locals() else attempts),
+        "best_price_cents": round(best_price_seen * 100, 1) if best_price_seen else None,
+        "last_error": last_error,
+    }
 
 
 async def run_station_stops(st, current_temp_c):
@@ -586,28 +724,38 @@ async def run_station_stops(st, current_temp_c):
             if stop_temp is None:
                 continue
 
+            bid = meta.get("binding_id")
+            force_station_exit = False
+            if bid:
+                try:
+                    force_station_exit = get_binding_setting(bid, "blocked_reason", "") == "station_stop"
+                except Exception:
+                    force_station_exit = False
+
             temp_market = convert_station_temp(current_temp_c, market_unit)
-            if not stop_triggered(temp_market, stop_temp, direction):
+            if not force_station_exit and not stop_triggered(temp_market, stop_temp, direction):
                 continue
 
             # === СНАЧАЛА СДЕЛКА ===
             t0 = time.time()
             res = panic_exit(pos)
             elapsed = round(time.time() - t0, 2)
-
-            bid = meta.get("binding_id")
             arrow = "выше" if direction == "up" else "ниже"
             temp_txt = f"{current_temp_c:.1f}°C / {c_to_f(current_temp_c):.1f}°F"
 
             if not res.get("success"):
+                if bid:
+                    set_binding_setting(bid, "blocked", "1")
+                    set_binding_setting(bid, "blocked_reason", "station_stop")
                 reports.append(
                     f"🚨 *СТОП ПО СТАНЦИИ — ВЫЙТИ НЕ УДАЛОСЬ*\n\n"
                     f"📌 {pos.get('question', '')}\n"
                     f"🎯 Исход: {meta.get('outcome_label', '—')}\n"
                     f"🌡 {temp_txt} — {arrow} стопа {stop_temp}°{market_unit}\n"
                     f"❌ `{res.get('error')}`\n"
+                    + (f"🔁 Попыток FAK: {res.get('attempts')}\n" if res.get("attempts") else "")
                     + (f"💡 {res['explain']}\n" if res.get("explain") else "")
-                    + "Закройте позицию вручную!"
+                    + "Бот повторит выход на следующем тике, но лучше контролировать вручную."
                 )
                 continue
 
@@ -623,25 +771,32 @@ async def run_station_stops(st, current_temp_c):
             )
 
             note = ""
+            title = "ПОЗИЦИЯ ЗАКРЫТА"
             if res.get("partial"):
                 remaining = round(float(pos["size"]) - float(closed_size), 2)
                 update_position_size(pos["id"], remaining)
-                note = f"\n⚠️ Частично: остаток {remaining} шт. добьём на следующем тике."
+                title = "ПОЗИЦИЯ ЧАСТИЧНО ЗАКРЫТА"
+                note = f"\n⚠️ Остаток {remaining} шт. бот продолжит добивать на следующих тиках."
             else:
                 remove_position(pos["id"])
 
-            # Блокируем связку: в этот рынок больше не входим
+            # Блокируем связку: в этот рынок больше не входим, но оставшаяся
+            # позиция при частичном выходе всё равно будет добиваться стопом.
             if bid:
                 set_binding_setting(bid, "blocked", "1")
                 set_binding_setting(bid, "blocked_reason", "station_stop")
 
+            attempts_txt = ""
+            if res.get("attempts_used"):
+                attempts_txt = f" | попыток FAK: {res.get('attempts_used')}/{res.get('attempts')}"
+
             reports.append(
-                f"🚨 *СТОП ПО СТАНЦИИ — ПОЗИЦИЯ ЗАКРЫТА*\n\n"
+                f"🚨 *СТОП ПО СТАНЦИИ — {title}*\n\n"
                 f"📌 {pos.get('question', '')}\n"
                 f"🎯 Исход: {meta.get('outcome_label', '—')}\n"
                 f"🌡 Станция: {temp_txt} — {arrow} стопа {stop_temp}°{market_unit}\n"
                 f"⚡️ Продано рыночным FAK по {close_cents}¢ "
-                f"(лучший бид был {res.get('best_price_cents')}¢), за {elapsed} с\n"
+                f"(лучший бид был {res.get('best_price_cents')}¢), за {elapsed} с{attempts_txt}\n"
                 f"📦 Объём: {closed_size} шт.\n"
                 f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$\n"
                 f"🔒 Связка заблокирована — повторных входов не будет." + note
