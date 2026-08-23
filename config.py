@@ -28,4 +28,9 @@ POLY_API_KEY          = os.getenv("POLY_API_KEY")
 POLY_API_SECRET       = os.getenv("POLY_API_SECRET")
 POLY_API_PASSPHRASE   = os.getenv("POLY_API_PASSPHRASE")
 POLY_FUNDER           = os.getenv("POLY_FUNDER")
-POLY_SIGNATURE_TYPE   = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+# Для новых Deposit Wallet Polymarket рабочий дефолт обычно 3.
+# Если в окружении задано другое значение — оно имеет приоритет.
+try:
+    POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "3"))
+except ValueError:
+    POLY_SIGNATURE_TYPE = 3

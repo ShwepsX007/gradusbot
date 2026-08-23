@@ -148,9 +148,12 @@ def _object_to_dict(obj):
     result = {}
     for key in [
         "id", "orderID", "order_id", "orderId",
-        "side", "price",
+        "success", "error", "errorMsg", "message",
+        "side", "price", "avgPrice", "average_price",
         "original_size", "size", "remaining_size", "initial_size",
-        "status", "asset_id", "token_id"
+        "status", "state", "asset_id", "token_id",
+        "makingAmount", "making_amount", "takingAmount", "taking_amount",
+        "sizeMatched", "size_matched", "matchedSize", "filledSize",
     ]:
         try:
             val = getattr(obj, key, None)
@@ -752,103 +755,144 @@ def _post_order_with_client(client, token_id, side: str, price: float, size: flo
 def _post_market_order_with_client(client, token_id, side: str, amount: float,
                                    worst_price: Optional[float], order_type="FOK"):
     """
-    Настоящий рыночный ордер.
-    amount: для BUY — сумма в USDC, для SELL — количество шар.
-    worst_price: worst-price limit (защита от проскальзывания), НЕ целевая цена.
-    """
-    from py_clob_client_v2.clob_types import MarketOrderArgs
+    Настоящий рыночный ордер CLOB.
 
+    В рабочем polymarket_trading2.py market-ордера отправляются через
+    MarketOrderArgsV2 + OrderType. Старый MarketOrderArgs/price часто не даёт
+    того же поведения, что кнопка Market на сайте.
+
+    BUY  amount = сумма в USDC.
+    SELL amount = количество долей.
+    worst_price используется как внешний slippage guard: вызывающий код уже
+    проверяет стакан до этой цены, а в MarketOrderArgsV2 цену не передаём.
+    """
     ot_enum, ot_name = _resolve_order_type(order_type)
     if ot_name not in ("FOK", "FAK"):
         ot_enum, ot_name = _resolve_order_type("FOK")
 
-    options = _build_partial_options(token_id)
-
-    args_kwargs = {
-        "token_id": str(token_id),
-        "amount": float(amount),
-        "side": side,
-    }
-    if worst_price is not None:
-        args_kwargs["price"] = float(worst_price)
-
     try:
-        order_args = MarketOrderArgs(**args_kwargs)
-    except TypeError:
-        args_kwargs.pop("price", None)
-        order_args = MarketOrderArgs(**args_kwargs)
+        from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
 
-    # Часть версий SDK требует order_type прямо в MarketOrderArgs
+        ot = OrderType.FOK if ot_name == "FOK" else OrderType.FAK
+        order_args = MarketOrderArgsV2(
+            token_id=str(token_id),
+            amount=float(amount),
+            side=side,
+            order_type=ot,
+        )
+
+        try:
+            result = client.create_and_post_market_order(order_args, order_type=ot)
+            log.info(f"✅ Market order placed (MarketOrderArgsV2/create_and_post_market_order, {ot_name}): {result}")
+            return result
+        except AttributeError:
+            order = client.create_market_order(order_args)
+            try:
+                result = client.post_order(order, ot)
+            except TypeError:
+                result = client.post_order(order, order_type=ot)
+            log.info(f"✅ Market order placed (MarketOrderArgsV2/create_market_order + post_order, {ot_name}): {result}")
+            return result
+        except Exception as e:
+            err_v2 = e
+            log.warning(f"MarketOrderArgsV2 create_and_post_market_order failed: {e}")
+            try:
+                order = client.create_market_order(order_args)
+                try:
+                    result = client.post_order(order, ot)
+                except TypeError:
+                    result = client.post_order(order, order_type=ot)
+                log.info(f"✅ Market order placed (MarketOrderArgsV2 fallback, {ot_name}): {result}")
+                return result
+            except Exception as e2:
+                log.warning(f"MarketOrderArgsV2 create_market_order + post_order failed: {e2}")
+    except ImportError as e:
+        err_v2 = e
+        log.warning(f"MarketOrderArgsV2 unavailable: {e}")
+
+    # Фолбэк для старых версий py-clob-client-v2.
+    from py_clob_client_v2.clob_types import MarketOrderArgs
+
+    order_args = MarketOrderArgs(
+        token_id=str(token_id),
+        amount=float(amount),
+        side=side,
+    )
     try:
-        if ot_enum is not None and hasattr(order_args, "order_type") and getattr(order_args, "order_type", None) is None:
+        if ot_enum is not None and hasattr(order_args, "order_type"):
             setattr(order_args, "order_type", ot_enum)
     except Exception:
         pass
 
-    kwargs = {}
-    if options is not None:
-        kwargs["options"] = options
-    if ot_enum is not None:
-        kwargs["order_type"] = ot_enum
-
     try:
-        result = _call_with_optional_kwargs(client.create_and_post_market_order, order_args, **kwargs)
-        log.info(f"✅ Market order placed (create_and_post_market_order, {ot_name}): {result}")
+        result = _call_with_optional_kwargs(client.create_and_post_market_order, order_args, order_type=ot_enum)
+        log.info(f"✅ Market order placed (MarketOrderArgs/create_and_post_market_order, {ot_name}): {result}")
         return result
     except Exception as e:
         err1 = e
-        log.warning(f"create_and_post_market_order failed: {e}")
+        log.warning(f"MarketOrderArgs create_and_post_market_order failed: {e}")
 
     try:
-        create_kwargs = {"options": options} if options is not None else {}
-        order = _call_with_optional_kwargs(client.create_market_order, order_args, **create_kwargs)
-        if ot_enum is not None:
+        order = client.create_market_order(order_args)
+        try:
+            result = client.post_order(order, ot_enum)
+        except TypeError:
             result = _call_with_optional_kwargs(client.post_order, order, order_type=ot_enum)
-        else:
-            result = client.post_order(order)
-        log.info(f"✅ Market order placed (create_market_order + post_order, {ot_name}): {result}")
+        log.info(f"✅ Market order placed (MarketOrderArgs/create_market_order + post_order, {ot_name}): {result}")
         return result
     except Exception as e:
-        err2 = e
-        log.warning(f"create_market_order + post_order failed: {e}")
+        log.warning(f"MarketOrderArgs create_market_order + post_order failed: {e}")
+        raise e
 
-    raise err2 if 'err2' in locals() else err1
 
 
 def _parse_fill(resp: dict, side: str) -> dict:
     """
-    Разбирает ответ CLOB и определяет, был ли РЕАЛЬНЫЙ филл.
-    makingAmount / takingAmount: для BUY making=USDC, taking=шары; для SELL наоборот.
+    Разбирает ответ CLOB и определяет факт исполнения.
+
+    Разные версии API/SDK возвращают разные поля:
+      • sizeMatched / matchedSize / filledSize — исполненные доли;
+      • makingAmount / takingAmount — что отдали/получили;
+      • status=matched иногда приходит без чисел.
     """
+    resp = resp or {}
     order_id = (
         resp.get("orderID") or resp.get("orderId")
         or resp.get("order_id") or resp.get("id") or ""
     )
-    status = str(resp.get("status") or resp.get("state") or "").lower()
+    status = str(resp.get("status") or resp.get("state") or "").strip().lower()
+
+    def _num(*keys):
+        for key in keys:
+            v = resp.get(key)
+            if v in (None, ""):
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
 
     making = resp.get("makingAmount", resp.get("making_amount"))
     taking = resp.get("takingAmount", resp.get("taking_amount"))
-
-    def _f(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
-
-    making_f, taking_f = _f(making), _f(taking)
-
-    filled_size = 0.0     # шары
-    filled_cash = 0.0     # USDC
-    avg_price = None
+    making_f = _num("makingAmount", "making_amount")
+    taking_f = _num("takingAmount", "taking_amount")
+    matched_shares = _num("sizeMatched", "size_matched", "matchedSize", "filledSize")
 
     if side.upper() == "BUY":
-        filled_cash, filled_size = making_f, taking_f
+        filled_cash = making_f
+        filled_size = matched_shares or taking_f
     else:
-        filled_size, filled_cash = making_f, taking_f
+        filled_size = matched_shares or making_f
+        filled_cash = taking_f
 
-    if filled_size > 0:
-        avg_price = round(filled_cash / filled_size, 4)
+    # Некоторые ответы CLOB отдают amounts в 6-decimal integer units. Если
+    # вычисленная цена явно невозможна (> $1 за долю), нормализуем обе величины.
+    if filled_size > 0 and filled_cash > 0 and (filled_cash / filled_size) > 1.5:
+        filled_cash /= 1_000_000
+        filled_size /= 1_000_000
 
+    avg_price = round(filled_cash / filled_size, 4) if filled_size > 0 and filled_cash > 0 else None
     filled = filled_size > 0 or status in ("matched", "filled", "complete", "completed")
 
     return {
@@ -1079,6 +1123,20 @@ def _execute_with_sig_fallback(sender, side: str, log_label: str) -> dict:
             log.info(f"✅ Рабочий sig_type для ордера: {st}")
 
             resp = raw if isinstance(raw, dict) else _object_to_dict(raw)
+
+            # CLOB при отказе часто не кидает exception, а возвращает dict вида
+            # {"success": false, "errorMsg": "not enough balance / allowance"}.
+            # Не маскируем такой ответ под успешный, но не исполненный FOK.
+            if isinstance(resp, dict):
+                err_msg = str(resp.get("errorMsg") or resp.get("error") or "").strip()
+                if resp.get("success") is False or err_msg:
+                    return {
+                        "success": False,
+                        "error": err_msg or "CLOB rejected order (success=false)",
+                        "raw": resp,
+                        "explain": classify_order_error(err_msg),
+                    }
+
             result = {"success": True, "raw": resp}
             result.update(_parse_fill(resp, side))
             return result
