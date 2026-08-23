@@ -11,11 +11,92 @@ from config import WU_API_KEYS
 log = logging.getLogger("bot")
 
 SESSION = requests.Session()
+# AWC просит ставить осмысленный User-Agent: браузерная подделка попадает под автофильтр.
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "gradusbot/1.0 (telegram weather trading bot)",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache"
 })
+
+
+# =========================================================
+# ЗАЩИТА ОТ БАНА: лимитер запросов + backoff + кэш
+# =========================================================
+
+def _setting_int(key, default):
+    try:
+        from database import get_setting
+        return int(float(get_setting(key, str(default)) or default))
+    except Exception:
+        return default
+
+
+class HostRateLimiter:
+    """Скользящее окно: не больше max_per_min обращений к хосту за минуту."""
+
+    def __init__(self, name, default_per_min, setting_key=None):
+        self.name = name
+        self.default_per_min = default_per_min
+        self.setting_key = setting_key
+        self.hits = []
+        self.rejected = 0
+
+    def limit(self):
+        return _setting_int(self.setting_key, self.default_per_min) if self.setting_key else self.default_per_min
+
+    def allow(self):
+        now = time.time()
+        self.hits = [t for t in self.hits if now - t < 60]
+        if len(self.hits) >= self.limit():
+            self.rejected += 1
+            return False
+        self.hits.append(now)
+        return True
+
+    def used(self):
+        now = time.time()
+        return len([t for t in self.hits if now - t < 60])
+
+
+# Хардлимит AWC — 100 запросов/мин на IP, держимся заметно ниже
+AWC_LIMITER = HostRateLimiter("aviationweather.gov", 20, "awc_rate_per_min")
+
+_AWC_STATE = {"blocked_until": 0.0, "strikes": 0, "last_error": ""}
+_METAR_CACHE = {}   # icao -> (timestamp, data)
+
+
+def awc_status():
+    """Состояние обращения к AWC — для диагностики в Telegram."""
+    now = time.time()
+    return {
+        "used_last_min": AWC_LIMITER.used(),
+        "limit_per_min": AWC_LIMITER.limit(),
+        "rejected": AWC_LIMITER.rejected,
+        "blocked": max(0, int(_AWC_STATE["blocked_until"] - now)),
+        "strikes": _AWC_STATE["strikes"],
+        "last_error": _AWC_STATE["last_error"],
+        "cached_stations": len(_METAR_CACHE),
+    }
+
+
+def _awc_penalty(code):
+    """Экспоненциальная пауза после 429/403, чтобы не усугублять блокировку."""
+    _AWC_STATE["strikes"] += 1
+    pause = min(900, 60 * (2 ** (_AWC_STATE["strikes"] - 1)))
+    _AWC_STATE["blocked_until"] = time.time() + pause
+    _AWC_STATE["last_error"] = f"HTTP {code}"
+    log.error(
+        f"🚫 AWC ответил {code} (лимит запросов). Пауза {pause} с, "
+        f"попытка #{_AWC_STATE['strikes']}. Снизьте частоту опроса METAR."
+    )
+
+
+def _awc_ok():
+    if _AWC_STATE["strikes"]:
+        log.info("✅ AWC снова отвечает нормально, счётчик блокировок сброшен")
+    _AWC_STATE["strikes"] = 0
+    _AWC_STATE["blocked_until"] = 0.0
+    _AWC_STATE["last_error"] = ""
 
 MONTH_NAMES = {1:"january",2:"february",3:"march",4:"april",5:"may",6:"june",7:"july",8:"august",9:"september",10:"october",11:"november",12:"december"}
 ICAO_TO_CITY = {"EGLC":"london","EGLL":"london","LFPB":"paris","LFPG":"paris","RCSS":"taipei"}
@@ -177,12 +258,44 @@ def fetch_checkwx(icao, api_key=""):
 
     return None
 
-def fetch_metar(icao):
+def fetch_metar(icao, force=False):
+    """
+    METAR с AWC с защитой от бана:
+      • кэш на metar_cache_ttl секунд (несколько станций с одним ICAO = один запрос);
+      • лимитер awc_rate_per_min запросов в минуту;
+      • экспоненциальная пауза после 429/403.
+    При блокировке возвращает последние известные данные, а не None.
+    """
     icao = icao.upper().strip()
+    now = time.time()
+
+    cached = _METAR_CACHE.get(icao)
+    ttl = _setting_int("metar_cache_ttl", 5)
+    if cached and not force and now - cached[0] < ttl:
+        return cached[1]
+
+    if now < _AWC_STATE["blocked_until"]:
+        log.warning(
+            f"AWC на паузе ещё {int(_AWC_STATE['blocked_until'] - now)} с — "
+            f"отдаю кэш по {icao}"
+        )
+        return cached[1] if cached else None
+
+    if not AWC_LIMITER.allow():
+        log.warning(
+            f"Лимит запросов к AWC ({AWC_LIMITER.limit()}/мин) исчерпан — "
+            f"пропускаю опрос {icao}, отдаю кэш"
+        )
+        return cached[1] if cached else None
+
     try:
         url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json&taf=false"
-        r = SESSION.get(url, timeout=20) 
+        r = SESSION.get(url, timeout=20)
+        if r.status_code in (403, 429):
+            _awc_penalty(r.status_code)
+            return cached[1] if cached else None
         if r.status_code != 200: return None
+        _awc_ok()
         data = r.json()
         if not data or not isinstance(data, list): return None
         m = data[0]
@@ -198,8 +311,11 @@ def fetch_metar(icao):
         if m.get("rawOb") is not None: result["raw_metar"] = m["rawOb"]
         if m.get("obsTime") is not None: result["obs_time"] = m["obsTime"]
         if "temp" not in result: return None
+        _METAR_CACHE[icao] = (time.time(), result)
         return result
-    except: return None
+    except Exception as e:
+        log.warning(f"fetch_metar({icao}) error: {e}")
+        return cached[1] if cached else None
 
 def fetch_weather(api_url):
     try:

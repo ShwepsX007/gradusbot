@@ -111,6 +111,56 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=KB([back("tr_api_menu")])
             )
         
+        # === Ручной ввод интервалов опроса ===
+        if state and state.startswith("wait_interval_"):
+            key = state[len("wait_interval_"):]
+            limits = {
+                "interval": (10, 3600, 30),
+                "metar_interval": (10, 3600, 30),
+                "checkwx_interval": (5, 3600, 10),
+                "m_interval": (5, 3600, 10),
+                "metar_burst_interval": (5, 120, 10),
+            }
+            lo, hi, safe = limits.get(key, (5, 3600, 30))
+            try:
+                val = int(float(text.replace(",", ".")))
+            except ValueError:
+                return await update.message.reply_text("❌ Введите целое число секунд.")
+            if not (lo <= val <= hi):
+                return await update.message.reply_text(f"❌ Допустимый диапазон: {lo}–{hi} секунд.")
+
+            set_setting(key, str(val))
+            s["state"] = None
+
+            warn = ""
+            if val < safe:
+                warn = (
+                    f"\n\n⚠️ {val}с — это агрессивно. Рекомендуемый минимум {safe}с. "
+                    f"При частых 429 бот сам уйдёт в паузу."
+                )
+            from jobs import schedule_jobs
+            schedule_jobs(context)
+            return await update.message.reply_text(
+                f"✅ Интервал сохранён: *{val}с*{warn}", parse_mode="Markdown",
+                reply_markup=KB([back("back_main")])
+            )
+
+        # === Окно турбо-опроса METAR ===
+        if state == "wait_burst_window":
+            raw = text.replace(" ", "").replace(":", "").replace("—", "-").replace("–", "-")
+            try:
+                a, b = raw.split("-")
+                start, end = int(a) % 60, int(b) % 60
+            except (ValueError, AttributeError):
+                return await update.message.reply_text("❌ Формат: `45-10`", parse_mode="Markdown")
+            set_setting("metar_burst_from", str(start))
+            set_setting("metar_burst_to", str(end))
+            s["state"] = None
+            return await update.message.reply_text(
+                f"✅ Турбо-окно: с *:{start}* по *:{end}* минуту часа.",
+                parse_mode="Markdown", reply_markup=KB([back("back_main")])
+            )
+
         # === Ввод параметров стратегии для связки ===
         if state and state.startswith("wait_bind_"):
             param = state[len("wait_bind_"):]

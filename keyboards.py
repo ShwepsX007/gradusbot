@@ -101,6 +101,11 @@ def settings_kb():
     m_th = get_setting("m_threshold", "1.0")
     pred_win = get_setting("metar_pred_window", "10")
     has_key = "✅ Установлен" if get_setting("checkwx_api_key", "") else "❌ Отсутствует"
+    burst_on = get_setting("metar_burst", "1") == "1"
+    burst_txt = (
+        f"{get_setting('metar_burst_interval', '10')}с в :"
+        f"{get_setting('metar_burst_from', '45')}–:{get_setting('metar_burst_to', '10')}"
+    ) if burst_on else "выкл"
 
     def m(v, c):
         return f"»{v}«" if str(v) == str(c) else str(v)
@@ -116,12 +121,16 @@ def settings_kb():
 
         [Btn("— Интервал CheckWX ⚡ —", callback_data="noop")],
         [Btn(m(f"{v}с", f"{scwx}с"), callback_data=f"smet_cwx_{v}") for v in (10, 30, 60)],
+        [Btn(f"✏️ Вручную ({scwx}с)", callback_data="sman_cwx")],
 
         [Btn("— Интервал METAR (AWC) ✈️ —", callback_data="noop")],
         [Btn(m(f"{v}с", f"{smet}с"), callback_data=f"smet_{v}") for v in (30, 60, 120)],
+        [Btn(f"✏️ Вручную ({smet}с)", callback_data="sman_metar")],
+        [Btn(f"⚡ Турбо-окно METAR: {burst_txt}", callback_data="sburst_menu")],
 
         [Btn("— Интервал WU 📡 —", callback_data="noop")],
         [Btn(m(f"{v}с", f"{si}с"), callback_data=f"si_{v}") for v in (30, 60, 120, 240)],
+        [Btn(f"✏️ Вручную ({si}с)", callback_data="sman_wu")],
 
         [Btn(f"— Окно прогноза METAR: {pred_win} мин —", callback_data="noop")],
         [Btn(m(f"{v}м", f"{pred_win}м"), callback_data=f"smet_pr_{v}") for v in (5, 8, 10, 12, 15)],
@@ -132,9 +141,33 @@ def settings_kb():
 
         [Btn("— Интервал рынков —", callback_data="noop")],
         [Btn(m(f"{v}с", f"{mi}с"), callback_data=f"smi_{v}") for v in (10, 30, 60, 120)],
+        [Btn(f"✏️ Вручную ({mi}с)", callback_data="sman_mkt")],
 
         [Btn("— Порог рынков —", callback_data="noop")],
         [Btn(m(f"{v}%", f"{m_th}%"), callback_data=f"smt_{v}") for v in ("0.5", "1.0", "2.0", "5.0")],
 
         back("back_main")
+    ])
+
+def burst_kb():
+    on = get_setting("metar_burst", "1") == "1"
+    bi = get_setting("metar_burst_interval", "10")
+    bf = get_setting("metar_burst_from", "45")
+    bt = get_setting("metar_burst_to", "10")
+    rate = get_setting("awc_rate_per_min", "20")
+
+    def m(v, c):
+        return f"»{v}«" if str(v) == str(c) else str(v)
+
+    return KB([
+        [Btn(f"⚡ Турбо-окно: {'✅ ВКЛ' if on else '❌ ВЫКЛ'}", callback_data="sburst_toggle")],
+        [Btn("— Интервал внутри окна —", callback_data="noop")],
+        [Btn(m(f"{v}с", f"{bi}с"), callback_data=f"sburst_int_{v}") for v in (5, 10, 15, 30)],
+        [Btn(f"✏️ Вручную ({bi}с)", callback_data="sman_burst")],
+        [Btn(f"— Окно: с :{bf} по :{bt} мин —", callback_data="noop")],
+        [Btn("✏️ Задать окно", callback_data="sman_window")],
+        [Btn(f"— Лимит запросов к AWC: {rate}/мин —", callback_data="noop")],
+        [Btn(m(f"{v}", f"{rate}"), callback_data=f"sburst_rate_{v}") for v in (10, 20, 30, 60)],
+        [Btn("📊 Диагностика AWC", callback_data="sburst_stats")],
+        back("back_main"),
     ])

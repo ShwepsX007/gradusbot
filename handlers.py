@@ -61,7 +61,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if d in ("tr_buy", "tr_sell", "tr_confirm") or d.startswith(("trm_", "try_", "trn_")):
             return await trade.handle(update, context)
 
-        if d.startswith(("su_", "si_", "sth_", "smi_", "smt_", "smet_", "ntg_")):
+        if d.startswith(("su_", "si_", "sth_", "smi_", "smt_", "smet_", "ntg_",
+                         "sman_", "sburst_")):
             return await settings_h.handle(update, context)
 
     except Exception as e:

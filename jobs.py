@@ -39,6 +39,55 @@ def fmt_metar_temp(val):
     return f"M{abs(val)}" if val < 0 else f"{val}"
 
 
+# =========================================================
+# ТУРБО-ОКНО ОПРОСА METAR
+# =========================================================
+
+_LAST_METAR_POLL = {}   # station_id -> timestamp
+
+
+def _in_burst_window(now_utc=None):
+    """
+    METAR выпускается раз в час (обычно :50–:56) плюс внеплановые SPECI.
+    Внутри окна опрашиваем часто, вне окна — редко: и сигнал ловим быстро,
+    и лишнюю нагрузку на AWC не создаём.
+    """
+    if get_setting("metar_burst", "1") != "1":
+        return False
+    try:
+        start = int(get_setting("metar_burst_from", "45")) % 60
+        end = int(get_setting("metar_burst_to", "10")) % 60
+    except (TypeError, ValueError):
+        start, end = 45, 10
+
+    minute = (now_utc or datetime.now(timezone.utc)).minute
+    if start <= end:
+        return start <= minute <= end
+    return minute >= start or minute <= end   # окно через границу часа
+
+
+def metar_poll_due(station_id):
+    """Пора ли опрашивать эту METAR-станцию с учётом турбо-окна."""
+    now = time.time()
+
+    def _int(key, default):
+        try:
+            return int(float(get_setting(key, str(default)) or default))
+        except (TypeError, ValueError):
+            return default
+
+    burst = _in_burst_window()
+    need = _int("metar_burst_interval", 10) if burst else _int("metar_interval", 60)
+    need = max(5, need)
+
+    last = _LAST_METAR_POLL.get(station_id, 0)
+    if now - last < need:
+        return False, burst, need
+
+    _LAST_METAR_POLL[station_id] = now
+    return True, burst, need
+
+
 def _checkwx_window_now(st):
     """Сейчас ли окно опроса для CheckWX станции?"""
     sid = st["id"]
@@ -89,6 +138,12 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
             # Для CheckWX — пропускаем опрос вне окна
             if st.get("station_type") == "checkwx":
                 if not _checkwx_window_now(st):
+                    continue
+
+            # Для METAR (AWC) — частый опрос только в турбо-окне выпуска сводки
+            if st.get("station_type") == "metar":
+                due, in_burst, need = metar_poll_due(st["id"])
+                if not due:
                     continue
 
             st_data = fetch_station_data(st)
@@ -800,8 +855,16 @@ def schedule_jobs(context, cid=None):
         data={"cid": current_cid, "stype": "wunderground"},
         job_kwargs={"misfire_grace_time": 60}
     )
+    # Джоб тикает часто, но реальные запросы фильтрует metar_poll_due()
+    metar_tick = si_metar
+    if get_setting("metar_burst", "1") == "1":
+        try:
+            metar_tick = max(5, min(si_metar, int(get_setting("metar_burst_interval", "10"))))
+        except (TypeError, ValueError):
+            metar_tick = si_metar
+
     jq.run_repeating(
-        job_stations, interval=si_metar, first=2,
+        job_stations, interval=metar_tick, first=2,
         name="st_metar_job",
         data={"cid": current_cid, "stype": "metar"},
         job_kwargs={"misfire_grace_time": 60}

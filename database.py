@@ -100,6 +100,12 @@ def init_db():
         ("checkwx_default_lead", "5"),
         ("market_notifications", "1"),
         ("pos_interval", "20"),          # Интервал проверки SL/TP по стакану
+        ("awc_rate_per_min", "20"),      # Потолок запросов к aviationweather.gov в минуту
+        ("metar_cache_ttl", "5"),        # Кэш METAR, сек (дедуп одинаковых ICAO)
+        ("metar_burst", "1"),            # Турбо-окно опроса METAR
+        ("metar_burst_interval", "10"),  # Интервал опроса внутри окна, сек
+        ("metar_burst_from", "45"),      # Минута часа: начало окна
+        ("metar_burst_to", "10"),        # Минута часа: конец окна
         ("exit_slippage_cents", "2"),    # Запас цены для FAK-выхода, центы
         ("demo_mode", "0"),
         ("order_timeout", "20"),
