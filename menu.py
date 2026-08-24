@@ -1,3 +1,4 @@
+import telegram.error
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -17,4 +18,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d == "back_main":
         s["state"] = None
-        return await q.edit_message_text("📋 Используйте кнопки нижнего меню 👇", parse_mode="Markdown")
+        try:
+            return await q.edit_message_text("📋 Используйте кнопки нижнего меню 👇", parse_mode="Markdown")
+        except telegram.error.BadRequest as e:
+            if "Message is not modified" in str(e):
+                return q.message
+            raise

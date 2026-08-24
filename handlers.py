@@ -1,4 +1,5 @@
 import logging
+import telegram.error
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -65,6 +66,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          "sman_", "sburst_")):
             return await settings_h.handle(update, context)
 
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" in str(e):
+            log.debug("Telegram ignored duplicate edit: Message is not modified")
+            return
+        log.exception(f"on_callback BadRequest: {e}")
+        await send_internal_error(update)
     except Exception as e:
         log.exception(f"on_callback error: {e}")
         await send_internal_error(update)
