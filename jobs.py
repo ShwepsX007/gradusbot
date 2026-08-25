@@ -12,7 +12,7 @@ from database import (
     add_station_history, update_station, get_station_history,
     add_market_history, update_market,
     get_positions, remove_position, add_trade_history,
-    get_bindings, add_position, update_position_size, update_position_limits,
+    get_bindings, add_position, update_position_size, update_position_meta, update_position_limits,
     get_binding_setting, set_binding_setting, get_station,
     get_positions_by_station, position_meta,
 )
@@ -394,18 +394,29 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                     tp_val = min(99, fill_cents + tp_delta) if tp_delta > 0 else 0
                     sl_val = max(1, fill_cents - sl_delta) if sl_delta > 0 else 0
 
+                    meta = {
+                        "strategy": strat_id,
+                        "binding_id": bid,
+                        "station_id": st["id"],
+                        "outcome_label": signal.get("outcome_label", ""),
+                        "market_unit": signal.get("market_unit", "C"),
+                    }
+                    tp_note = ""
+                    if tp_val > 0 and not demo_mode:
+                        tp_res = place_tp_limit_order(signal["token_id"], filled_size, tp_val, "BUY")
+                        if tp_res.get("success"):
+                            meta["tp_order_id"] = tp_res.get("order_id")
+                            meta["tp_order_price_cents"] = tp_val
+                            tp_note = f"\n📌 TP-лимитка выставлена в стакан: {tp_val}¢"
+                        else:
+                            tp_note = f"\n⚠️ TP-лимитку не удалось выставить: {tp_res.get('error')}"
+
                     add_position(
                         1 if demo_mode else 0,
                         market_slug, signal["token_id"], "BUY", filled_size,
                         sl_val, tp_val, fill_cents,
                         signal["question"], "YES",
-                        meta={
-                            "strategy": strat_id,
-                            "binding_id": bid,
-                            "station_id": st["id"],
-                            "outcome_label": signal.get("outcome_label", ""),
-                            "market_unit": signal.get("market_unit", "C"),
-                        }
+                        meta=meta
                     )
 
                     mode_label = "🎮 ДЕМО" if demo_mode else "💰 РЕАЛ"
@@ -419,7 +430,7 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
                         f"⚡️ *Тип ордера:* рыночный {res.get('order_type', 'FOK')}\n"
                         f"📊 *Цена факт. исполнения:* {fill_cents}¢ "
                         f"(потолок {round(signal['worst_price'] * 100)}¢)\n"
-                        f"📦 *Объём:* {filled_size} шт.{partial}\n"
+                        f"📦 *Объём:* {filled_size} шт.{partial}{tp_note}\n"
                         f"💡 *Основание:* {signal['reason']}"
                     )
                     await context.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
@@ -431,6 +442,76 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # ИСПОЛНЕНИЕ ОРДЕРОВ (рыночные FOK на вход / FAK на выход)
 # =========================================================
+
+def _order_id_from_result(res) -> str:
+    if not isinstance(res, dict):
+        return ""
+    raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+    for src in (res, raw):
+        for key in ("orderID", "orderId", "order_id", "id"):
+            value = src.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def place_tp_limit_order(token_id, size, tp_cents, side="BUY") -> dict:
+    """
+    Ставит настоящий TP-ордер в стакан.
+    Для BUY-позиции TP = SELL GTC по tp_cents. Для шорта — BUY GTC.
+    """
+    try:
+        tp_cents = int(float(tp_cents or 0))
+        size = float(size or 0)
+        if tp_cents <= 0 or size <= 0:
+            return {"skipped": True, "reason": "tp disabled"}
+        info = pt.get_market_info(token_id)
+        min_size = float((info or {}).get("min_size") or 0)
+        if min_size and size + 1e-9 < min_size:
+            return {
+                "success": False,
+                "error": f"позиция {size:g} шт. меньше минимума лимитного TP {min_size:g} шт.; TP оставлен виртуальным",
+            }
+        price = max(0.001, min(0.999, tp_cents / 100.0))
+        close_side = "SELL" if str(side).upper() == "BUY" else "BUY"
+        res = pt.place_order(token_id, close_side, price, size, "GTC")
+        if res.get("error") or not res.get("success"):
+            return {"success": False, "error": res.get("error", "TP order rejected"), "raw": res}
+        oid = _order_id_from_result(res)
+        if not oid:
+            return {"success": False, "error": "TP order accepted, but order id not found", "raw": res}
+        return {"success": True, "order_id": oid, "price_cents": tp_cents, "raw": res}
+    except Exception as e:
+        log.warning(f"place_tp_limit_order error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def _drop_tp_meta_for_position(pos: dict):
+    meta = position_meta(pos)
+    changed = False
+    for key in ("tp_order_id", "tp_order_price_cents"):
+        if key in meta:
+            meta.pop(key, None)
+            changed = True
+    if changed and pos.get("id"):
+        update_position_meta(pos["id"], meta)
+
+
+def cancel_attached_tp_order(pos: dict) -> dict:
+    """Отменяет прикреплённый TP-лимитник перед ручным/стоп-выходом."""
+    meta = position_meta(pos)
+    oid = meta.get("tp_order_id")
+    if not oid or pos.get("is_demo") == 1:
+        return {"skipped": True}
+    res = pt.cancel_order(str(oid))
+    if isinstance(res, dict) and res.get("error"):
+        log.warning(f"Не удалось отменить TP order {oid} перед выходом: {res.get('error')}")
+    else:
+        log.info(f"TP order {oid} cancelled before exit")
+    out = res if isinstance(res, dict) else {"success": True, "result": res}
+    out["tp_order_cancelled"] = str(oid)
+    return out
+
 
 def _best_price_from_book(token_id, side):
     """
@@ -543,6 +624,10 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
 
     close_side = "SELL" if str(pos.get("side", "BUY")).upper() == "BUY" else "BUY"
 
+    # Если для позиции висит TP-лимитка в стакане, перед любым другим выходом
+    # её нужно отменить, иначе можно продать позицию дважды.
+    tp_cancel_res = cancel_attached_tp_order(pos)
+
     if close_side == "SELL":
         # amount в шарах
         res = pt.place_market_order(pos["token_id"], "SELL", requested_size, worst_price, order_type)
@@ -573,7 +658,7 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
     except (TypeError, ValueError):
         filled_cash = round(filled_size * float(fill_cents) / 100.0, 4)
 
-    return {
+    out = {
         "success": True,
         "demo": False,
         "order_id": res.get("orderID", "unknown"),
@@ -582,6 +667,9 @@ def execute_exit(pos: dict, worst_price: float, order_type: str = "FAK") -> dict
         "fill_cents": int(round(float(fill_cents))),
         "partial": filled_size + 1e-9 < requested_size,
     }
+    if isinstance(tp_cancel_res, dict) and tp_cancel_res.get("tp_order_cancelled"):
+        out["tp_order_cancelled"] = tp_cancel_res.get("tp_order_cancelled")
+    return out
 
 
 # =========================================================
@@ -800,6 +888,8 @@ async def run_station_stops(st, current_temp_c):
             if res.get("partial"):
                 remaining = round(float(pos["size"]) - float(closed_size), 2)
                 update_position_size(pos["id"], remaining)
+                if res.get("tp_order_cancelled"):
+                    _drop_tp_meta_for_position(pos)
                 title = "ПОЗИЦИЯ ЧАСТИЧНО ЗАКРЫТА"
                 note = f"\n⚠️ Остаток {remaining} шт. бот продолжит добивать на следующих тиках."
             else:
@@ -910,16 +1000,59 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
 
             cur_cents = round(best_price * 100, 1)
 
+            meta = position_meta(pos)
+            tp_order_id = meta.get("tp_order_id")
+            tp_order_live = False
+            if tp_order_id and tp > 0:
+                # TP теперь стоит настоящим GTC-ордером в стакане. Пока он открыт,
+                # не дублируем TP-выход рыночным FAK. Если ордер исчез из open orders,
+                # считаем TP исполненным и убираем позицию из трекера.
+                open_ids = {str(o.get("id")) for o in pt.get_open_orders() if o.get("id")}
+                if str(tp_order_id) in open_ids:
+                    tp_order_live = True
+                else:
+                    tp_reached = (side == "BUY" and cur_cents >= tp) or (side != "BUY" and cur_cents <= tp)
+                    if tp_reached:
+                        closed_size = float(pos["size"])
+                        ep = float(pos["entry_price"])
+                        close_cents = float(meta.get("tp_order_price_cents") or tp)
+                        diff = (close_cents - ep) if side == "BUY" else (ep - close_cents)
+                        pnl = round(diff * closed_size / 100.0, 2)
+                        add_trade_history(
+                            pos["is_demo"], pos["slug"], pos["question"], pos["outcome"],
+                            pos["side"], closed_size, ep, close_cents, pnl
+                        )
+                        remove_position(pos["id"])
+                        bind_id = meta.get("binding_id")
+                        if bind_id:
+                            set_binding_setting(bind_id, "blocked", "1")
+                            set_binding_setting(bind_id, "blocked_reason", "tp")
+                        await context.bot.send_message(
+                            chat_id=cid,
+                            text=(
+                                f"🎯 *TP-лимитка исполнена / исчезла из стакана*\n\n"
+                                f"📌 {pos.get('question', '')}\n"
+                                f"⚡️ Цена TP: {close_cents}¢\n"
+                                f"📦 Объём: {closed_size} шт.\n"
+                                f"💰 PnL: {'+' if pnl > 0 else ''}{pnl}$\n"
+                                f"🔒 Связка заблокирована — повторных входов не будет."
+                            ),
+                            parse_mode="Markdown"
+                        )
+                        continue
+                    # Ордер исчез, но цена TP ещё не достигнута: возможно, его отменили вручную.
+                    # В этом случае не считаем позицию закрытой, а ниже включится старый виртуальный TP.
+
             hit = None
             if side == "BUY":
                 if sl > 0 and cur_cents <= sl:
                     hit = ("SL", sl)
-                elif tp > 0 and cur_cents >= tp:
+                elif tp > 0 and cur_cents >= tp and not tp_order_live:
                     hit = ("TP", tp)
             else:
                 if sl > 0 and cur_cents >= sl:
                     hit = ("SL", sl)
-                elif tp > 0 and cur_cents <= tp:
+                elif tp > 0 and cur_cents <= tp and not tp_order_live:
                     hit = ("TP", tp)
 
             if not hit:
@@ -975,6 +1108,8 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
                 remaining = round(float(pos["size"]) - float(closed_size), 2)
                 partial_note = f"\n⚠️ Частичное исполнение, остаток {remaining} шт. закроется на следующей проверке."
                 update_position_size(pos["id"], remaining)
+                if res.get("tp_order_cancelled"):
+                    _drop_tp_meta_for_position(pos)
             else:
                 remove_position(pos["id"])
 

@@ -285,21 +285,33 @@ async def _station_stop_enter(bid, option):
     tp_abs = min(99, fill_cents + tp_delta) if tp_delta > 0 else 0
     sl_abs = max(1, fill_cents - sl_delta) if sl_delta > 0 else 0
 
+    meta = {
+        "strategy": "station_stop",
+        "binding_id": bid,
+        "station_id": b["station_id"],
+        "outcome_label": label,
+        "market_unit": market_unit,
+        "direction": p["direction"],
+        "stop_temp": stop_temp,
+        "bucket": list(bucket[:2]) if bucket else None,
+        "entry_type": entry_type,
+    }
+    tp_note = ""
+    if tp_abs > 0 and not demo:
+        from jobs import place_tp_limit_order
+        tp_res = place_tp_limit_order(token_id, filled_size, tp_abs, "BUY")
+        if tp_res.get("success"):
+            meta["tp_order_id"] = tp_res.get("order_id")
+            meta["tp_order_price_cents"] = tp_abs
+            tp_note = f"\n📌 TP-лимитка выставлена в стакан: {tp_abs}¢"
+        else:
+            tp_note = f"\n⚠️ TP-лимитку не удалось выставить: {tp_res.get('error')}"
+
     add_position(
         1 if demo else 0,
         b["market_slug"], token_id, "BUY", filled_size,
         sl_abs, tp_abs, fill_cents, b["market_name"], "YES",
-        meta={
-            "strategy": "station_stop",
-            "binding_id": bid,
-            "station_id": b["station_id"],
-            "outcome_label": label,
-            "market_unit": market_unit,
-            "direction": p["direction"],
-            "stop_temp": stop_temp,
-            "bucket": list(bucket[:2]) if bucket else None,
-            "entry_type": entry_type,
-        }
+        meta=meta
     )
 
     mode_label = "🎮 ДЕМО" if demo else "💰 РЕАЛ"
@@ -313,7 +325,7 @@ async def _station_stop_enter(bid, option):
         f"🎯 Корзина: *{label}*\n"
         f"⚡️ Ордер: {kind}\n"
         f"💲 Цена: {fill_cents}¢ | 📦 Объём: {filled_size} шт.\n"
-        f"🆔 `{str(order_id)[:14]}`\n\n"
+        f"🆔 `{str(order_id)[:14]}`{tp_note}\n\n"
         f"🛑 Стоп по станции: *{stop_temp}°{market_unit}* и {arrow} ({stop_src})\n"
         f"💸 TP: {tp_abs or '—'}¢ | SL: {sl_abs or '—'}¢\n\n"
         f"_При сигнале станции позиция будет продана по рынку немедленно._"

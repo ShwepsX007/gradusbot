@@ -54,6 +54,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"🔹 Действие: *{p['side']} ({p['outcome']})* | Объём: *{p['size']}*\n"
             msg += f"🔹 Вход: *{ep}¢* | Текущая: *{curr_price}¢*\n"
             msg += f"🔹 SL: *{p['sl']}¢* | TP: *{p['tp']}¢*\n"
+            try:
+                from database import position_meta
+                tp_oid = position_meta(p).get("tp_order_id")
+            except Exception:
+                tp_oid = None
+            if tp_oid:
+                msg += f"🔹 TP-ордер в стакане: `{str(tp_oid)[:10]}...`\n"
             msg += f"🔹 PnL: {'📈+' if pnl > 0 else '📉'}{pnl}$\n───────────────────\n"
 
             kb.append([Btn(f"🛑 Продать сейчас ({curr_price}¢)", callback_data=f"pos_close_{p['id']}_{curr_price}")])
@@ -75,8 +82,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if d.startswith("pos_forget_"):
         pid = int(d.split("_")[2])
+        pos = get_position_by_id(pid)
+        if pos:
+            try:
+                from jobs import cancel_attached_tp_order
+                cancel_attached_tp_order(pos)
+            except Exception:
+                pass
         remove_position(pid)
-        return await q.edit_message_text("✅ Позиция стерта из памяти бота (ордер на биржу не отправлялся).", reply_markup=KB([back("tr_orders")]))
+        return await q.edit_message_text("✅ Позиция стерта из памяти бота. Прикреплённая TP-лимитка отменена, если была.", reply_markup=KB([back("tr_orders")]))
 
     if d.startswith("pos_sl0_"):
         pid = int(d.split("_")[2])
@@ -147,6 +161,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if res.get("partial"):
             remaining = round(float(pos["size"]) - float(closed_size), 2)
             update_position_size(pid, remaining)
+            if res.get("tp_order_cancelled"):
+                try:
+                    from database import position_meta, update_position_meta
+                    meta = position_meta(pos)
+                    meta.pop("tp_order_id", None)
+                    meta.pop("tp_order_price_cents", None)
+                    update_position_meta(pid, meta)
+                except Exception:
+                    pass
             note = f"\n⚠️ Исполнено частично, в позиции осталось {remaining} шт."
         else:
             remove_position(pid)

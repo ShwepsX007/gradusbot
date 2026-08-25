@@ -320,6 +320,10 @@ def update_position_size(pid, size):
     """Уменьшает объём позиции после частичного исполнения выхода (FAK)."""
     with get_db() as c: c.execute("UPDATE active_positions SET size=? WHERE id=?", (size, pid))
 
+def update_position_meta(pid, meta):
+    meta_json = json.dumps(meta, ensure_ascii=False) if isinstance(meta, dict) else (meta or None)
+    with get_db() as c: c.execute("UPDATE active_positions SET meta=? WHERE id=?", (meta_json, pid))
+
 def update_position_limits(pid, sl, tp):
     with get_db() as c: c.execute("UPDATE active_positions SET sl=?, tp=? WHERE id=?", (sl, tp, pid))
 
