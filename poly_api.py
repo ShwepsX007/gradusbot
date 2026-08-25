@@ -122,7 +122,10 @@ def _bind_card(bid):
             f"позиция немедленно продаётся по рынку._"
         )
 
-        kb.append([Btn("🎯 Войти в рынок", callback_data=f"stbind_enter_{bid}")])
+        kb.append([
+            Btn("🎯 Войти в рынок", callback_data=f"stbind_enter_{bid}"),
+            Btn("💼 Позиции / выход", callback_data="tr_orders"),
+        ])
         kb.append([
             Btn(("» ⚡️ По рынку «" if p["entry_type"] == "market" else "⚡️ По рынку"),
                 callback_data=f"stbind_et_{bid}_market"),

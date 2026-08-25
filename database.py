@@ -110,6 +110,8 @@ def init_db():
         ("panic_slippage_cents", "5"),   # Запас цены для метео-стопа, центы
         ("panic_exit_attempts", "5"),    # Сколько раз метео-стоп пробует FAK-продажу
         ("panic_exit_retry_delay_sec", "0.4"),  # Пауза между FAK-попытками метео-стопа
+        ("station_notify_cooldown_sec", "300"), # Не чаще 1 погодного уведомления по станции за N секунд
+        ("exit_fail_notify_cooldown_sec", "900"), # Не спамить одинаковыми ошибками выхода TP/SL
         ("demo_mode", "0"),
         ("order_timeout", "20"),
         ("order_retries", "3"),

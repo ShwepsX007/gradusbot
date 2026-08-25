@@ -65,6 +65,26 @@ def _minute_in_window(minute, center, lead, window):
     return minute >= start or minute <= end
 
 
+def _float_setting_safe(key, default):
+    try:
+        return float(get_setting(key, str(default)) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _notify_allowed(key: str, cooldown_sec: float) -> bool:
+    """Простой антиспам: True, если по ключу давно не уведомляли."""
+    now = time.time()
+    try:
+        last = float(get_setting(key, "0") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if cooldown_sec > 0 and now - last < cooldown_sec:
+        return False
+    set_setting(key, str(now))
+    return True
+
+
 def station_metar_window(sid):
     """
     Персональное окно выпуска METAR для станции.
@@ -209,6 +229,11 @@ async def job_stations(context: ContextTypes.DEFAULT_TYPE):
             first_time = old_temp is None
 
             should_notify = notify_stations and (temp_changed or always_metar or first_time)
+            if should_notify and not first_time:
+                cooldown = _float_setting_safe("station_notify_cooldown_sec", 300)
+                # METAR/CheckWX в турбо-окне могут опрашиваться каждые 5-10 секунд.
+                # Без кулдауна одинаковые обновления превращаются в спам.
+                should_notify = _notify_allowed(f"station_notify_{st['id']}", cooldown)
 
             if should_notify:
                 # Единицы берём из общих настроек: "C", "F" или "B" (обе сразу),
@@ -912,17 +937,26 @@ async def job_positions(context: ContextTypes.DEFAULT_TYPE):
             res = execute_exit(pos, worst_price, "FAK")
 
             if not res.get("success"):
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text=(
-                        f"⚠️ *{kind} сработал, но выход не исполнился*\n"
-                        f"📌 {pos.get('question', '')}\n"
-                        f"Текущий bid: {cur_cents}¢ | Уровень: {level}¢\n"
-                        f"`{res.get('error')}`"
-                        + (f"\n\n💡 {res['explain']}" if res.get("explain") else "")
-                    ),
-                    parse_mode="Markdown"
-                )
+                cooldown = _float_setting_safe("exit_fail_notify_cooldown_sec", 900)
+                notify_key = f"pos_exit_fail_{pos['id']}_{kind}"
+                if _notify_allowed(notify_key, cooldown):
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=(
+                            f"⚠️ *{kind} сработал, но выход не исполнился*\n"
+                            f"📌 {pos.get('question', '')}\n"
+                            f"Текущий bid: {cur_cents}¢ | Уровень: {level}¢\n"
+                            f"`{res.get('error')}`"
+                            + (f"\n\n💡 {res['explain']}" if res.get("explain") else "")
+                            + f"\n\n_Повторные одинаковые ошибки будут скрыты на {int(cooldown // 60)} мин._"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    log.warning(
+                        f"{kind} exit failed for position {pos['id']} (notification suppressed): "
+                        f"{res.get('error')}"
+                    )
                 continue
 
             close_cents = res["fill_cents"]
