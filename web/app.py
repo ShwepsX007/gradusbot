@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -26,6 +27,9 @@ def init_web_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS web_metar_history (
             station_id INTEGER NOT NULL, obs_time INTEGER NOT NULL, temp REAL NOT NULL,
             PRIMARY KEY (station_id, obs_time))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_station_solar (
+            station_id INTEGER NOT NULL, day TEXT NOT NULL, sunrise TEXT, sunset TEXT, timezone TEXT NOT NULL,
+            PRIMARY KEY (station_id, day))''')
 
 
 init_web_db()
@@ -71,7 +75,7 @@ def station_info(code):
 
 def forecast(lat, lon):
     return cached(('forecast', lat, lon), 900, lambda: upstream('https://api.open-meteo.com/v1/forecast', {
-        'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'past_days': 1, 'forecast_days': 2,
+        'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'past_days': 6, 'forecast_days': 2,
         'hourly': 'temperature_2m,relative_humidity_2m,cloud_cover,wind_speed_10m,wind_direction_10m,precipitation_probability',
         'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset'}))
 
@@ -183,6 +187,7 @@ def remove_station(sid):
         conn.execute('DELETE FROM station_market_bindings WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM station_history WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM web_metar_history WHERE station_id=?', (sid,))
+        conn.execute('DELETE FROM web_station_solar WHERE station_id=?', (sid,))
         prefix = f'st_{sid}_'
         conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
         conn.execute('DELETE FROM stations WHERE id=?', (sid,))
@@ -196,28 +201,56 @@ def record_web_metar(sid, metar):
     except (TypeError, ValueError, OverflowError):
         return
     now = time.time()
-    if not math.isfinite(temp) or obs_time < now - 48 * 3600 or obs_time > now + 300:
+    if not math.isfinite(temp) or obs_time < now - 8 * 24 * 3600 or obs_time > now + 300:
         return
     with db.get_db() as conn:
         # Observations are deduplicated by their source timestamp, not poll time.
         conn.execute('INSERT OR IGNORE INTO web_metar_history (station_id,obs_time,temp) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)', (sid, obs_time, temp, sid))
-        conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 48 * 3600))
+        conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 8 * 24 * 3600))
 
 
 def combined_history(sid):
-    points = db.get_station_history(sid)
+    points = db.get_station_history(sid, hours=8 * 24)
     with db.get_db() as conn:
         points.extend([[r['obs_time'], r['temp']] for r in conn.execute(
             'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>?',
-            (sid, time.time() - 24 * 3600))])
+            (sid, time.time() - 8 * 24 * 3600))])
     return sorted(points, key=lambda p: p[0])
+
+
+def save_solar_days(sid, forecast_data):
+    if not isinstance(forecast_data, dict): return
+    tz = forecast_data.get('timezone')
+    daily = forecast_data.get('daily') or {}
+    if not isinstance(tz, str) or not tz or not isinstance(daily, dict): return
+    dates, rises, sets = daily.get('time'), daily.get('sunrise'), daily.get('sunset')
+    if not all(isinstance(x, list) for x in (dates, rises, sets)): return
+    rows = []
+    for day, rise, sunset in zip(dates, rises, sets):
+        if not isinstance(day, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day): continue
+        # Preserve dates even when polar conditions have no sunrise or sunset.
+        if rise is not None and (not isinstance(rise, str) or not rise.startswith(day + 'T')): continue
+        if sunset is not None and (not isinstance(sunset, str) or not sunset.startswith(day + 'T')): continue
+        rows.append((sid, day, rise, sunset, tz, sid))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=9)).date().isoformat()
+    with db.get_db() as conn:
+        for row in rows:
+            conn.execute("""INSERT OR REPLACE INTO web_station_solar (station_id,day,sunrise,sunset,timezone)
+                SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)""", row)
+        conn.execute('DELETE FROM web_station_solar WHERE station_id=? AND day<?', (sid, cutoff))
+
+
+def get_solar_days(sid):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=9)).date().isoformat()
+    with db.get_db() as conn:
+        return [dict(r) for r in conn.execute('SELECT day,sunrise,sunset,timezone FROM web_station_solar WHERE station_id=? AND day>=? ORDER BY day', (sid, cutoff))]
 
 
 @app.get('/api/stations/<int:sid>/weather')
 def weather(sid):
     station = db.get_station(sid)
     if not station: return jsonify(error='Станция не найдена'), 404
-    result = {'station': public_station(station), 'history': combined_history(sid), 'metar': None, 'forecast': None, 'info': None}
+    result = {'station': public_station(station), 'history': combined_history(sid), 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
     if not station['enabled']:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
@@ -248,6 +281,8 @@ def weather(sid):
     result['info'] = info
     if info and info.get('lat') is not None and info.get('lon') is not None:
         result['forecast'] = forecast(info['lat'], info['lon'])
+        save_solar_days(sid, result['forecast'])
+        result['solar_days'] = get_solar_days(sid)
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
 

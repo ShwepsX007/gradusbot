@@ -1,7 +1,7 @@
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state = {stations:[], selected:null, bindings:[], market:null, weather:null, demo:false, units:'C'};
+const state = {stations:[], selected:null, bindings:[], market:null, weather:null, demo:false, units:'C', arcOffset:0, arcStation:null};
 const demoStation = {id:0,name:'New York',station_code:'KLGA',station_type:'metar',enabled:1};
 const demoBindings = [{id:0,market_slug:'demo',market_name:'New York · сегодня'}, {id:1,market_slug:'demo-tomorrow',market_name:'New York · завтра'}];
 function shiftDate(date,days){let d=new Date(date+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10)}
@@ -21,7 +21,7 @@ $('#station-form').onsubmit=async e=>{e.preventDefault();const f=e.currentTarget
 $('#station-toggle').onclick=async()=>{if(state.demo){toast('В демонстрации станция не изменяется');return}let s=state.stations.find(x=>x.id===state.selected);if(!s)return;try{await api(`/api/stations/${s.id}`,{method:'PATCH',body:JSON.stringify({enabled:!s.enabled})});await loadStations(s.id)}catch(e){toast(e.message)}};
 async function loadStations(select){try{state.stations=await api('/api/stations');state.demo=state.stations.length===0;$('#demo-banner').classList.toggle('hidden',!state.demo);if(state.demo){state.selected=0;state.weather=demoWeather;state.bindings=demoBindings;state.market='demo';renderAll();return}state.selected=state.stations.some(x=>x.id===(select??state.selected))?(select??state.selected):state.stations[0].id;renderStationTabs();await loadStation()}catch(e){toast(e.message)}}
 function renderStationTabs(){const list=state.demo?[demoStation]:state.stations;$('#station-count').textContent=state.demo?'01':String(list.length).padStart(2,'0');$('#station-tabs').innerHTML=list.map(s=>`<button class="station-tab ${s.id===state.selected?'active':''}" data-id="${s.id}"><i class="tab-dot"></i>${esc(s.name)} <span style="opacity:.5;margin-left:7px">${esc(s.station_code)}</span></button>`).join('');$$('.station-tab').forEach(b=>b.onclick=async()=>{state.selected=Number(b.dataset.id);renderStationTabs();await loadStation()})}
-async function loadStation(background=false){const previousMarket=state.market;if(!background){state.market=null;state.weather=null;state.bindings=[];renderWeather();renderMarketTabs();renderMarket(null)}try{const [w,b]=await Promise.all([api(`/api/stations/${state.selected}/weather`),api(`/api/stations/${state.selected}/bindings`)]);if(w.station.id!==state.selected)return;state.weather=w;state.bindings=b;state.market=b.some(x=>x.market_slug===previousMarket)?previousMarket:(b[0]?.market_slug||null);renderWeather();renderMarketTabs();await loadMarket()}catch(e){toast(e.message)}}
+async function loadStation(background=false){if(state.arcStation!==state.selected){state.arcStation=state.selected;state.arcOffset=0}const previousMarket=state.market;if(!background){state.market=null;state.weather=null;state.bindings=[];renderWeather();renderMarketTabs();renderMarket(null)}try{const [w,b]=await Promise.all([api(`/api/stations/${state.selected}/weather`),api(`/api/stations/${state.selected}/bindings`)]);if(w.station.id!==state.selected)return;state.weather=w;state.bindings=b;state.market=b.some(x=>x.market_slug===previousMarket)?previousMarket:(b[0]?.market_slug||null);renderWeather();renderMarketTabs();await loadMarket()}catch(e){toast(e.message)}}
 function fmt(v,unit=''){return v===null||v===undefined||v===''?'—':`${esc(v)}${unit}`}
 function tempNumber(v){return Number.isFinite(Number(v))&&v!==null&&v!==undefined&&v!==''?Number(v):null}
 function prettyNumber(n){return String(Math.round((n+Number.EPSILON)*10)/10)}
@@ -38,46 +38,60 @@ function renderPrecipitation(m,f){
   el.textContent=p?`${p.probability}%${p.probability>=60?' · высокая':''}`:'Нет данных';el.classList.toggle('risk-high',!!p&&p.probability>=60);
   $('#precip-period').textContent=p?`Интервал ${p.start}–${p.end} · местное время`:'Почасовой прогноз недоступен';
 }
-function drawChart(history){let pts=history.filter(x=>x[1]!=null&&Number.isFinite(Number(x[1])));$('#chart-empty').classList.toggle('hidden',pts.length>=2);const svg=$('#history-chart');if(pts.length<2){svg.innerHTML='';$$('.chart-grid span').forEach(el=>el.textContent='—');return}let vals=pts.map(p=>+p[1]), min=Math.min(...vals)-2,max=Math.max(...vals)+2, end=Date.now()/1000, start=end-24*3600, span=end-start;let coords=pts.map(p=>`${((p[0]-start)/span*790+5).toFixed(1)},${(145-(p[1]-min)/(max-min)*130).toFixed(1)}`).join(' ');svg.innerHTML=`<defs><linearGradient id="fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#a6dfaa" stop-opacity=".18"/><stop offset="1" stop-color="#a6dfaa" stop-opacity="0"/></linearGradient></defs><polygon points="5,160 ${coords} 795,160" fill="url(#fill)"/><polyline points="${coords}" fill="none" stroke="#b6e6b7" stroke-width="2" vector-effect="non-scaling-stroke"/>`;let grid=$$('.chart-grid span');[max,max-(max-min)/3,max-2*(max-min)/3,min].forEach((v,i)=>grid[i].textContent=tempText(v))}
+function drawChart(history){let now=Date.now()/1000,pts=history.filter(x=>x[1]!=null&&Number.isFinite(Number(x[1]))&&Number(x[0])>=now-24*3600&&Number(x[0])<=now);$('#chart-empty').classList.toggle('hidden',pts.length>=2);const svg=$('#history-chart');if(pts.length<2){svg.innerHTML='';$$('.chart-grid span').forEach(el=>el.textContent='—');return}let vals=pts.map(p=>+p[1]), min=Math.min(...vals)-2,max=Math.max(...vals)+2, end=Date.now()/1000, start=end-24*3600, span=end-start;let coords=pts.map(p=>`${((p[0]-start)/span*790+5).toFixed(1)},${(145-(p[1]-min)/(max-min)*130).toFixed(1)}`).join(' ');svg.innerHTML=`<defs><linearGradient id="fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#a6dfaa" stop-opacity=".18"/><stop offset="1" stop-color="#a6dfaa" stop-opacity="0"/></linearGradient></defs><polygon points="5,160 ${coords} 795,160" fill="url(#fill)"/><polyline points="${coords}" fill="none" stroke="#b6e6b7" stroke-width="2" vector-effect="non-scaling-stroke"/>`;let grid=$$('.chart-grid span');[max,max-(max-min)/3,max-2*(max-min)/3,min].forEach((v,i)=>grid[i].textContent=tempText(v))}
 function localDate(tz){if(!tz)return null;try{let parts=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());let get=k=>parts.find(p=>p.type===k)?.value;return `${get('year')}-${get('month')}-${get('day')}`}catch{return null}}
-const {zonedEpoch, precipitationForecast} = WeatherView;
-function solarCycle(f,now){
-  let d=f.daily||{},r=d.sunrise||[],s=d.sunset||[];
-  for(let i=0;i<r.length;i++){
-    let rise=zonedEpoch(r[i],f.timezone),set=zonedEpoch(s[i],f.timezone),next=zonedEpoch(r[i+1],f.timezone);
-    if(rise!=null&&set!=null&&set>rise&&now>=rise&&now<set)return {start:rise,end:set,day:true};
-    if(set!=null&&next!=null&&next>set&&now>=set&&now<next)return {start:set,end:next,day:false};
-  }
-  return null;
+const {precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, DAY_START_X, DAY_WIDTH} = WeatherView;
+function displayedSolarDay(w,day){
+  let saved=(w.solar_days||[]).find(item=>item.day===day);if(saved)return saved;
+  let f=w.forecast||{},d=f.daily||{},dates=d.time||d.sunrise?.map(x=>x?.slice(0,10))||[],idx=dates.indexOf(day);
+  return idx<0?null:{day,sunrise:d.sunrise?.[idx],sunset:d.sunset?.[idx],timezone:f.timezone};
 }
-function arcPoint(p){return {x:70+660*p,y:(1-p)**2*142+2*(1-p)*p*(-8)+p**2*142}}
+function dateLabel(day){try{return new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',day:'numeric',month:'long',year:'numeric'}).format(new Date(day+'T12:00:00Z'))}catch{return day||'—'}}
 function updateClock(){
-  const w=state.weather||{},f=w.forecast||{},tz=f.timezone,now=Date.now();
-  try{$('#local-time').textContent=tz?new Intl.DateTimeFormat('ru-RU',{timeZone:tz,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(now)):'—'}catch{$('#local-time').textContent='—'}
-  const cycle=solarCycle(f,now), marker=$('#sun-marker'), progress=$('#arc-progress');
-  if(!cycle){marker.classList.add('hidden');progress.style.strokeDashoffset='100';$('#arc-observations').innerHTML='';$('.sun-heading h4').textContent='Солнечный цикл недоступен';return}
-  marker.classList.remove('hidden');const p=Math.max(0,Math.min(1,(now-cycle.start)/(cycle.end-cycle.start))), pt=arcPoint(p);
-  for(const id of ['sun-dot','sun-glow']){$('#'+id).setAttribute('cx',pt.x);$('#'+id).setAttribute('cy',pt.y)}
-  const text=$('#sun-temperature');text.setAttribute('x',pt.x);text.setAttribute('y',pt.y);text.innerHTML=tempMarker(w.metar?.temp,pt.x);
-  $('#sun-dot').style.fill=cycle.day?'#e8d79c':'#c1d4e6';progress.style.strokeDashoffset=String(100*(1-p));
-  $('.sun-heading h4').textContent=cycle.day?'Движение солнца':'Ночной цикл';$('.sun-icon').textContent=cycle.day?'☼':'☾';
-  $('#arc-start-label').textContent=cycle.day?'ВОСХОД':'ЗАКАТ';$('#arc-end-label').textContent=cycle.day?'ЗАКАТ':'ВОСХОД';
-  // Only show recorded points in the current solar interval, not forecasts or interpolation.
-  let last=-1, points=[];for(const [stamp,temp] of (w.history||[])){
-    const ms=Number(stamp)*1000, ratio=(ms-cycle.start)/(cycle.end-cycle.start);
-    if(!Number.isFinite(ms)||temp==null||!Number.isFinite(Number(temp))||ratio<0||ratio>p||ratio>p-0.055||ratio-last<0.11)continue;
-    let a=arcPoint(ratio),label=tempText(Number(temp)),at=new Intl.DateTimeFormat('ru-RU',{timeZone:tz,hour:'2-digit',minute:'2-digit'}).format(new Date(ms));
-    points.push(`<g class="arc-observation"><title>${esc(at)} · ${esc(label)}</title><circle cx="${a.x}" cy="${a.y}" r="2.5"/><text x="${a.x}" y="${a.y-10}" text-anchor="middle">${esc(label)}</text></g>`);last=ratio;
+  const w=state.weather||{},f=w.forecast||{},now=Date.now(),tz=f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone;
+  const local=localClock(now,tz), day=local?shiftDay(local.day,state.arcOffset):null, solar=day?displayedSolarDay(w,day):null;
+  $('#arc-prev').disabled=!local||state.arcOffset<=-6;$('#arc-next').disabled=!local||state.arcOffset>=0;
+  $('#arc-day-counter').textContent=`${1-state.arcOffset} / 7`;
+  $('#arc-date').textContent=day?(state.arcOffset===0?'Сегодня · ':'')+dateLabel(day):'Дата недоступна';
+  $('#sunrise').textContent=timePart(solar?.sunrise);$('#sunset').textContent=timePart(solar?.sunset);
+  $('#local-time-label').textContent=state.arcOffset===0?'МЕСТНОЕ ВРЕМЯ':'ВЫБРАННАЯ ДАТА';
+  $('#local-time').textContent=state.arcOffset===0?(local?.time||'—'):(day?day.split('-').reverse().join('.'):'—');
+  const sunrise=solarSeconds(solar?.sunrise), sunset=solarSeconds(solar?.sunset), path=dailyPath(sunrise,sunset);
+  const marker=$('#sun-marker');$('#arc-observations').innerHTML='';
+  $('#arc-full').setAttribute('d',path||'');$('#arc-progress').setAttribute('d',path||'');
+  if(!path||!local){
+    marker.classList.add('hidden');$('#arc-passed-rect').setAttribute('width',0);
+    $('.sun-heading h4').textContent='Нет данных о восходе и закате';$('.sun-icon').textContent='◷';
+    $('#arc-note').textContent='Для выбранной даты нет данных о восходе и закате. История может быть неполной.';return;
   }
-  $('#arc-observations').innerHTML=points.join('');
+  const current=state.arcOffset===0,seconds=current?local.seconds:86400;
+  $('#arc-passed-rect').setAttribute('width',DAY_WIDTH*seconds/86400);
+  const pt=current?curvePoint(seconds,sunrise,sunset):null;
+  marker.classList.toggle('hidden',!pt);
+  if(pt){
+    for(const id of ['sun-dot','sun-glow']){$('#'+id).setAttribute('cx',pt.x);$('#'+id).setAttribute('cy',pt.y)}
+    const text=$('#sun-temperature');text.setAttribute('x',pt.x);text.setAttribute('y',pt.y);text.innerHTML=tempMarker(w.metar?.temp,pt.x);
+    const dayPhase=seconds>=sunrise&&seconds<sunset;$('#sun-dot').style.fill=dayPhase?'#e8d79c':'#c1d4e6';$('.sun-icon').textContent=dayPhase?'☼':'☾';
+  }else $('.sun-icon').textContent='◷';
+  $('.sun-heading h4').textContent=current?'Ночь · день · ночь':'История станции';
+  // Points are recorded observations, placed by local wall-clock time, not predictions.
+  const observations=observationsForDay(w.history||[],tz,day,now);let lastLabelX=-Infinity;
+  $('#arc-observations').innerHTML=observations.map(item=>{
+    const p=curvePoint(item.seconds,sunrise,sunset);if(!p)return '';
+    let label='';if(p.x-lastLabelX>=80&&(!pt||Math.abs(p.x-pt.x)>30)){lastLabelX=p.x;label=`<text x="${p.x}" y="${p.y-11}" text-anchor="middle">${esc(tempText(item.temp))}</text>`}
+    return `<g class="arc-observation"><title>${esc(item.time)} · ${esc(tempText(item.temp))}</title><circle cx="${p.x}" cy="${p.y}" r="2.4"/>${label}</g>`;
+  }).join('');
+  $('#arc-note').textContent=observations.length?`Сохранено точек: ${observations.length}. Температура и время — при наведении${current?'; на светиле — последний METAR':''}.`:'Нет сохранённых наблюдений за выбранный день.';
 }
+$('#arc-prev').onclick=()=>{if(state.arcOffset>-6){state.arcOffset--;updateClock()}};
+$('#arc-next').onclick=()=>{if(state.arcOffset<0){state.arcOffset++;updateClock()}};
 function renderMarketTabs(){let b=state.bindings;$('#market-count').textContent=String(b.length).padStart(2,'0');$('#market-tabs').innerHTML=b.map(x=>`<button class="market-tab ${x.market_slug===state.market?'active':''}" data-slug="${esc(x.market_slug)}">${esc(x.market_name)}</button>`).join('');$$('.market-tab').forEach(btn=>btn.onclick=()=>{state.market=btn.dataset.slug;renderMarketTabs();loadMarket()})}
 async function loadMarket(){if(!state.market){renderMarket(null);return}if(state.demo){renderMarket({market:{title:state.market==='demo'?'Максимальная температура в Нью-Йорке':'Максимальная температура в Нью-Йорке · завтра',options:demoOptions,closed:false},positions:[]});return}const slug=state.market;try{let m=await api('/api/market/'+encodeURIComponent(slug));if(slug===state.market)renderMarket(m)}catch(e){renderMarket(null,e.message)}}
 function renderMarket(data,error){let m=data?.market,binding=state.bindings.find(x=>x.market_slug===state.market);$('#market-title').textContent=binding?.market_name||m?.title||'Нет данных рынка';$('#market-description').textContent=error||(!m?'Найдите рынок или добавьте ссылку на событие.':state.demo?'Демонстрационные значения · не реальные котировки':(binding?.market_name!==m.title?'Оригинал: '+m.title:'Вероятности исходов по данным события Polymarket'));$('#market-state').textContent=state.demo?'ДЕМО':m?.closed?'ЗАКРЫТ':'СОБЫТИЕ';$('#market-link').href=state.demo||!state.market?'https://polymarket.com':'https://polymarket.com/event/'+encodeURIComponent(state.market);$('#market-options').innerHTML=m?.options?.length?m.options.map(o=>{let n=typeof o.prob==='number'?Math.max(0,Math.min(100,o.prob)):null;return `<div class="option-row"><span class="option-name">${esc(o.label)}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span><span class="option-price">${n==null?'—':n+'¢'}</span><span class="trade-disabled" title="Торговля через веб-панель пока недоступна">Только просмотр</span></div>`}).join(''):'<div class="empty-state">Выберите или добавьте рынок</div>';let pos=data?.positions||[];$('#positions-count').textContent=`Позиций бота: ${pos.length}`;for(const id of ['rename-market','unlink-market','delete-market'])$('#'+id).classList.toggle('hidden',state.demo||!state.market);$('#positions').innerHTML=pos.length?'<b>ПОЗИЦИИ ИЗ БАЗЫ БОТА</b>'+pos.map(p=>`<div class="position-row">${esc(p.is_demo?'ДЕМО · ':'')}${esc(p.question||p.outcome||'Позиция')} · ${esc(p.side)} · ${esc(p.size)} shares · вход ${esc(p.entry_price)} · SL ${esc(p.sl??'—')} / TP ${esc(p.tp??'—')}</div>`).join(''):''}
 $('#rename-market').onclick=async()=>{let binding=state.bindings.find(x=>x.market_slug===state.market);if(!binding)return;let name=prompt('Новое название рынка (изменится во всех станциях и в базе бота):',binding.market_name);if(name===null)return;try{await api('/api/markets/'+encodeURIComponent(binding.market_slug),{method:'PATCH',body:JSON.stringify({name})});await loadStation(true);toast('Рынок переименован')}catch(e){toast(e.message)}};
 $('#unlink-market').onclick=async()=>{let binding=state.bindings.find(x=>x.market_slug===state.market);if(!binding||!confirm('Отвязать рынок от станции? Настройки стратегии этой связки будут удалены. Ордера на бирже не отменяются.'))return;try{await api('/api/bindings/'+binding.id,{method:'DELETE',body:'{}'});await loadStation();toast('Рынок отвязан')}catch(e){toast(e.message)}};
 $('#delete-market').onclick=async()=>{if(!state.market||!confirm('Удалить рынок из общей базы бота? Будут удалены его история, привязки ко ВСЕМ станциям и настройки стратегий этих связок. Ордера на бирже не отменяются. Продолжить?'))return;try{await api('/api/markets/'+encodeURIComponent(state.market),{method:'DELETE',body:'{}'});await loadStation();toast('Рынок удалён')}catch(e){toast(e.message)}};
-function renderAll(){renderStationTabs();renderWeather();renderMarketTabs();loadMarket()}
+function renderAll(){if(state.arcStation!==state.selected){state.arcStation=state.selected;state.arcOffset=0}renderStationTabs();renderWeather();renderMarketTabs();loadMarket()}
 function renderStations(){
   $('#station-list').innerHTML=state.stations.length?state.stations.map(s=>`<div class="manage-row"><div><b>${esc(s.name)}</b><small>${esc(s.station_code)} · ${esc(s.station_type)} · ${s.enabled?'включена':'выключена'}</small></div><div class="manage-actions"><button class="button secondary station-select" data-id="${s.id}">Открыть ↗</button><button class="button secondary station-rename" data-id="${s.id}">Переименовать</button><button class="button danger station-delete" data-id="${s.id}">Удалить</button></div></div>`).join(''):'<div class="empty-state">Станций пока нет. Добавьте первую станцию.</div>';
   $$('.station-select').forEach(b=>b.onclick=async()=>{state.selected=Number(b.dataset.id);page('weather');renderStationTabs();await loadStation()});

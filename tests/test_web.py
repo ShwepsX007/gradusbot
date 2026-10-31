@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
 
@@ -244,6 +245,41 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f'/api/stations/{sid}', json={}).status_code, 200)
         with web.db.get_db() as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_history').fetchone()[0], 0)
+
+    def test_seven_day_web_history_retained_and_disabled_is_read_only(self):
+        sid = self.add_station()['id']
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': True})
+        old = int(time.time() - 6 * 24 * 3600)
+        web.record_web_metar(sid, {'temp': 10, 'obs_time': old})
+        web.record_web_metar(sid, {'temp': 22, 'obs_time': int(time.time())})
+        web.record_web_metar(sid, {'temp': 9, 'obs_time': int(time.time() - 9 * 24 * 3600)})
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': False})
+        with patch.object(web.utils, 'fetch_metar') as fetch:
+            result = self.client.get(f'/api/stations/{sid}/weather').get_json()
+        fetch.assert_not_called()
+        self.assertEqual([x[1] for x in result['history']], [10.0,22.0])
+        self.assertEqual(web.db.get_station_history(sid), [])
+
+    def test_solar_archive_persists_for_disabled_station_and_is_deleted_with_it(self):
+        sid = self.add_station()['id']
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': True})
+        yesterday=(datetime.now(timezone.utc)-timedelta(days=1)).date().isoformat()
+        forecast = {'timezone':'Europe/London', 'daily':{'time':[yesterday], 'sunrise':[yesterday+'T06:30'], 'sunset':[yesterday+'T18:20']}}
+        web.save_solar_days(sid,forecast)
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': False})
+        with patch.object(web, 'forecast') as fetch:
+            result = self.client.get(f'/api/stations/{sid}/weather').get_json()
+        fetch.assert_not_called()
+        self.assertEqual(result['solar_days'][0]['day'], yesterday)
+        self.assertEqual(result['solar_days'][0]['timezone'], 'Europe/London')
+        self.assertEqual(result['solar_days'][0]['sunrise'], yesterday+'T06:30')
+        self.assertEqual(self.client.delete(f'/api/stations/{sid}', json={}).status_code, 200)
+        self.assertEqual(web.get_solar_days(sid), [])
+
+    def test_forecast_includes_six_previous_solar_dates(self):
+        with patch.object(web, 'upstream', return_value={}) as request:
+            web.forecast(10,20)
+        self.assertEqual(request.call_args.args[1]['past_days'], 6)
 
     def test_station_urls_are_never_exposed(self):
         sid = web.db.add_station('Private', 'https://example.test/?apiKey=secret', '', 'KJFK', 'metar')
