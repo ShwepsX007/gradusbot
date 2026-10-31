@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ class TerminalTests(unittest.TestCase):
         self.old_db = web.db.DB_FILE
         web.db.DB_FILE = os.path.join(self.tmp.name, 'test.db')
         web.db.init_db()
+        web.init_web_db()
         web._cache.clear()
         self.client = web.app.test_client()
 
@@ -115,6 +117,57 @@ class TerminalTests(unittest.TestCase):
         fetch.assert_not_called()
         self.assertEqual(result['events'], [])
         self.assertIn('ручной поиск', result['message'])
+
+    def test_station_rename_preserves_status_and_rejects_invalid(self):
+        station = self.add_station()
+        sid = station['id']
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': True})
+        response = self.client.patch(f'/api/stations/{sid}', json={'name': ' Heathrow '})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['name'], 'Heathrow')
+        self.assertEqual(response.get_json()['enabled'], 1)
+        self.assertEqual(self.client.patch(f'/api/stations/{sid}', json={'name': ' '}).status_code, 400)
+        self.assertEqual(self.client.patch(f'/api/stations/{sid}', json={'name': None}).status_code, 400)
+        self.assertEqual(self.client.patch(f'/api/stations/{sid}', json={'name': 'X', 'enabled': 1}).status_code, 400)
+        self.assertEqual(web.db.get_station(sid)['name'], 'Heathrow')
+
+    def test_market_rename_updates_all_bindings_and_market(self):
+        first = self.add_station()['id']
+        second = web.db.add_station('Paris', '', '', 'LFPG', 'metar')
+        mid = web.db.add_market('Old', 'test-market')
+        bid1 = web.db.add_binding(first, 'test-market', 'Old')
+        bid2 = web.db.add_binding(second, 'test-market', 'Old')
+        self.assertEqual(self.client.patch('/api/markets/test-market', json={'name': ' New name '}).status_code, 200)
+        self.assertEqual(web.db.get_market(mid)['name'], 'New name')
+        self.assertEqual(web.db.get_binding(bid1)['market_name'], 'New name')
+        self.assertEqual(web.db.get_binding(bid2)['market_name'], 'New name')
+        self.assertEqual(self.client.patch('/api/markets/test-market', json={'name': ''}).status_code, 400)
+        self.assertEqual(self.client.patch('/api/markets/nonexistent', json={'name': 'New'}).status_code, 404)
+        self.assertEqual(self.client.get('/api/markets').get_json()[0]['name'], 'New name')
+
+    def test_units_are_validated_and_saved_with_bot_settings(self):
+        data = {'metar_interval': 120, 'awc_rate_per_min': 20, 'm_interval': 30, 'units': 'B'}
+        self.assertEqual(self.client.post('/api/settings', json=data).status_code, 200)
+        self.assertEqual(web.db.get_setting('units'), 'B')
+        data.update(units='K', metar_interval=180)
+        self.assertEqual(self.client.post('/api/settings', json=data).status_code, 400)
+        self.assertEqual(web.db.get_setting('metar_interval'), '120')
+        self.assertEqual(self.client.get('/api/settings').get_json()['units'], 'B')
+
+    def test_web_metar_history_is_deduplicated_and_separate(self):
+        sid = self.add_station()['id']
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': True})
+        obs = int(time.time()) - 60
+        metar = {'temp': 21, 'dew_point': 12, 'obs_time': obs}
+        with patch.object(web.utils, 'fetch_metar', return_value=metar), patch.object(web, 'station_info', return_value=None):
+            first = self.client.get(f'/api/stations/{sid}/weather').get_json()
+            second = self.client.get(f'/api/stations/{sid}/weather').get_json()
+        self.assertEqual(first['history'], [[obs, 21.0]])
+        self.assertEqual(second['history'], first['history'])
+        self.assertEqual(web.db.get_station_history(sid), [])
+        self.assertEqual(self.client.delete(f'/api/stations/{sid}', json={}).status_code, 200)
+        with web.db.get_db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_history').fetchone()[0], 0)
 
     def test_station_urls_are_never_exposed(self):
         sid = web.db.add_station('Private', 'https://example.test/?apiKey=secret', '', 'KJFK', 'metar')

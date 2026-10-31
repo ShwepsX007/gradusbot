@@ -3,3 +3,20 @@
 .unlink{background:none;border:0;padding:0;color:#a7cbb0;font-size:10px}.unlink:hover{text-decoration:underline}
 #sun-dot,#sun-glow{transition:cx 1s ease,cy 1s ease,fill 1s ease}.arc-progress{transition:stroke-dashoffset 1s ease}
 .manage-actions{display:flex;align-items:center;gap:8px}.danger{background:#302322;color:#e2b8b1;border:1px solid #59403c}.danger:hover{border-color:#d7a49a}@media(max-width:500px){.manage-actions{flex-direction:column;align-items:stretch}.manage-actions .button{padding:8px}}
+/* Wide, shallow day/night arc above the station details. */
+.weather-card{display:flex;flex-direction:column}
+.sun-panel{border-left:0;border-top:0;background:radial-gradient(ellipse at 50% 100%,#24372c 0%,#19232a 70%);padding:23px 28px 18px}
+.weather-main{border-top:1px solid var(--line)}
+.sun-graphic{max-width:900px;width:100%;height:auto;aspect-ratio:800 / 185;margin:4px auto 0}
+.sun-graphic svg{display:block;width:100%;height:auto}
+.arc-progress{stroke-dasharray:100;stroke-dashoffset:100}
+.arc-label{bottom:2%;font-size:8px}.arc-label.left{left:8%}.arc-label.right{right:8%}
+.sun-times{max-width:900px;margin:5px auto 0}
+.arc-note{text-align:center;color:#81948a;font-size:10px;margin:16px auto 0;line-height:1.4}
+#sun-temperature{font:700 10px 'DM Sans',Arial,sans-serif;fill:#23392d;pointer-events:none}
+.arc-observation circle{fill:#bce2b9}.arc-observation text{font:600 9px 'DM Sans',Arial,sans-serif;fill:#c8dec8}
+.temperature{font-size:40px;letter-spacing:-1.5px}.temperature-dual{font-size:25px;letter-spacing:-.5px;white-space:nowrap}
+.temp-block{min-width:210px}.chart-wrap{margin-left:88px}.chart-axis{margin-left:88px}.chart-grid{white-space:nowrap}.forecast-row strong{font-size:14px;white-space:nowrap}
+.market-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-left:15px}.market-actions .button{padding:8px 10px}.market-title-row{gap:12px}
+select{display:block;width:100%;background:#10181b;color:#e8f0e9;border:1px solid #35433e;border-radius:5px;padding:12px;margin-top:8px;font:inherit}select:focus{outline:1px solid #a9dba9}
+@media(max-width:700px){.sun-panel{padding:20px}.sun-graphic{height:auto}.sun-times{margin-top:8px}.arc-note{margin-top:12px}.chart-wrap,.chart-axis{margin-left:70px}.temperature-dual{font-size:22px}.market-title-row{display:block}.market-actions{margin:16px 0 0;justify-content:flex-start}.market-actions .external-link{display:inline}.market-actions .button{font-size:10px}.temp-block{min-width:0}}

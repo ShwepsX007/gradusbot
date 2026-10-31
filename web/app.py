@@ -16,6 +16,17 @@ import utils
 
 app = Flask(__name__, static_folder='static')
 db.init_db()
+
+
+def init_web_db():
+    # Separate from the bot's history: the web UI must not affect bot strategies.
+    with db.get_db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_metar_history (
+            station_id INTEGER NOT NULL, obs_time INTEGER NOT NULL, temp REAL NOT NULL,
+            PRIMARY KEY (station_id, obs_time))''')
+
+
+init_web_db()
 _lock = threading.RLock()
 _cache = {}
 
@@ -58,7 +69,7 @@ def station_info(code):
 
 def forecast(lat, lon):
     return cached(('forecast', lat, lon), 900, lambda: upstream('https://api.open-meteo.com/v1/forecast', {
-        'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'forecast_days': 2,
+        'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'past_days': 1, 'forecast_days': 2,
         'hourly': 'temperature_2m,relative_humidity_2m,cloud_cover,wind_speed_10m,wind_direction_10m',
         'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset'}))
 
@@ -123,8 +134,17 @@ def add_station():
 def toggle_station(sid):
     data = request.get_json() or {}
     if not db.get_station(sid): return jsonify(error='Станция не найдена'), 404
-    if not isinstance(data.get('enabled'), bool): return jsonify(error='Укажите enabled'), 400
-    db.update_station(sid, enabled=int(data['enabled']))
+    if not isinstance(data, dict) or not data or set(data) - {'enabled', 'name'}:
+        return jsonify(error='Укажите название или статус станции'), 400
+    changes = {}
+    if 'enabled' in data:
+        if not isinstance(data['enabled'], bool): return jsonify(error='Укажите enabled'), 400
+        changes['enabled'] = int(data['enabled'])
+    if 'name' in data:
+        if not isinstance(data['name'], str) or not data['name'].strip() or len(data['name'].strip()) > 100:
+            return jsonify(error='Название станции должно содержать от 1 до 100 символов'), 400
+        changes['name'] = data['name'].strip()
+    db.update_station(sid, **changes)
     return jsonify(public_station(db.get_station(sid)))
 
 
@@ -160,17 +180,42 @@ def remove_station(sid):
         _delete_binding_settings(conn, ids)
         conn.execute('DELETE FROM station_market_bindings WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM station_history WHERE station_id=?', (sid,))
+        conn.execute('DELETE FROM web_metar_history WHERE station_id=?', (sid,))
         prefix = f'st_{sid}_'
         conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
         conn.execute('DELETE FROM stations WHERE id=?', (sid,))
     return jsonify(ok=True)
 
 
+def record_web_metar(sid, metar):
+    try:
+        obs_time = int(metar.get('obs_time'))
+        temp = float(metar.get('temp'))
+    except (TypeError, ValueError, OverflowError):
+        return
+    now = time.time()
+    if not math.isfinite(temp) or obs_time < now - 48 * 3600 or obs_time > now + 300:
+        return
+    with db.get_db() as conn:
+        # Observations are deduplicated by their source timestamp, not poll time.
+        conn.execute('INSERT OR IGNORE INTO web_metar_history (station_id,obs_time,temp) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)', (sid, obs_time, temp, sid))
+        conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 48 * 3600))
+
+
+def combined_history(sid):
+    points = db.get_station_history(sid)
+    with db.get_db() as conn:
+        points.extend([[r['obs_time'], r['temp']] for r in conn.execute(
+            'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>?',
+            (sid, time.time() - 24 * 3600))])
+    return sorted(points, key=lambda p: p[0])
+
+
 @app.get('/api/stations/<int:sid>/weather')
 def weather(sid):
     station = db.get_station(sid)
     if not station: return jsonify(error='Станция не найдена'), 404
-    result = {'station': public_station(station), 'history': db.get_station_history(sid), 'metar': None, 'forecast': None, 'info': None}
+    result = {'station': public_station(station), 'history': combined_history(sid), 'metar': None, 'forecast': None, 'info': None}
     if not station['enabled']:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
@@ -187,6 +232,9 @@ def weather(sid):
         metar = dict(metar)
         metar['humidity'] = humidity(metar.get('temp'), metar.get('dew_point'))
     result['metar'] = metar
+    if metar:
+        record_web_metar(sid, metar)
+        result['history'] = combined_history(sid)
     info = station_info(code)
     result['info'] = info
     if info and info.get('lat') is not None and info.get('lon') is not None:
@@ -236,6 +284,28 @@ def delete_binding(bid):
         _delete_binding_settings(conn, [bid])
         conn.execute('DELETE FROM station_market_bindings WHERE id=?', (bid,))
     return jsonify(ok=True)
+
+
+@app.get('/api/markets')
+def list_markets():
+    return jsonify([{k: m.get(k) for k in ('id', 'name', 'slug', 'enabled')} for m in db.get_markets()])
+
+
+@app.patch('/api/markets/<slug>')
+def rename_market(slug):
+    if not valid_slug(slug): return jsonify(error='Некорректный slug'), 400
+    data = request.get_json() or {}
+    name = data.get('name') if isinstance(data, dict) else None
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 200:
+        return jsonify(error='Название рынка должно содержать от 1 до 200 символов'), 400
+    name = name.strip()
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM markets WHERE slug=?', (slug,)).fetchone() and not conn.execute('SELECT 1 FROM station_market_bindings WHERE market_slug=?', (slug,)).fetchone():
+            return jsonify(error='Рынок не найден'), 404
+        conn.execute('UPDATE markets SET name=? WHERE slug=?', (name, slug))
+        conn.execute('UPDATE station_market_bindings SET market_name=? WHERE market_slug=?', (name, slug))
+    return jsonify(ok=True, name=name)
 
 
 @app.delete('/api/markets/<slug>')
@@ -333,8 +403,15 @@ def settings():
             except (KeyError, ValueError, TypeError): return jsonify(error=f'Некорректное значение {key}'), 400
             if not low <= v <= high: return jsonify(error=f'{key}: допустимо {low}–{high}'), 400
             values[key] = v
-        for key, value in values.items(): db.set_setting(key, value)
-    return jsonify({key: db.get_setting(key, str(bounds[0])) for key, bounds in SETTINGS.items()})
+        units = data.get('units', db.get_setting('units', 'C'))
+        if units not in ('C', 'F', 'B'): return jsonify(error='Выберите °C, °F или обе единицы'), 400
+        values['units'] = units
+        with db.get_db() as conn:
+            for key, value in values.items():
+                conn.execute('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', (key, str(value)))
+    result = {key: db.get_setting(key, str(bounds[0])) for key, bounds in SETTINGS.items()}
+    result['units'] = db.get_setting('units', 'C')
+    return jsonify(result)
 
 
 if __name__ == '__main__':
