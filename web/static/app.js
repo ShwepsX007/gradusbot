@@ -88,8 +88,9 @@ async function renderAllMarkets(){
   try{
     let [markets,all]=await Promise.all([api('/api/markets'),Promise.all(state.stations.map(async s=>({s,b:await api(`/api/stations/${s.id}/bindings`)})))]);
     if(!markets.length){$('#all-markets').innerHTML='<div class="empty-state">Рынков пока нет. Найдите и привяжите первый рынок.</div>';return}
-    $('#all-markets').innerHTML=markets.map(m=>{let linked=all.filter(x=>x.b.some(b=>b.market_slug===m.slug));return `<div class="manage-row"><div><b>${esc(m.name)}</b><small>${linked.length?linked.map(x=>esc(x.s.name)).join(' · '):'Не привязан к станции'} · ${esc(m.slug)}</small></div><div class="manage-actions">${linked.length?`<button class="button secondary open-managed-market" data-id="${linked[0].s.id}" data-slug="${esc(m.slug)}">Открыть ↗</button>`:''}<button class="button secondary rename-managed-market" data-slug="${esc(m.slug)}">Переименовать</button><button class="button danger delete-managed-market" data-slug="${esc(m.slug)}">Удалить</button></div></div>`}).join('');
+    $('#all-markets').innerHTML=markets.map(m=>{let linked=all.filter(x=>x.b.some(b=>b.market_slug===m.slug));return `<div class="manage-row"><div><b>${esc(m.name)}</b><small>${linked.length?linked.map(x=>esc(x.s.name)).join(' · '):'Не привязан к станции'} · ${esc(m.slug)}</small></div><div class="manage-actions">${linked.length?`<button class="button secondary open-managed-market" data-id="${linked[0].s.id}" data-slug="${esc(m.slug)}">Открыть ↗</button>`:''}<button class="button secondary resolve-managed-market" data-slug="${esc(m.slug)}">Найти станцию</button><button class="button secondary rename-managed-market" data-slug="${esc(m.slug)}">Переименовать</button><button class="button danger delete-managed-market" data-slug="${esc(m.slug)}">Удалить</button></div></div>`}).join('');
     $$('.open-managed-market').forEach(b=>b.onclick=async()=>{state.selected=Number(b.dataset.id);page('weather');renderStationTabs();await loadStation();state.market=b.dataset.slug;renderMarketTabs();await loadMarket()});
+    $$('.resolve-managed-market').forEach(b=>b.onclick=()=>openMarketFirst(b.dataset.slug, true));
     $$('.rename-managed-market').forEach(b=>b.onclick=async()=>{let m=markets.find(x=>x.slug===b.dataset.slug);if(!m)return;let name=prompt('Новое название рынка (изменится во всех станциях и в базе бота):',m.name);if(name===null)return;try{await api('/api/markets/'+encodeURIComponent(m.slug),{method:'PATCH',body:JSON.stringify({name})});if(state.selected)await loadStation(true);await renderAllMarkets();toast('Рынок переименован')}catch(e){toast(e.message)}});
     $$('.delete-managed-market').forEach(b=>b.onclick=async()=>{let slug=b.dataset.slug;if(!confirm('Удалить рынок из общей базы бота? Будут удалены его история, привязки ко ВСЕМ станциям и настройки стратегий этих связок. Ордера на бирже не отменяются. Продолжить?'))return;try{await api('/api/markets/'+encodeURIComponent(slug),{method:'DELETE',body:'{}'});if(!state.demo)await loadStation();await renderAllMarkets();toast('Рынок удалён')}catch(e){toast(e.message)}});
   }catch(e){toast(e.message)}
@@ -98,7 +99,61 @@ let searchSequence=0;
 function showSearchResults(results, empty){let target=$('#search-results');target.innerHTML=results.length?results.map(r=>`<div class="search-result"><span>${esc(r.title)}</span><button type="button" data-slug="${esc(r.slug)}">Выбрать</button></div>`).join(''):`<div class="search-message">${esc(empty)}</div>`;target.querySelectorAll('button').forEach(b=>b.onclick=()=>{$('#bind-form input').value=b.dataset.slug})}
 async function searchStationMarkets(){let selected=state.selected, seq=++searchSequence, target=$('#search-results');target.innerHTML='<div class="search-message">Автоматический поиск по станции…</div>';let st=state.stations.find(x=>x.id===selected);$('#market-search-hint').textContent=`Станция ${st?.name||''} (${st?.station_code||''}). Проверьте дату, правила и источник разрешения рынка.`;try{let data=await api(`/api/stations/${selected}/market-search`);if(seq!==searchSequence||selected!==state.selected)return;showSearchResults(data.events,data.message||'Подходящие активные рынки не найдены. Попробуйте ручной поиск или ссылку.')}catch(e){if(seq===searchSequence)target.innerHTML=`<div class="search-message">${esc(e.message)}. Можно использовать ручной поиск или ссылку.</div>`}}
 $('#search-form').onsubmit=async e=>{e.preventDefault();let seq=++searchSequence, target=$('#search-results');target.innerHTML='<div class="search-message">Поиск…</div>';try{let q=new FormData(e.currentTarget).get('q');let results=await api('/api/search?q='+encodeURIComponent(q));if(seq!==searchSequence)return;showSearchResults(results,'Ничего не найдено. Попробуйте другое название.')}catch(err){if(seq===searchSequence)target.innerHTML=`<div class="search-message">${esc(err.message)}</div>`}};
-$('#bind-form').onsubmit=async e=>{e.preventDefault();let f=e.currentTarget;try{let result=await api(`/api/stations/${state.selected}/bindings`,{method:'POST',body:JSON.stringify({slug:new FormData(f).get('slug')})});f.reset();f.closest('dialog').close();await loadStation();state.market=result.market_slug;renderMarketTabs();await loadMarket();page('weather');toast('Рынок привязан')}catch(err){f.querySelector('.dialog-error').textContent=err.message}};
+$('#bind-form').onsubmit=async e=>{
+  e.preventDefault();let f=e.currentTarget,slug=new FormData(f).get('slug'),sid=state.selected,station=state.stations.find(x=>x.id===sid);
+  if(!station)return;
+  f.querySelector('.dialog-error').textContent='Проверяем источник разрешения…';
+  try{
+    let resolution;
+    try{resolution=await api('/api/market-station/resolve',{method:'POST',body:JSON.stringify({slug})})}
+    catch(err){if(!confirm(`Не удалось проверить источник (${err.message}). Продолжить ручную привязку к ${station.station_code}?`)){f.querySelector('.dialog-error').textContent='';return}}
+    if(sid!==state.selected){f.querySelector('.dialog-error').textContent='Станция изменилась. Повторите привязку.';return}
+    if(resolution?.status==='found'){
+      const code=resolution.candidate.code;
+      if(code!==String(station.station_code).toUpperCase()){
+        f.querySelector('.dialog-error').textContent='';
+        if(confirm(`В правилах найден код ${code}, а выбрана станция ${station.station_code}. Открыть подбор найденной станции?`)){
+          f.closest('dialog').close();openMarketFirst(slug, false);showResolution(resolution, slug);
+        }
+        return;
+      }
+      if(!confirm(`В правилах указан код ${code} (${resolution.candidate.kind}). Привязать к выбранной станции? Проверьте правила события.`)){f.querySelector('.dialog-error').textContent='';return}
+    } else if(resolution && !confirm('В правилах нет однозначного кода станции. Привязать рынок к выбранной станции вручную? Обязательно проверьте источник разрешения.')){f.querySelector('.dialog-error').textContent='';return}
+    let result=await api(`/api/stations/${sid}/bindings`,{method:'POST',body:JSON.stringify({slug})});f.reset();f.closest('dialog').close();await loadStation();state.market=result.market_slug;renderMarketTabs();await loadMarket();page('weather');toast('Рынок привязан');
+  }catch(err){f.querySelector('.dialog-error').textContent=err.message}
+};
+let marketResolution=null, resolutionSequence=0;
+function openMarketFirst(slug='', auto=false){
+  if($('#market-dialog').open)$('#market-dialog').close();
+  let dialog=$('#market-first-dialog');$('#market-resolve-form input').value=slug;$('#market-first-results').innerHTML='';$('#market-resolution').innerHTML='';marketResolution=null;++resolutionSequence;
+  if(!dialog.open)dialog.showModal();
+  if(auto&&slug)resolveMarketFirst();
+}
+$('#market-first-overview').onclick=$('#market-first-page').onclick=()=>openMarketFirst();
+$('#market-first-from-bind').onclick=()=>openMarketFirst($('#bind-form input').value,!!$('#bind-form input').value);
+$('#market-resolve-form input').addEventListener('input',()=>{++resolutionSequence;marketResolution=null;$('#market-resolution').innerHTML=''});
+function evidenceHtml(c){let source=c.url?`<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">${esc(c.url)} ↗</a>`:esc(c.kind);return `<div class="resolution-evidence">${esc(c.kind)} · ${esc(c.field)}<br>${source}</div>`}
+function showResolution(result,input){
+  marketResolution={...result,input};let box=$('#market-resolution');
+  let content=`<div class="resolution-card"><h4>${esc(result.title)}</h4>`;
+  if(result.status==='found'){
+    let c=result.candidate, existing=result.existing_stations||[];
+    content+=`<div class="resolution-code">${esc(c.code)}</div>${evidenceHtml(c)}<p>${existing.length?`Найдена существующая METAR-станция: <b>${esc(existing[0].name)}</b>.`:'Будет создана новая METAR-станция в выключенном состоянии.'}</p><p class="resolution-warning">Проверьте правила и источник рынка. METAR используется для наблюдения и может отличаться от итоговых данных разрешения.</p><button type="button" class="button primary full" id="confirm-market-station">Подтвердить и привязать</button>`;
+  }else{
+    let details=(result.candidates||[]).map(c=>`<li><b>${esc(c.code)}</b> ${evidenceHtml(c)}</li>`).join('');
+    content+=`<p class="resolution-warning">${result.status==='conflict'?'В правилах найдены разные коды станции. Автоматическая привязка остановлена.':'Однозначный код станции в источнике разрешения не найден.'}</p>${details?`<ul>${details}</ul>`:''}<p>Проверьте правила на Polymarket. Можно сохранить рынок без привязки и добавить станцию вручную.</p>`;
+  }
+  content+=`<button type="button" class="button secondary full" id="save-market-only">Сохранить рынок без станции</button></div>`;
+  box.innerHTML=content;
+  let add=$('#confirm-market-station');if(add)add.onclick=async()=>{
+    if(!marketResolution||$('#market-resolve-form input').value!==marketResolution.input)return;
+    add.disabled=true;try{let response=await api('/api/market-station/add',{method:'POST',body:JSON.stringify({slug:result.slug,code:result.candidate.code,confirm:true})});$('#market-first-dialog').close();await loadStations(response.station.id);state.market=response.slug;renderMarketTabs();await loadMarket();page('weather');toast(response.already_bound?'Рынок уже привязан':response.created_station?'Станция создана выключенной; рынок привязан':'Рынок привязан к существующей станции')}catch(e){toast(e.message)}finally{add.disabled=false}
+  };
+  $('#save-market-only').onclick=async e=>{let button=e.currentTarget;if(!marketResolution||$('#market-resolve-form input').value!==marketResolution.input)return;if(!confirm('Сохранить рынок без привязки к станции?'))return;button.disabled=true;try{await api('/api/markets',{method:'POST',body:JSON.stringify({slug:result.slug})});$('#market-first-dialog').close();page('markets');toast('Рынок сохранён без станции')}catch(err){toast(err.message)}finally{button.disabled=false}};
+}
+async function resolveMarketFirst(){let input=$('#market-resolve-form input').value.trim();if(!input)return;$('#market-resolve-form input').value=input;let seq=++resolutionSequence;marketResolution=null;$('#market-resolution').innerHTML='<p class="search-message">Изучаем правила события…</p>';try{let data=await api('/api/market-station/resolve',{method:'POST',body:JSON.stringify({slug:input})});if(seq===resolutionSequence)showResolution(data,input)}catch(err){if(seq===resolutionSequence)$('#market-resolution').innerHTML=`<div class="market-resolution-error">${esc(err.message)}</div>`}}
+$('#market-resolve-form').onsubmit=e=>{e.preventDefault();resolveMarketFirst()};
+$('#market-first-search').onsubmit=async e=>{e.preventDefault();let target=$('#market-first-results');target.innerHTML='<div class="search-message">Поиск…</div>';try{let results=await api('/api/search?q='+encodeURIComponent(new FormData(e.currentTarget).get('q')));target.innerHTML=results.length?results.map(r=>`<div class="search-result"><span>${esc(r.title)}</span><button type="button" data-slug="${esc(r.slug)}">Выбрать</button></div>`).join(''):'<div class="search-message">Событий не найдено. Можно вставить ссылку ниже.</div>';target.querySelectorAll('button').forEach(b=>b.onclick=()=>{$('#market-resolve-form input').value=b.dataset.slug;resolveMarketFirst()})}catch(err){target.innerHTML=`<div class="search-message">${esc(err.message)}</div>`}};
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
 $('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);loadSettings().then(()=>loadStations());

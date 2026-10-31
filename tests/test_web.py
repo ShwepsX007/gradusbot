@@ -70,6 +70,66 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(self.client.delete(f"/api/bindings/{r.get_json()['id']}", json={}).status_code, 200)
             self.assertEqual(self.client.get(f"/api/stations/{s['id']}/bindings").get_json(), [])
 
+    def test_market_first_resolve_and_create_is_explicit_and_idempotent(self):
+        slug = 'highest-temperature-in-nyc-on-june-15-2026'
+        event = {'title':'Highest temperature in NYC?', 'resolutionSource':'https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA', 'markets':[]}
+        with patch.object(web, 'upstream', return_value=event) as fetch:
+            result = self.client.post('/api/market-station/resolve', json={'slug': 'https://polymarket.com/event/'+slug})
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.get_json()['candidate']['code'], 'KLGA')
+            self.assertEqual(web.db.get_stations(), [])
+            self.assertEqual(web.db.get_markets(), [])
+            self.assertEqual(self.client.post('/api/market-station/add', json={'slug':slug,'code':'KLGA'}).status_code, 400)
+            self.assertEqual(self.client.post('/api/market-station/add', json={'slug':slug,'code':'KJFK','confirm':True}).status_code, 409)
+            response = self.client.post('/api/market-station/add', json={'slug':slug,'code':'KLGA','confirm':True})
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertTrue(data['created_station'])
+            self.assertFalse(data['station']['enabled'])
+            sid = data['station']['id']
+            self.assertEqual(len(web.db.get_bindings(sid)), 1)
+            self.assertEqual(len(web.db.get_markets()), 1)
+            repeat = self.client.post('/api/market-station/add', json={'slug':slug,'code':'KLGA','confirm':True}).get_json()
+            self.assertFalse(repeat['created_station'])
+            self.assertTrue(repeat['already_bound'])
+            self.assertEqual(len(web.db.get_stations()), 1)
+            self.assertEqual(len(web.db.get_bindings(sid)), 1)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_market_first_reuses_station_and_preserves_custom_market_name(self):
+        sid = web.db.add_station('New York', '', '', 'KLGA', 'metar')
+        web.db.update_station(sid, enabled=1)
+        web.db.add_market('Мой рынок', 'test-market')
+        event = {'title':'Original', 'description':'ICAO: KLGA'}
+        with patch.object(web, 'upstream', return_value=event):
+            preview = self.client.post('/api/market-station/resolve', json={'slug':'test-market'}).get_json()
+            self.assertEqual(preview['existing_stations'][0]['id'], sid)
+            result = self.client.post('/api/market-station/add', json={'slug':'test-market','code':'KLGA','confirm':True}).get_json()
+        self.assertFalse(result['created_station'])
+        self.assertEqual(result['station']['enabled'], 1)
+        self.assertEqual(web.db.get_bindings(sid)[0]['market_name'], 'Мой рынок')
+
+    def test_market_first_conflict_and_unknown_do_not_create_station(self):
+        for event in ({'title':'No source', 'description':'Temperature in London'},
+                      {'title':'Conflict', 'description':'ICAO: KLGA ICAO: KJFK'}):
+            web._cache.clear()
+            with patch.object(web, 'upstream', return_value=event):
+                preview = self.client.post('/api/market-station/resolve', json={'slug':'test-event'}).get_json()
+                self.assertIn(preview['status'], ('unknown','conflict'))
+                self.assertEqual(self.client.post('/api/market-station/add', json={'slug':'test-event','code':'KLGA','confirm':True}).status_code, 409)
+        self.assertEqual(web.db.get_stations(), [])
+        self.assertEqual(web.db.get_markets(), [])
+
+    def test_save_market_without_station_and_network_error(self):
+        with patch.object(web, 'upstream', return_value={'title':'Event', 'description':'No station'}):
+            self.assertEqual(self.client.post('/api/markets', json={'slug':'test-event'}).status_code, 200)
+            self.assertTrue(self.client.post('/api/markets', json={'slug':'test-event'}).get_json()['already_exists'])
+        self.assertEqual(len(web.db.get_markets()), 1)
+        self.assertEqual(web.db.get_stations(), [])
+        with patch.object(web, 'upstream', side_effect=RuntimeError('offline')):
+            self.assertEqual(self.client.post('/api/market-station/resolve', json={'slug':'other-event'}).status_code, 502)
+        self.assertEqual(self.client.post('/api/market-station/resolve', json={'slug':'https://evil.test/event/test'}).status_code, 400)
+
     def test_station_delete_cascades_only_its_data(self):
         s = self.add_station()
         sid = s['id']

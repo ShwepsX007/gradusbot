@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
+from web.market_station import identify_station
 
 app = Flask(__name__, static_folder='static')
 db.init_db()
@@ -292,6 +293,94 @@ def delete_binding(bid):
         _delete_binding_settings(conn, [bid])
         conn.execute('DELETE FROM station_market_bindings WHERE id=?', (bid,))
     return jsonify(ok=True)
+
+
+def event_for_station(slug):
+    def load():
+        data = upstream('https://gamma-api.polymarket.com/events/slug/' + slug)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) and isinstance(data.get('title'), str) and data['title'].strip() else None
+    return cached(('event-rules', slug), 120, load)
+
+
+def market_input():
+    data = request.get_json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+def market_resolution(slug):
+    event = event_for_station(slug)
+    if not event:
+        return None, None
+    result = identify_station(event)
+    result.update({'slug': slug, 'title': event['title']})
+    candidate = result['candidate']
+    result['existing_stations'] = [public_station(s) for s in db.get_stations()
+        if candidate and s.get('station_type') == 'metar' and (s.get('station_code') or '').strip().upper() == candidate['code']]
+    return event, result
+
+
+@app.post('/api/market-station/resolve')
+def resolve_market_station():
+    slug = valid_slug(market_input().get('slug', ''))
+    if not slug: return jsonify(error='Укажите slug или ссылку на событие Polymarket'), 400
+    _, result = market_resolution(slug)
+    if result is None: return jsonify(error='Не удалось загрузить правила события из Polymarket'), 502
+    return jsonify(result)
+
+
+def city_label(slug, code):
+    match = re.search(r'(?:highest|lowest)-temperature-in-(.+?)-on-', slug)
+    city = match.group(1).replace('-', ' ').title() if match else ''
+    return (city[:80] if city else code)
+
+
+@app.post('/api/market-station/add')
+def add_market_station():
+    data = market_input()
+    slug = valid_slug(data.get('slug', ''))
+    if not slug: return jsonify(error='Укажите ссылку на событие'), 400
+    if data.get('confirm') is not True: return jsonify(error='Подтвердите источник и станцию'), 400
+    event, result = market_resolution(slug)
+    if result is None: return jsonify(error='Не удалось загрузить правила события'), 502
+    if result['status'] != 'found' or data.get('code') != result['candidate']['code']:
+        return jsonify(error='Источник не подтверждён или станция изменилась. Проверьте правила заново.'), 409
+    code = result['candidate']['code']
+    # Never turn on a newly discovered station or strategy. Atomic reuse/add avoids duplicates.
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        station = conn.execute("SELECT * FROM stations WHERE station_type='metar' AND UPPER(TRIM(station_code))=? ORDER BY id LIMIT 1", (code,)).fetchone()
+        created = station is None
+        if created:
+            sid = conn.execute("INSERT INTO stations (name,api_url,wu_url,station_code,station_type,enabled) VALUES (?,?,?,?,?,0)",
+                (city_label(slug, code), '', '', code, 'metar')).lastrowid
+            station = conn.execute('SELECT * FROM stations WHERE id=?', (sid,)).fetchone()
+        sid = station['id']
+        market = conn.execute('SELECT * FROM markets WHERE slug=? ORDER BY id LIMIT 1', (slug,)).fetchone()
+        name = market['name'] if market else event['title']
+        if not market:
+            conn.execute("INSERT INTO markets (name,slug,enabled,last_probs) VALUES (?,?,1,'{}')", (name, slug))
+        binding = conn.execute('SELECT id FROM station_market_bindings WHERE station_id=? AND market_slug=? LIMIT 1', (sid, slug)).fetchone()
+        already_bound = binding is not None
+        if not binding:
+            conn.execute('INSERT INTO station_market_bindings (station_id,market_slug,market_name) VALUES (?,?,?)', (sid, slug, name))
+    return jsonify(station=public_station(dict(station)), created_station=created, already_bound=already_bound, slug=slug)
+
+
+@app.post('/api/markets')
+def save_market_without_station():
+    slug = valid_slug(market_input().get('slug', ''))
+    if not slug: return jsonify(error='Укажите ссылку на событие'), 400
+    event = event_for_station(slug)
+    if not event: return jsonify(error='Не удалось загрузить событие Polymarket'), 502
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        market = conn.execute('SELECT id FROM markets WHERE slug=? ORDER BY id LIMIT 1', (slug,)).fetchone()
+        already_exists = market is not None
+        if not market:
+            conn.execute("INSERT INTO markets (name,slug,enabled,last_probs) VALUES (?,?,1,'{}')", (event['title'], slug))
+    return jsonify(ok=True, already_exists=already_exists)
 
 
 @app.get('/api/markets')
