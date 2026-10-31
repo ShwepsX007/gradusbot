@@ -1,0 +1,12 @@
+const assert = require('node:assert/strict');
+const {zonedEpoch, precipitationForecast} = require('../web/static/weather.js');
+const ny = {timezone:'America/New_York', hourly:{time:['2026-06-01T12:00','2026-06-01T13:00','2026-06-01T14:00'], precipitation_probability:[10,70,30]}};
+assert.equal(zonedEpoch('2026-06-01T13:00', 'America/New_York'), Date.parse('2026-06-01T17:00:00Z'));
+assert.deepEqual(precipitationForecast(ny, Date.parse('2026-06-01T16:15:00Z')), {probability:70,start:'12:00',end:'13:00'});
+assert.deepEqual(precipitationForecast(ny, Date.parse('2026-06-01T17:00:00Z')), {probability:30,start:'13:00',end:'14:00'});
+assert.equal(precipitationForecast(ny, Date.parse('2026-06-01T19:00:00Z')), null);
+assert.equal(precipitationForecast({timezone:'UTC',hourly:{time:['2026-06-01T13:00'],precipitation_probability:[null]}}, Date.parse('2026-06-01T12:30:00Z')), null);
+assert.deepEqual(precipitationForecast({timezone:'UTC',hourly:{time:['2026-06-01T13:00'],precipitation_probability:[0]}}, Date.parse('2026-06-01T12:30:00Z')), {probability:0,start:'12:00',end:'13:00'});
+assert.deepEqual(precipitationForecast({timezone:'America/New_York',hourly:{time:['2026-06-02T00:00'],precipitation_probability:[80]}}, Date.parse('2026-06-02T03:30:00Z')), {probability:80,start:'23:00',end:'00:00'});
+assert.equal(precipitationForecast({timezone:'invalid-zone',hourly:{time:['2026-06-01T13:00'],precipitation_probability:[80]}}, Date.parse('2026-06-01T12:30:00Z')), null);
+console.log('Weather forecast UI helpers: OK');

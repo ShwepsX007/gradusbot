@@ -43,6 +43,22 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(result['metar']['humidity'], 53)
         self.assertEqual(result['forecast']['timezone'], 'Europe/London')
 
+    def test_weather_decodes_cloud_precipitation_and_wind(self):
+        station = self.add_station()
+        self.client.patch(f"/api/stations/{station['id']}", json={'enabled': True})
+        metar = {'temp': 16, 'dew_point': 12, 'wind_speed': 8,
+                 'wx_phrase': 'FEW', 'raw_metar': 'EGLL 201200Z 21008KT -RA FEW020 BKN060 16/12 Q1012'}
+        with patch.object(web.utils, 'fetch_metar', return_value=metar), patch.object(web, 'station_info', return_value=None):
+            result = self.client.get(f"/api/stations/{station['id']}/weather").get_json()['metar']
+        self.assertEqual(result['wind_ms'], 4.1)
+        self.assertEqual(result['cloud'], {'description': 'Преимущественно облачно', 'code': 'BKN'})
+        self.assertEqual(result['precipitation']['description'], 'Слабые осадки: дождь')
+
+    def test_forecast_requests_precipitation_probability(self):
+        with patch.object(web, 'upstream', return_value={}) as upstream:
+            web.forecast(51.0, 0.0)
+        self.assertIn('precipitation_probability', upstream.call_args.args[1]['hourly'])
+
     def test_market_binding_and_positions(self):
         s = self.add_station()
         payload = {'title': 'Temperature in London', 'options': [], 'closed': False}

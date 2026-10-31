@@ -20,3 +20,9 @@
 .market-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-left:15px}.market-actions .button{padding:8px 10px}.market-title-row{gap:12px}
 select{display:block;width:100%;background:#10181b;color:#e8f0e9;border:1px solid #35433e;border-radius:5px;padding:12px;margin-top:8px;font:inherit}select:focus{outline:1px solid #a9dba9}
 @media(max-width:700px){.sun-panel{padding:20px}.sun-graphic{height:auto}.sun-times{margin-top:8px}.arc-note{margin-top:12px}.chart-wrap,.chart-axis{margin-left:70px}.temperature-dual{font-size:22px}.market-title-row{display:block}.market-actions{margin:16px 0 0;justify-content:flex-start}.market-actions .external-link{display:inline}.market-actions .button{font-size:10px}.temp-block{min-width:0}}
+/* Observed weather and model probability are deliberately separate. */
+.rain-panel{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:17px 0 5px;border-top:1px solid #2c3739}
+.rain-item{display:flex;align-items:flex-start;gap:12px;min-width:0}.rain-icon{display:grid;place-items:center;background:#263a35;color:#b5dfc2;width:34px;height:34px;border-radius:7px;font-size:19px;flex-shrink:0}.forecast-precip .rain-icon{background:#283a3b;color:#a8d8de}
+.rain-label{display:block;font-size:8px;font-weight:700;letter-spacing:1px;color:#82938e}.rain-item strong{display:block;font-size:13px;margin-top:7px}.rain-item small{display:block;color:#859891;font-size:10px;margin-top:5px;line-height:1.4}.rain-item .risk-high{color:#e4c189}
+.rain-explain{color:#788b84;font-size:10px;line-height:1.45;margin:10px 0 15px}.weather-details strong{line-height:1.35}.weather-details #cloud{font-size:13px}.weather-details #wind{font-size:13px}
+@media(max-width:700px){.rain-panel{grid-template-columns:1fr;gap:15px}.weather-details{grid-template-columns:repeat(2,minmax(0,1fr));row-gap:18px}}

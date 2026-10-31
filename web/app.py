@@ -13,6 +13,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
+from web.weather import cloud_description, precipitation_description
 
 app = Flask(__name__, static_folder='static')
 db.init_db()
@@ -70,7 +71,7 @@ def station_info(code):
 def forecast(lat, lon):
     return cached(('forecast', lat, lon), 900, lambda: upstream('https://api.open-meteo.com/v1/forecast', {
         'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'past_days': 1, 'forecast_days': 2,
-        'hourly': 'temperature_2m,relative_humidity_2m,cloud_cover,wind_speed_10m,wind_direction_10m',
+        'hourly': 'temperature_2m,relative_humidity_2m,cloud_cover,wind_speed_10m,wind_direction_10m,precipitation_probability',
         'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset'}))
 
 
@@ -231,6 +232,13 @@ def weather(sid):
     if metar:
         metar = dict(metar)
         metar['humidity'] = humidity(metar.get('temp'), metar.get('dew_point'))
+        metar['cloud'] = cloud_description(metar.get('raw_metar'), metar.get('wx_phrase'))
+        metar['precipitation'] = precipitation_description(metar.get('raw_metar'))
+        try:
+            wind = float(metar.get('wind_speed'))
+            metar['wind_ms'] = round(wind * 0.514444, 1) if math.isfinite(wind) and wind >= 0 else None
+        except (TypeError, ValueError):
+            metar['wind_ms'] = None
     result['metar'] = metar
     if metar:
         record_web_metar(sid, metar)
