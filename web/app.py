@@ -128,6 +128,44 @@ def toggle_station(sid):
     return jsonify(public_station(db.get_station(sid)))
 
 
+def _binding_ids(conn, where, value):
+    return [r['id'] for r in conn.execute('SELECT id FROM station_market_bindings WHERE ' + where + '=?', (value,))]
+
+
+def _delete_binding_settings(conn, ids):
+    for bid in ids:
+        prefix = f"bind_{bid}_"
+        conn.execute("DELETE FROM settings WHERE substr(key,1,?)=?", (len(prefix), prefix))
+
+
+def _has_position(conn, station_id=None, slugs=()):
+    # Conservative guard: local position records only; it cannot see exchange orders.
+    for row in conn.execute('SELECT * FROM active_positions'):
+        pos = dict(row)
+        if pos.get('slug') in slugs or (station_id is not None and str(db.position_meta(pos).get('station_id')) == str(station_id)):
+            return True
+    return False
+
+
+@app.delete('/api/stations/<int:sid>')
+def remove_station(sid):
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM stations WHERE id=?', (sid,)).fetchone():
+            return jsonify(error='Станция не найдена'), 404
+        slugs = [r['market_slug'] for r in conn.execute('SELECT market_slug FROM station_market_bindings WHERE station_id=?', (sid,))]
+        if _has_position(conn, sid, slugs):
+            return jsonify(error='В базе бота есть связанная позиция. Сначала проверьте и закройте её в боте.'), 409
+        ids = _binding_ids(conn, 'station_id', sid)
+        _delete_binding_settings(conn, ids)
+        conn.execute('DELETE FROM station_market_bindings WHERE station_id=?', (sid,))
+        conn.execute('DELETE FROM station_history WHERE station_id=?', (sid,))
+        prefix = f'st_{sid}_'
+        conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
+        conn.execute('DELETE FROM stations WHERE id=?', (sid,))
+    return jsonify(ok=True)
+
+
 @app.get('/api/stations/<int:sid>/weather')
 def weather(sid):
     station = db.get_station(sid)
@@ -189,8 +227,32 @@ def add_binding(sid):
 
 @app.delete('/api/bindings/<int:bid>')
 def delete_binding(bid):
-    if not db.get_binding(bid): return jsonify(error='Привязка не найдена'), 404
-    db.delete_binding(bid)
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        binding = conn.execute('SELECT * FROM station_market_bindings WHERE id=?', (bid,)).fetchone()
+        if not binding: return jsonify(error='Привязка не найдена'), 404
+        if _has_position(conn, slugs=(binding['market_slug'],)):
+            return jsonify(error='В базе бота есть позиция на этом рынке. Сначала проверьте и закройте её в боте.'), 409
+        _delete_binding_settings(conn, [bid])
+        conn.execute('DELETE FROM station_market_bindings WHERE id=?', (bid,))
+    return jsonify(ok=True)
+
+
+@app.delete('/api/markets/<slug>')
+def remove_market(slug):
+    if not valid_slug(slug): return jsonify(error='Некорректный slug'), 400
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        markets = conn.execute('SELECT id FROM markets WHERE slug=?', (slug,)).fetchall()
+        ids = _binding_ids(conn, 'market_slug', slug)
+        if not markets and not ids: return jsonify(error='Рынок не найден'), 404
+        if _has_position(conn, slugs=(slug,)):
+            return jsonify(error='В базе бота есть позиция на этом рынке. Сначала проверьте и закройте её в боте.'), 409
+        _delete_binding_settings(conn, ids)
+        conn.execute('DELETE FROM station_market_bindings WHERE market_slug=?', (slug,))
+        for market in markets:
+            conn.execute('DELETE FROM market_history WHERE market_id=?', (market['id'],))
+        conn.execute('DELETE FROM markets WHERE slug=?', (slug,))
     return jsonify(ok=True)
 
 
@@ -211,6 +273,53 @@ def search():
     if data is None: return jsonify(error='Поиск Polymarket временно недоступен'), 502
     events = data.get('events', []) if isinstance(data, dict) else []
     return jsonify([{'slug': e.get('slug'), 'title': e.get('title')} for e in events if e.get('slug') and e.get('title') and not e.get('closed')])
+
+
+# Known Polymarket weather station cities. For other stations use the user's
+# city name or AWC's station location as a best-effort hint, not as proof.
+STATION_CITIES = {
+    'KLGA': 'new-york', 'KJFK': 'new-york', 'KEWR': 'new-york',
+    'EGLL': 'london', 'EGLC': 'london', 'EGKK': 'london',
+    'LFPG': 'paris', 'LFPB': 'paris', 'LFPO': 'paris',
+    'RKSI': 'seoul', 'RKSS': 'seoul', 'RJTT': 'tokyo', 'RJAA': 'tokyo',
+    'RCSS': 'taipei', 'RCTP': 'taipei', 'KORD': 'chicago', 'KMDW': 'chicago',
+    'KMIA': 'miami', 'KATL': 'atlanta', 'KSEA': 'seattle', 'KLAX': 'los-angeles',
+    'LTAC': 'ankara', 'LTFM': 'istanbul', 'UUEE': 'moscow',
+}
+CITY_ALIASES = {'нью-йорк': 'new-york', 'ньюйорк': 'new-york', 'лондон': 'london',
+                'париж': 'paris', 'анкара': 'ankara', 'сеул': 'seoul',
+                'токио': 'tokyo', 'майами': 'miami', 'чикаго': 'chicago',
+                'москва': 'moscow', 'стамбул': 'istanbul', 'сиэтл': 'seattle'}
+
+
+def station_city(station):
+    code = (station.get('station_code') or '').upper()
+    if code in STATION_CITIES: return STATION_CITIES[code]
+    name = (station.get('name') or '').strip().lower()
+    if name in CITY_ALIASES: return CITY_ALIASES[name]
+    # A label entered by the user can be a city. Avoid network calls to AWC
+    # for a disabled station and do not infer a city from arbitrary URLs.
+    if re.fullmatch(r'[a-z]+(?:[ -][a-z]+)*', name): return name.replace(' ', '-')
+    return None
+
+
+@app.get('/api/stations/<int:sid>/market-search')
+def search_station_markets(sid):
+    station = db.get_station(sid)
+    if not station: return jsonify(error='Станция не найдена'), 404
+    city = station_city(station)
+    if not city:
+        return jsonify(city=None, events=[], message='Город автоматически не определён. Используйте ручной поиск по-английски.')
+    query = 'temperature in ' + city.replace('-', ' ')
+    data = cached(('search', query), 120, lambda: upstream('https://gamma-api.polymarket.com/public-search', {
+        'q': query, 'limit_per_type': 50, 'events_status': 'active'}))
+    if data is None: return jsonify(error='Поиск Polymarket временно недоступен'), 502
+    events = data.get('events', []) if isinstance(data, dict) else []
+    prefix = re.compile(r'^(?:highest|lowest)-temperature-in-' + re.escape(city) + r'-on-')
+    found = [{'slug': e['slug'], 'title': e['title']} for e in events
+             if isinstance(e, dict) and e.get('title') and isinstance(e.get('slug'), str)
+             and prefix.match(e['slug']) and not e.get('closed')]
+    return jsonify(city=city.replace('-', ' '), events=found)
 
 
 SETTINGS = {'metar_interval': (60, 3600), 'awc_rate_per_min': (1, 60), 'm_interval': (30, 3600)}
