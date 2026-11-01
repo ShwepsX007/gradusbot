@@ -12,7 +12,7 @@ let csrfToken = '';
 let toastTimer;
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok)throw Error(data.error||'Ошибка запроса');return data}
-function page(name){$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='settings')loadSettings()}
+function page(name){$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='settings'){loadSettings();loadSecurityInfo()}}
 $$('.nav').forEach(x=>x.onclick=()=>page(x.dataset.page));
 function showDialog(id){$(`#${id}`).showModal()}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
@@ -212,10 +212,39 @@ function bookFor(option,side){
 }
 function priceCents(value){const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n*100)+'¢':'—'}
 function shares(value){const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n):'—'}
-function quote(book){if(!book)return '<span class="quote-missing">нет данных</span>';const ask=book.asks?.[0],bid=book.bids?.[0];return `<div class="quote"><b>${ask?esc(priceCents(ask.price)):'—'}</b><small>купить · ${ask?esc(shares(ask.size))+' шт.':'нет заявок'}</small><small>продать · ${bid?esc(priceCents(bid.price)):'нет заявок'}</small></div>`}
-function bookSide(title,book){
+let draftMarket=null,draftOptionsKey='',tradeDrafts=new Map(),draftMarketOptions=new Map();
+function getDraft(){if(!tradeDrafts.has(state.market))tradeDrafts.set(state.market,{index:'',token:'yes',action:'BUY',type:'GTC',price:'',size:'',sl:'',tp:''});return tradeDrafts.get(state.market)}
+function draftEstimate(){
+  const d=getDraft(),price=Number(d.price),size=Number(d.size);
+  $('#trade-estimate').textContent=d.price!==''&&d.size!==''&&price>0&&price<100&&size>0?`Оценка: ${(price*size/100).toLocaleString('ru-RU',{maximumFractionDigits:4})} USDC без комиссий · не ордер`:'Укажите цену и количество для оценки суммы.';
+}
+function renderTradeDraft(m){
+  let opts=m?.options||[],key=JSON.stringify(opts.map(o=>[o.label,o.token_yes,o.token_no]));
+  if(draftMarket===state.market&&draftOptionsKey===key)return;
+  draftMarket=state.market;draftOptionsKey=key;
+  let d=getDraft(),previousKey=draftMarketOptions.get(state.market);
+  if(m&&previousKey&&previousKey!==key){d.index='';d.price='';}
+  if(m)draftMarketOptions.set(state.market,key);
+  $('#trade-option').innerHTML='<option value="">Выберите исход</option>'+opts.map((o,i)=>`<option value="${i}">${esc(o.label)}</option>`).join('');
+  if(m&&(!opts[Number(d.index)]||d.index===''))d.index='';
+  for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']])$('#trade-'+id).value=d[key];
+  draftEstimate();
+}
+for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']]){
+  $('#trade-'+id).addEventListener('input',e=>{getDraft()[key]=e.currentTarget.value;draftEstimate()});
+}
+function pickBookPrice(index,token,side,price){
+  if(state.demo||!marketData?.market?.options?.[index]||!bookFor(marketData.market.options[index],token))return;
+  const n=Number(price);if(!Number.isFinite(n)||n<=0||n>=1)return;
+  const d=getDraft();d.index=String(index);d.token=token;d.action=side==='ask'?'BUY':'SELL';d.price=String(Math.round(n*1000000)/10000);
+  draftOptionsKey='';renderTradeDraft(marketData.market);
+  $('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});
+}
+function pickButton(price,index,token,side,css){return `<button type="button" class="quote-pick ${css}" data-index="${index}" data-token="${token}" data-side="${side}" data-price="${esc(price)}" title="Заполнить черновик; ордер не отправляется">${esc(priceCents(price))}</button>`}
+function quote(book,index,token){if(!book)return '<span class="quote-missing">нет данных</span>';const ask=book.asks?.[0],bid=book.bids?.[0];return `<div class="quote">${ask?pickButton(ask.price,index,token,'ask','ask'):'—'}<small>купить · ${ask?esc(shares(ask.size))+' шт.':'нет заявок'}</small><small>продать · ${bid?pickButton(bid.price,index,token,'bid','bid'):'нет заявок'}</small></div>`}
+function bookSide(title,book,index,token){
   if(!book)return `<section class="book-side"><h4>${title}</h4><p>Стакан недоступен или отсутствует.</p></section>`;
-  const levels=(items,kind)=>items?.length?items.map(x=>`<div class="book-level"><span class="${kind}">${esc(priceCents(x.price))}</span><span>${esc(shares(x.size))}</span></div>`).join(''):'<div class="book-empty">Нет заявок</div>';
+  const levels=(items,kind)=>items?.length?items.map(x=>`<div class="book-level"><span>${pickButton(x.price,index,token,kind,kind)}</span><span>${esc(shares(x.size))}</span></div>`).join(''):'<div class="book-empty">Нет заявок</div>';
   return `<section class="book-side"><h4>${title}</h4><div class="book-updated">Получен: ${esc(new Date(book.fetched_at*1000).toLocaleTimeString('ru-RU'))}</div><div class="book-columns"><div><div class="book-column-title">Покупатели · BID</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book.bids,'bid')}</div><div><div class="book-column-title">Продавцы · ASK</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book.asks,'ask')}</div></div></section>`;
 }
 function renderMarket(data,error){
@@ -224,11 +253,13 @@ function renderMarket(data,error){
   $('#market-description').textContent=error||(!m?'Найдите рынок или добавьте ссылку на событие.':state.demo?'Демонстрационные значения · не реальные котировки':(binding?.market_name!==m.title?'Оригинал: '+m.title:'Цены и заявки по исходам события Polymarket'));
   $('#market-state').textContent=state.demo?'ДЕМО':m?.closed?'ЗАКРЫТ':'СОБЫТИЕ';
   $('#market-link').href=state.demo||!state.market?'https://polymarket.com':'https://polymarket.com/event/'+encodeURIComponent(state.market);
+  renderTradeDraft(m);
   $('#market-options').innerHTML=m?.options?.length?m.options.map((o,i)=>{
     let n=typeof o.prob==='number'?Math.max(0,Math.min(100,o.prob)):null,yes=bookFor(o,'yes'),no=bookFor(o,'no');
-    return `<div class="option-row book-option"><span class="option-name">${esc(o.label)}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span>${quote(yes)}${quote(no)}<button class="book-toggle" data-index="${i}" aria-expanded="${bookChoice===i}">${bookChoice===i?'Скрыть':'Стакан'} ↕</button></div>${bookChoice===i?`<div class="book-details">${bookSide('YES · ДА',yes)}${bookSide('NO · НЕТ',no)}<p class="book-disclaimer">До 5 лучших ценовых уровней на каждой стороне. Количество — число контрактов, не число людей. YES и NO могут отражать общую ликвидность; не суммируйте их.</p></div>`:''}`
+    return `<div class="option-row book-option"><span class="option-name">${esc(o.label)}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span>${quote(yes,i,'yes')}${quote(no,i,'no')}<button class="book-toggle" data-index="${i}" aria-expanded="${bookChoice===i}">${bookChoice===i?'Скрыть':'Стакан'} ↕</button></div>${bookChoice===i?`<div class="book-details">${bookSide('YES · ДА',yes,i,'yes')}${bookSide('NO · НЕТ',no,i,'no')}<p class="book-disclaimer">До 5 лучших ценовых уровней на каждой стороне. Количество — число контрактов, не число людей. YES и NO могут отражать общую ликвидность; не суммируйте их.</p></div>`:''}`
   }).join(''):'<div class="empty-state">Выберите или добавьте рынок</div>';
   $$('.book-toggle').forEach(btn=>btn.onclick=()=>{bookChoice=bookChoice===Number(btn.dataset.index)?null:Number(btn.dataset.index);renderMarket(marketData)});
+  $$('.quote-pick').forEach(btn=>btn.onclick=()=>pickBookPrice(Number(btn.dataset.index),btn.dataset.token,btn.dataset.side,btn.dataset.price));
   $('#book-status').textContent=state.demo?'Демо: реальные заявки стакана не отображаются.':bookMessage||'Стакан CLOB загружается отдельно';
   let pos=data?.positions||[];$('#positions-count').textContent=`Позиций бота: ${pos.length}`;for(const id of ['rename-market','unlink-market','delete-market'])$('#'+id).classList.toggle('hidden',state.demo||!state.market);
   $('#positions').innerHTML=pos.length?'<b>ПОЗИЦИИ ИЗ БАЗЫ БОТА</b>'+pos.map(p=>`<div class="position-row">${esc(p.is_demo?'ДЕМО · ':'')}${esc(p.question||p.outcome||'Позиция')} · ${esc(p.side)} · ${esc(p.size)} shares · вход ${esc(p.entry_price)} · SL ${esc(p.sl??'—')} / TP ${esc(p.tp??'—')}</div>`).join(''):'';
@@ -389,5 +420,17 @@ async function resolveMarketFirst(){let input=$('#market-resolve-form input').va
 $('#market-resolve-form').onsubmit=e=>{e.preventDefault();resolveMarketFirst()};
 $('#market-first-search').onsubmit=async e=>{e.preventDefault();let target=$('#market-first-results');target.innerHTML='<div class="search-message">Поиск…</div>';try{let results=await api('/api/search?q='+encodeURIComponent(new FormData(e.currentTarget).get('q')));target.innerHTML=results.length?results.map(r=>`<div class="search-result"><span>${esc(r.title)}</span><button type="button" data-slug="${esc(r.slug)}">Выбрать</button></div>`).join(''):'<div class="search-message">Событий не найдено. Можно вставить ссылку ниже.</div>';target.querySelectorAll('button').forEach(b=>b.onclick=()=>{$('#market-resolve-form input').value=b.dataset.slug;resolveMarketFirst()})}catch(err){target.innerHTML=`<div class="search-message">${esc(err.message)}</div>`}};
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
+async function loadSecurityInfo(){
+  const form=$('#password-form'),button=form.querySelector('button');button.disabled=true;
+  try{const s=await api('/api/security-info');button.disabled=!s.tunnel;$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.'}
+  catch(e){$('#password-status').textContent='Не удалось проверить подключение: '+e.message}
+}
+$('#password-form').onsubmit=async e=>{
+  e.preventDefault();const f=e.currentTarget,button=f.querySelector('button'),data=Object.fromEntries(new FormData(f));
+  if(data.new_password!==data.confirmation){toast('Новые пароли не совпадают');return}
+  button.disabled=true;
+  try{await api('/api/change-password',{method:'POST',body:JSON.stringify({current_password:data.current_password,new_password:data.new_password})});f.reset();alert('Пароль изменён. Войдите заново.');location.assign('/login')}
+  catch(err){toast(err.message);button.disabled=false}
+};
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
 $('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));

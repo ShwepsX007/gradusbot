@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory, render_template, redirect, session, url_for
 import requests
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,6 +39,8 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get('WEB_COOKIE_SECURE', '1') != '0',
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
     MAX_CONTENT_LENGTH=1024 * 1024,
+    WEB_TUNNEL_ONLY=os.environ.get('WEB_TUNNEL_ONLY') == '1',
+    WEB_TRUST_PROXY=os.environ.get('WEB_TRUST_PROXY') == '1',
 )
 # Enable ONLY when a trusted reverse proxy is the sole entry to Gunicorn.
 if os.environ.get('WEB_TRUST_PROXY') == '1':
@@ -55,6 +57,8 @@ def init_web_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS web_station_solar (
             station_id INTEGER NOT NULL, day TEXT NOT NULL, sunrise TEXT, sunset TEXT, timezone TEXT NOT NULL,
             PRIMARY KEY (station_id, day))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_auth_password (
+            id INTEGER PRIMARY KEY CHECK(id=1), password_hash TEXT NOT NULL)''')
 
 
 init_web_db()
@@ -120,8 +124,14 @@ LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_ATTEMPTS = 5
 
 
+def current_password_hash():
+    with db.get_db() as conn:
+        row = conn.execute('SELECT password_hash FROM web_auth_password WHERE id=1').fetchone()
+    return row['password_hash'] if row else app.config['WEB_PASSWORD_HASH']
+
+
 def auth_version():
-    material = app.config['WEB_USERNAME'] + '\0' + app.config['WEB_PASSWORD_HASH']
+    material = app.config['WEB_USERNAME'] + '\0' + current_password_hash()
     return hashlib.sha256(material.encode()).hexdigest()
 
 
@@ -167,6 +177,17 @@ def origin_ok():
         return False
 
 
+def trusted_ssh_tunnel():
+    # Gunicorn sets SERVER_NAME from the listener's bound address, not the Host
+    # header. Refuse other WSGI servers and reverse proxies rather than trusting
+    # client-supplied forwarding headers. This requires a loopback-only listener.
+    return (app.config['WEB_TUNNEL_ONLY'] and not app.config['WEB_TRUST_PROXY']
+            and request.environ.get('gunicorn.socket') is not None
+            and request.environ.get('SERVER_NAME') == '127.0.0.1'
+            and request.remote_addr == '127.0.0.1'
+            and re.fullmatch(r'127\.0\.0\.1(?::[0-9]{1,5})?', request.host or '') is not None)
+
+
 @app.after_request
 def security(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -177,6 +198,8 @@ def security(response):
 
 @app.before_request
 def access_control():
+    if app.config['WEB_TUNNEL_ONLY'] and not trusted_ssh_tunnel():
+        return 'Доступ разрешён только через SSH-туннель к локальному Gunicorn.', 403
     if not app.config['WEB_AUTH_CONFIGURED']:
         return 'Вход не настроен. Настройте GRADUS_USERNAME, GRADUS_PASSWORD_HASH и GRADUS_SESSION_SECRET на сервере.', 503
     public = request.endpoint == 'login' or request.path == '/static/login.css'
@@ -213,7 +236,7 @@ def login():
             password = request.form.get('password', '')
             # Verify the hash even for an incorrect username to reduce timing leakage.
             try:
-                password_ok = check_password_hash(app.config['WEB_PASSWORD_HASH'], password[:256])
+                password_ok = check_password_hash(current_password_hash(), password[:256])
             except (ValueError, TypeError):
                 password_ok = False
             if hmac.compare_digest(username.encode('utf-8'), app.config['WEB_USERNAME'].encode('utf-8')) and password_ok and len(password) <= 256:
@@ -226,12 +249,51 @@ def login():
                 csrf_token()
                 return redirect(url_for('index'))
             error, status = 'Неверный логин или пароль.', 401
-    return render_template('login.html', csrf=csrf_token(), error=error, insecure=not request.is_secure), status
+    return render_template('login.html', csrf=csrf_token(), error=error, insecure=not request.is_secure and not trusted_ssh_tunnel(), tunneled=trusted_ssh_tunnel()), status
 
 
 @app.get('/api/session')
 def session_info():
     return jsonify(csrf=csrf_token())
+
+
+@app.get('/api/security-info')
+def security_info():
+    return jsonify(tunnel=bool(trusted_ssh_tunnel()), trading_enabled=False)
+
+
+@app.post('/api/change-password')
+def change_password():
+    if not trusted_ssh_tunnel():
+        return jsonify(error='Смена пароля доступна только через настроенный SSH-туннель.'), 403
+    address = 'password:' + (request.remote_addr or 'unknown')
+    if not login_allowed(address):
+        return jsonify(error='Слишком много попыток. Повторите через 15 минут.'), 429
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict): return jsonify(error='Некорректный запрос.'), 400
+    old, new = data.get('current_password'), data.get('new_password')
+    if not isinstance(old, str) or not isinstance(new, str) or not 16 <= len(new) <= 256 or len(old) > 256:
+        return jsonify(error='Пароль должен содержать от 16 до 256 символов.'), 400
+    old_hash = current_password_hash()
+    try:
+        valid = check_password_hash(old_hash, old)
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        return jsonify(error='Неверный текущий пароль.'), 400
+    new_hash = generate_password_hash(new)
+    # Prevent concurrent requests, validated against the old password, from
+    # overwriting a newly changed password.
+    with db.get_db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT password_hash FROM web_auth_password WHERE id=1').fetchone()
+        current = row['password_hash'] if row else app.config['WEB_PASSWORD_HASH']
+        if not hmac.compare_digest(current, old_hash):
+            return jsonify(error='Пароль уже изменился. Войдите заново.'), 409
+        conn.execute('INSERT OR REPLACE INTO web_auth_password(id,password_hash) VALUES (1,?)', (new_hash,))
+    with _login_lock: _login_attempts.pop(address, None)
+    session.clear()
+    return jsonify(ok=True, message='Пароль изменён. Войдите заново на всех устройствах.')
 
 
 @app.post('/api/logout')
