@@ -14,13 +14,13 @@ import tempfile
 import requests
 from eth_account import Account
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds
+from py_clob_client_v2.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
 from py_clob_client_v2.constants import POLYGON
 
 import config
 
 HOST = 'https://clob.polymarket.com'
-DATA_API = 'https://data-api.polymarket.com/positions'
+DATA_API = 'https://data-api.polymarket.com/v2/positions'
 ADDRESS = re.compile(r'^0x[0-9a-fA-F]{40}$')
 PRIVATE_KEY = re.compile(r'^(?:0x)?[0-9a-fA-F]{64}$')
 
@@ -184,28 +184,53 @@ def _orders(c):
              'status':_string(o.get('status'),40)} for o in result[:1000] if isinstance(o,dict)]
 
 
+def _balance(c):
+    client = build_client(c)
+    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+    # Refresh CLOB's cache after deposits; this does not submit a trade or grant approvals.
+    client.update_balance_allowance(params)
+    result = client.get_balance_allowance(params)
+    value = result.get('balance') if isinstance(result, dict) else None
+    # CLOB collateral balance is an integer in six-decimal base units.
+    if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r'[0-9]{1,40}', str(value)):
+        raise AccountError('Неверный ответ CLOB о балансе.')
+    n = int(value)
+    return f'{n // 1_000_000}.{n % 1_000_000:06d}'
+
+
 def _positions(c):
-    r = requests.get(DATA_API, params={'user':c['funder'] or c['signer'], 'sizeThreshold':0, 'limit':500, 'offset':0},
+    r = requests.get(DATA_API, params={'user':c['funder'] or c['signer'], 'limit':100},
                      timeout=(3, 8), headers={'User-Agent':'gradusbot-web/1.0'})
     r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list): raise AccountError('Неверный ответ Data API.')
-    return [{'asset':_string(p.get('asset'),100), 'event_slug':_string(p.get('eventSlug')),
+    response = r.json()
+    if not isinstance(response,dict) or 'data' not in response or not isinstance(response.get('pagination'),dict):
+        raise AccountError('Неверный ответ Data API v2.')
+    data=response['data']
+    if data is None: data=[]
+    if not isinstance(data,list) or any(not isinstance(p,dict) for p in data):
+        raise AccountError('Неверный ответ Data API v2.')
+    pagination=response['pagination']
+    if not isinstance(pagination.get('has_more'), bool) or (pagination['has_more'] and not pagination.get('next_cursor')):
+        raise AccountError('Неверная пагинация Data API v2.')
+    positions=[{'asset':_string(p.get('token_id') or p.get('position_id') or p.get('asset_id'),100),
+             'event_slug':_string(p.get('event_slug')),
              'title':_string(p.get('title')), 'outcome':_string(p.get('outcome'),80),
-             'size':_number(p.get('size')), 'avg_price':_number(p.get('avgPrice')),
-             'current_price':_number(p.get('curPrice')), 'cash_pnl':_number(p.get('cashPnl')),
-             'redeemable':p.get('redeemable') is True} for p in data[:500] if isinstance(p,dict)]
+             'size':_number(p.get('current_size')), 'avg_price':_number(p.get('avg_price')),
+             'current_price':_number(p.get('current_price')), 'cash_pnl':_number(p.get('unrealized_pnl')),
+             'redeemable':p.get('redeemable') is True} for p in data[:100]]
+    return positions, bool(pagination['has_more'])
 
 
 def account_snapshot():
     c = load()
     if not c: raise AccountError('Сначала настройте аккаунт Polymarket.')
-    result = {'wallet':c['funder'] or c['signer'], 'orders':None, 'positions':None,
+    result = {'wallet':c['funder'] or c['signer'], 'orders':None, 'positions':None, 'collateral_balance':None,
               'errors':[], 'orders_first_page':True, 'positions_maybe_partial':False}
+    try: result['collateral_balance'] = _balance(c)
+    except Exception: result['errors'].append('Не удалось получить баланс CLOB; проверьте подключение и тип кошелька.')
     try: result['orders'] = _orders(c)
     except Exception: result['errors'].append('Не удалось получить открытые ордера CLOB; проверьте ключи и соединение.')
     try:
-        result['positions'] = _positions(c)
-        result['positions_maybe_partial'] = len(result['positions']) >= 500
+        result['positions'], result['positions_maybe_partial'] = _positions(c)
     except Exception: result['errors'].append('Не удалось получить позиции из Data API.')
     return result

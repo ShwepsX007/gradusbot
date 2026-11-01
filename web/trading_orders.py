@@ -1,6 +1,5 @@
 """One-shot CLOB manual orders. An uncertain outcome is never retried automatically."""
 import json
-import os
 import re
 import time
 from decimal import Decimal, InvalidOperation
@@ -14,20 +13,13 @@ class TradeError(Exception):
     pass
 
 
-def experimental_allowed():
-    return os.environ.get('WEB_EXPERIMENTAL_MANUAL_ORDERS') == '1'
-
-
 def enabled():
-    if not experimental_allowed(): return False
     with db.get_db() as conn:
         row=conn.execute('SELECT enabled FROM web_trading_control WHERE id=1').fetchone()
         return bool(row and row['enabled'])
 
 
 def set_enabled(on):
-    if on and not experimental_allowed():
-        raise TradeError('Экспериментальная торговля заблокирована на сервере: модуль не завершён и не проверен на реальной бирже.')
     with db.get_db() as conn:
         conn.execute('UPDATE web_trading_control SET enabled=? WHERE id=1',(1 if on else 0,))
 
@@ -77,7 +69,6 @@ def _reserve(data, wallet):
         if existing:
             # Replays return the recorded status and can never submit a second order.
             return dict(existing),False
-        if not experimental_allowed(): raise TradeError('Экспериментальная торговля заблокирована на сервере.')
         control=conn.execute('SELECT enabled FROM web_trading_control WHERE id=1').fetchone()
         if not control or not control['enabled']: raise TradeError('Торговля выключена в настройках.')
         unknown=conn.execute("SELECT 1 FROM web_order_intents WHERE wallet=? AND asset=? AND state IN ('pending','unknown')",(wallet,data['asset'])).fetchone()
@@ -109,6 +100,30 @@ def list_intents(wallet):
     with db.get_db() as conn:
         rows=conn.execute("SELECT * FROM web_order_intents WHERE wallet=? ORDER BY CASE WHEN state IN ('pending','unknown') THEN 0 ELSE 1 END, created DESC LIMIT 100",(wallet,)).fetchall()
     return [public_intent(dict(r)) for r in rows]
+
+
+def annotate_order_statuses(intents, credentials, limit=3):
+    """Best-effort individual order reads; never infer final settlement or mutate intents."""
+    selected=[row for row in intents if row['state']=='accepted' and row.get('order_id')][:limit]
+    if not selected: return intents
+    try: client=trading_account.build_client(credentials)
+    except Exception:
+        for row in selected: row['exchange']={'available':False}
+        return intents
+    for row in selected:
+        row['exchange']={'available':False}
+        try:
+            raw=client.get_order(row['order_id'])
+            if not isinstance(raw,dict) or str(raw.get('id','')).lower()!=row['order_id'].lower() or str(raw.get('asset_id',''))!=row['asset']:
+                continue
+            status=raw.get('status')
+            if not isinstance(status,str) or not re.fullmatch(r'[A-Za-z_]{1,32}',status): continue
+            original=parse_decimal(raw.get('original_size'));matched=parse_decimal(raw.get('size_matched'))
+            if original<=0 or matched<0 or matched>original: continue
+            row['exchange']={'available':True,'status':status,'original_size':str(original),'size_matched':str(matched)}
+        except Exception:
+            pass
+    return intents
 
 
 def submit(body, event):

@@ -35,6 +35,22 @@ class AccountTests(unittest.TestCase):
                 with self.assertRaises(account.AccountError): account.save(bad)
         self.assertEqual(account.load()['api_secret'],'secret-test')
 
+    def test_balance_validation_and_v2_pagination(self):
+        account.save(CREDS);client=Mock()
+        with patch.object(account,'build_client',return_value=client):
+            for bad in (None, '-1', '1.1', True, 'nan', '9'*41):
+                client.get_balance_allowance.return_value={'balance':bad}
+                with self.subTest(bad=bad),self.assertRaises(account.AccountError):account._balance(account.load())
+            client.get_balance_allowance.return_value={'balance':'0'}
+            self.assertEqual(account._balance(account.load()),'0.000000')
+        response=Mock();response.json.return_value={'data':[],'pagination':{'has_more':True,'next_cursor':'abc'}}
+        with patch.object(account.requests,'get',return_value=response):
+            positions,partial=account._positions(account.load());self.assertEqual(positions,[]);self.assertTrue(partial)
+            response.json.return_value={'data':[], 'pagination':{'has_more':True,'next_cursor':None}}
+            with self.assertRaises(account.AccountError): account._positions(account.load())
+            response.json.return_value=[]  # retired v1 response must not look like an empty v2 account
+            with self.assertRaises(account.AccountError): account._positions(account.load())
+
     def test_insecure_directory_file_and_symlink_fail_closed(self):
         account.save(CREDS)
         path=os.path.join(self.tmp.name,'.gradus-private','account.json')
@@ -49,19 +65,21 @@ class AccountTests(unittest.TestCase):
 
     def test_snapshot_isolates_failures_and_excludes_credentials(self):
         account.save(CREDS)
-        client=Mock();client.get_open_orders.return_value=[{'id':'abc','asset_id':'123','side':'BUY','price':'0.4','original_size':'10','size_matched':'2','status':'LIVE','secret':'SECRET'}]
-        response=Mock();response.json.return_value=[{'asset':'123','eventSlug':'e','title':'Event','outcome':'Yes','size':3,'avgPrice':0.4,'curPrice':0.5,'cashPnl':0.3,'private':'SECRET'}]
+        client=Mock();client.get_balance_allowance.return_value={'balance':'12345678'};client.get_open_orders.return_value=[{'id':'abc','asset_id':'123','side':'BUY','price':'0.4','original_size':'10','size_matched':'2','status':'LIVE','secret':'SECRET'}]
+        response=Mock();response.json.return_value={'data':[{'token_id':'123','event_slug':'e','title':'Event','outcome':'Yes','current_size':3,'avg_price':0.4,'current_price':0.5,'unrealized_pnl':0.3,'private':'SECRET'}],'pagination':{'has_more':False,'next_cursor':None}}
         with patch.object(account,'build_client',return_value=client),patch.object(account.requests,'get',return_value=response) as get:
             result=account.account_snapshot()
         self.assertEqual(result['orders'][0]['size_matched'],2)
-        self.assertEqual(result['positions'][0]['event_slug'],'e')
+        self.assertEqual(result['positions'][0]['event_slug'],'e');self.assertEqual(result['collateral_balance'],'12.345678')
+        client.update_balance_allowance.assert_called_once();client.get_balance_allowance.assert_called_once()
         self.assertNotIn('SECRET',str(result));self.assertNotIn('secret-test',str(result))
-        self.assertEqual(get.call_args.kwargs['params']['user'],CREDS['funder'])
+        self.assertEqual(get.call_args.kwargs['params']['user'],CREDS['funder']);self.assertEqual(get.call_args.args[0],account.DATA_API)
+        self.assertNotIn('offset',get.call_args.kwargs['params'])
         client.get_open_orders.assert_called_once_with(only_first_page=True)
         with patch.object(account,'build_client',side_effect=RuntimeError('private secret-test')),patch.object(account.requests,'get',side_effect=RuntimeError('secret')):
             result=account.account_snapshot()
         self.assertIsNone(result['orders']);self.assertIsNone(result['positions'])
-        self.assertEqual(len(result['errors']),2);self.assertNotIn('secret',str(result))
+        self.assertEqual(len(result['errors']),3);self.assertIsNone(result['collateral_balance']);self.assertNotIn('secret',str(result))
 
 
 class AccountEndpointTests(unittest.TestCase):
@@ -115,6 +133,14 @@ class AccountEndpointTests(unittest.TestCase):
         self.assertEqual(self.client.post(url,base_url=self.base,json={**data,'current_password':'long password for account','funder':'bad'},headers=headers).status_code,400)
         self.assertEqual(self.client.post(url,base_url=self.base,json=data,headers=headers).status_code,400)
         self.assertEqual(len(web._login_attempts['trading-config:127.0.0.1']),1)
+
+    def test_snapshot_balance_works_while_trading_is_off(self):
+        account.save(CREDS);client=Mock();client.get_balance_allowance.return_value={'balance':'2500000'};client.get_open_orders.return_value=[]
+        response=Mock();response.json.return_value={'data':[],'pagination':{'has_more':False,'next_cursor':None}}
+        with patch.object(account,'build_client',return_value=client),patch.object(account.requests,'get',return_value=response):
+            result=self.client.get('/api/trading/account',base_url=self.base)
+        self.assertEqual(result.status_code,200);self.assertEqual(result.get_json()['collateral_balance'],'2.500000')
+        self.assertEqual(result.get_json()['errors'],[]);client.post_order.assert_not_called()
 
     def test_security_and_secret_redaction(self):
         url='/api/trading/account-config'; data={**CREDS,'current_password':'long password for account'}

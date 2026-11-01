@@ -62,6 +62,11 @@ def init_web_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS web_trading_control (
             id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0)''')
         conn.execute('INSERT OR IGNORE INTO web_trading_control(id,enabled) VALUES(1,0)')
+        # Previous builds required an additional environment gate. When removing it,
+        # never silently activate a previously enabled database setting on upgrade.
+        conn.execute('CREATE TABLE IF NOT EXISTS web_trading_migrations (name TEXT PRIMARY KEY)')
+        migration=conn.execute('INSERT OR IGNORE INTO web_trading_migrations(name) VALUES(?)',('manual-opt-in-v1',))
+        if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_order_intents (
             nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, slug TEXT NOT NULL, asset TEXT NOT NULL,
             side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL, order_type TEXT NOT NULL,
@@ -347,7 +352,13 @@ def trading_intents():
     try:
         c=trading_account.load()
         if not c: return jsonify(intents=[])
-        return jsonify(intents=trading_orders.list_intents(c['funder'] or c['signer']))
+        slug=request.args.get('slug','')
+        if slug and not re.fullmatch(r'[a-z0-9-]{1,200}',slug): return jsonify(error='Неверное событие.'),400
+        rows=trading_orders.list_intents(c['funder'] or c['signer'])
+        if slug:
+            rows=[row for row in rows if row['slug']==slug]
+            trading_orders.annotate_order_statuses(rows,c)
+        return jsonify(intents=rows)
     except Exception: return jsonify(error='Не удалось получить журнал заявок.'),503
 
 

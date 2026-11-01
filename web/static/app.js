@@ -216,12 +216,13 @@ let accountSnapshot=null,accountSnapshotAt=0,accountInFlight=false,accountAutoRe
 function updateTradingControls(){const enabled=tradeEnabled&&!state.demo;$('#trade-submit').disabled=!enabled||tradeSending;$('#trade-submit').textContent=tradeSending?'Отправляем…':enabled?'Отправить реальный ордер':'Торговля выключена';$('.trade-preview-badge').textContent=enabled?'РЕАЛЬНАЯ ТОРГОВЛЯ ВКЛЮЧЕНА':'РЕАЛЬНАЯ ТОРГОВЛЯ ВЫКЛЮЧЕНА';$('.readonly').innerHTML=enabled?'<i></i> РЕАЛЬНАЯ ТОРГОВЛЯ':'<i></i> ТОЛЬКО НАБЛЮДЕНИЕ';}
 function renderAccountSnapshot(){
   const status=$('#account-status'),positions=$('#account-positions'),orders=$('#account-orders');
-  if(!accountSnapshot){positions.innerHTML='';orders.innerHTML='';return}
+  if(!accountSnapshot){positions.innerHTML='';orders.innerHTML='';$('#account-balance').textContent='';return}
   const data=accountSnapshot,opts=marketData?.market?.options||[],pairs=bookData?.pairs||[];
   const tokens=new Map();opts.forEach(o=>{const pair=pairs.find(p=>p.yes===o.token_yes&&p.no===o.token_no);if(pair){tokens.set(pair.yes,`${o.label} · YES`);tokens.set(pair.no,`${o.label} · NO`)}});
   const ps=Array.isArray(data.positions)?data.positions.filter(p=>p.event_slug===state.market||tokens.has(p.asset)):null;
   const os=Array.isArray(data.orders)?data.orders.filter(o=>tokens.has(o.asset_id)):null;
   status.textContent=`Снимок: ${new Date(accountSnapshotAt).toLocaleTimeString('ru-RU')} · кошелёк ${data.wallet}. Ордера — только первая страница CLOB.`+(data.positions_maybe_partial?' Позиции могут быть неполными.':'')+(data.errors?.length?' '+data.errors.join(' '):'');
+  $('#account-balance').textContent=data.collateral_balance!=null?`Баланс залога CLOB: ${data.collateral_balance} pUSD · снимок; доступная сумма может быть меньше из-за открытых ордеров и комиссий.`:'Баланс CLOB недоступен; это не означает нулевой баланс.';
   positions.innerHTML=ps?'<div class="account-list-title">ПОЗИЦИИ DATA API · ВЫБРАННОЕ СОБЫТИЕ</div>'+(ps.length?ps.map((p,i)=>`<div class="account-item"><b>${esc(p.title||p.outcome||'Позиция')} · ${esc(p.outcome)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price!=null?esc(priceCents(p.avg_price)):'—'} · текущая ${p.current_price!=null?esc(priceCents(p.current_price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(p.cash_pnl)+' USDC'}${p.redeemable?' · доступно погашение':''}</span>${tokens.has(p.asset)&&p.size>0?`<button type="button" class="button secondary account-close-draft" data-index="${i}">Подготовить продажу</button>`:''}</div>`).join(''):'<div class="account-empty">Нет позиций по выбранному событию в полученном снимке.</div>'):'<div class="account-empty">Позиции недоступны; это не означает, что их нет.</div>';
   orders.innerHTML=os?'<div class="account-list-title">ОТКРЫТЫЕ ОРДЕРА CLOB · ВЫБРАННОЕ СОБЫТИЕ</div>'+(os.length?os.map(o=>`<div class="account-item"><b>${esc(tokens.get(o.asset_id))} · ${esc(o.side)}</b><span>${o.price!=null?esc(priceCents(o.price)):'—'} · всего ${esc(shares(o.original_size))} / исполнено ${esc(shares(o.size_matched))} · ${esc(o.status||'статус неизвестен')}<br>ID ${esc(o.id)}</span><button type="button" class="button danger account-cancel" data-id="${esc(o.id)}">Отменить ордер</button></div>`).join(''):`<div class="account-empty">${pairs.length?'Нет открытых ордеров по выбранному событию на первой странице.':'Ордера появятся после получения идентификаторов стакана; отсутствие данных не означает отсутствие ордеров.'}</div>`):'<div class="account-empty">Ордера недоступны; это не означает, что их нет.</div>';
   $$('.account-close-draft').forEach(button=>button.onclick=()=>{
@@ -239,12 +240,21 @@ function renderAccountSnapshot(){
 async function loadAccountSnapshot(){
   if(accountInFlight)return;accountInFlight=true;const b=$('#account-refresh');b.disabled=true;$('#account-status').textContent='Получаем позиции и заявки Polymarket…';
   try{accountSnapshot=await api('/api/trading/account');accountSnapshotAt=Date.now();accountAutoRefresh=true;renderAccountSnapshot();await loadTradeJournal()}
-  catch(e){accountAutoRefresh=false;accountSnapshot=null;$('#account-positions').innerHTML='';$('#account-orders').innerHTML='';$('#account-status').textContent='Сверка не выполнена: '+e.message}
+  catch(e){accountAutoRefresh=false;accountSnapshot=null;$('#account-positions').innerHTML='';$('#account-orders').innerHTML='';$('#account-balance').textContent='Баланс недоступен.';$('#account-status').textContent='Сверка не выполнена: '+e.message}
   finally{accountInFlight=false;b.disabled=false}
 }
 $('#account-refresh').onclick=loadAccountSnapshot;
 async function loadTradeJournal(){
-  try{const slug=state.market;const data=await api('/api/trading/intents');if(state.market!==slug)return;const rows=(data.intents||[]).filter(x=>x.slug===slug);$('#trade-journal').innerHTML=rows.length?'<div class="account-list-title">ЖУРНАЛ ОТПРАВОК ТЕРМИНАЛА</div>'+rows.map(x=>`<div class="account-item"><b>${esc(x.side)} · ${esc(x.price)} USDC · ${esc(x.size)} шт. · ${esc(x.order_type)}</b><span>${esc(x.state==='accepted'?'Принят CLOB; исполнение проверьте на бирже':x.state==='not_sent'?'Не отправлен':'РЕЗУЛЬТАТ НЕИЗВЕСТЕН — проверьте Polymarket и не повторяйте')} · ${esc(x.order_id||x.nonce)}</span></div>`).join(''):''}catch(e){$('#trade-journal').textContent='Журнал отправок недоступен.'}
+  try{
+    const slug=state.market;if(!slug){$('#trade-journal').innerHTML='';return}
+    const data=await api('/api/trading/intents?slug='+encodeURIComponent(slug));if(state.market!==slug)return;
+    const rows=(data.intents||[]).filter(x=>x.slug===slug);
+    $('#trade-journal').innerHTML=rows.length?'<div class="account-list-title">ЖУРНАЛ ОТПРАВОК · СТАТУС ДО 3 ПОСЛЕДНИХ ОРДЕРОВ</div>'+rows.map(x=>{
+      const state=x.state==='accepted'?'Принят CLOB':x.state==='not_sent'?'Не отправлен':'РЕЗУЛЬТАТ НЕИЗВЕСТЕН — проверьте Polymarket и не повторяйте';
+      const ex=x.exchange?.available?` · CLOB: ${x.exchange.status}, сопоставлено ${x.exchange.size_matched} из ${x.exchange.original_size} шт. (расчёт сделок отдельно)`:x.exchange?' · Статус CLOB не получен':x.state==='accepted'?' · Статус не запрашивался':'';
+      return `<div class="account-item"><b>${esc(x.side)} · ${esc(x.price)} USDC · ${esc(x.size)} шт. · ${esc(x.order_type)}</b><span>${esc(state+ex)} · ${esc(x.order_id||x.nonce)}</span></div>`;
+    }).join(''):'';
+  }catch(e){$('#trade-journal').textContent='Журнал отправок недоступен.'}
 }
 function newTradeNonce(){const a=new Uint8Array(16);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}
 $('#trade-submit').onclick=async()=>{
@@ -506,7 +516,7 @@ $('#account-delete').onclick=async e=>{
 };
 $('#trade-control-form').onsubmit=async e=>{
   e.preventDefault();const f=e.currentTarget,button=f.querySelector('button'),on=f.elements.enabled.value==='true';
-  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? SL/TP не работают.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
+  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? Модуль не проверен на бирже, SL/TP и автономный мониторинг не работают.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
   button.disabled=true;try{const result=await api('/api/trading/control',{method:'POST',body:JSON.stringify({enabled:on,confirm:true,current_password:f.elements.current_password.value})});f.elements.current_password.value='';tradeEnabled=result.enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';renderAccountSnapshot()}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };

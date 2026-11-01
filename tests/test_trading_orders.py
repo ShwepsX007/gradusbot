@@ -13,22 +13,26 @@ BOOK={'asset_id':'1','tick_size':'0.01','min_order_size':'5','neg_risk':False}
 
 class OrderTests(unittest.TestCase):
     def setUp(self):
-        self.env=patch.dict(os.environ,{'WEB_EXPERIMENTAL_MANUAL_ORDERS':'1'});self.env.start()
         self.tmp=tempfile.TemporaryDirectory();self.old_db=web.db.DB_FILE
         web.db.DB_FILE=os.path.join(self.tmp.name,'db');web.db.init_db();web.init_web_db()
         self.p=patch.object(account.config,'BASE_DIR',self.tmp.name);self.p.start();account.save(KEY)
         self.client=Mock();self.client.get_order_book.return_value=BOOK.copy();self.client.create_order.return_value='signed';self.client.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
         self.cp=patch.object(account,'build_client',return_value=self.client);self.cp.start()
     def tearDown(self):
-        self.cp.stop();self.p.stop();self.env.stop();web.db.DB_FILE=self.old_db;self.tmp.cleanup()
+        self.cp.stop();self.p.stop();web.db.DB_FILE=self.old_db;self.tmp.cleanup()
 
-    def test_server_gate_fails_closed(self):
+    def test_upgrade_requires_fresh_opt_in_only_once(self):
         orders.set_enabled(True)
-        with patch.dict(os.environ,{'WEB_EXPERIMENTAL_MANUAL_ORDERS':'0'}):
-            self.assertFalse(orders.enabled())
-            with self.assertRaises(orders.TradeError):orders.set_enabled(True)
-            with self.assertRaises(orders.TradeError):orders.submit(BASE,EVENT)
-            self.client.post_order.assert_not_called()
+        with web.db.get_db() as conn: conn.execute("DELETE FROM web_trading_migrations WHERE name='manual-opt-in-v1'")
+        web.init_web_db();self.assertFalse(orders.enabled())
+        orders.set_enabled(True);web.init_web_db();self.assertTrue(orders.enabled())
+
+    def test_switch_fails_closed_and_persists(self):
+        self.assertFalse(orders.enabled())
+        orders.set_enabled(True);self.assertTrue(orders.enabled())
+        orders.set_enabled(False);self.assertFalse(orders.enabled())
+        with self.assertRaises(orders.TradeError):orders.submit(BASE,EVENT)
+        self.client.post_order.assert_not_called()
 
     def test_disabled_invalid_and_no_autosizing(self):
         with self.assertRaises(orders.TradeError): orders.submit(BASE,EVENT)
@@ -42,6 +46,20 @@ class OrderTests(unittest.TestCase):
         self.client.create_order.assert_not_called();self.client.post_order.assert_not_called()
         for changed in ({**EVENT,'closed':True},{**EVENT,'active':False}, {**EVENT,'markets':[{**EVENT['markets'][0],'acceptingOrders':False}]}):
             with self.assertRaises(orders.TradeError): orders.submit(BASE,changed)
+
+    def test_status_reads_show_partial_and_never_mutate_journal(self):
+        orders.set_enabled(True);orders.submit(BASE,EVENT);rows=orders.list_intents(account.load()['signer'])
+        oid='0x'+'1'*64
+        self.client.get_order.return_value={'id':oid,'asset_id':'1','status':'LIVE','original_size':'10','size_matched':'3.25'}
+        before=self.client.post_order.call_count
+        result=orders.annotate_order_statuses(rows,account.load());self.assertEqual(result[0]['exchange']['size_matched'],'3.25')
+        self.assertEqual(orders.list_intents(account.load()['signer'])[0]['state'],'accepted')
+        self.assertEqual(self.client.post_order.call_count,before)
+        self.client.get_order.return_value['size_matched']='11'
+        self.assertFalse(orders.annotate_order_statuses(rows,account.load())[0]['exchange']['available'])
+        self.client.get_order.side_effect=TimeoutError()
+        self.assertFalse(orders.annotate_order_statuses(rows,account.load())[0]['exchange']['available'])
+        self.assertEqual(self.client.post_order.call_count,before)
 
     def test_one_shot_and_idempotent(self):
         orders.set_enabled(True);result=orders.submit(BASE,EVENT)
@@ -103,7 +121,6 @@ class OrderTests(unittest.TestCase):
 
 class OrderEndpointTests(unittest.TestCase):
     def setUp(self):
-        self.env=patch.dict(os.environ,{'WEB_EXPERIMENTAL_MANUAL_ORDERS':'1'});self.env.start()
         self.tmp=tempfile.TemporaryDirectory();self.old_db=web.db.DB_FILE;self.config=dict(web.app.config)
         web.db.DB_FILE=os.path.join(self.tmp.name,'db');web.db.init_db();web.init_web_db()
         self.p=patch.object(account.config,'BASE_DIR',self.tmp.name);self.p.start();account.save(KEY)
@@ -112,7 +129,7 @@ class OrderEndpointTests(unittest.TestCase):
         self.client.environ_base.update({'SERVER_NAME':'127.0.0.1','SERVER_PORT':'8108','REMOTE_ADDR':'127.0.0.1','gunicorn.socket':object()})
         with self.client.session_transaction(base_url=self.base) as sess:sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='token'
     def tearDown(self):
-        self.p.stop();self.env.stop();web.db.DB_FILE=self.old_db;web.app.config.clear();web.app.config.update(self.config);self.tmp.cleanup()
+        self.p.stop();web.db.DB_FILE=self.old_db;web.app.config.clear();web.app.config.update(self.config);self.tmp.cleanup()
     def post(self,path,data,**kw):return self.client.post(path,base_url=self.base,json=data,**kw)
     def test_control_auth_and_fail_closed(self):
         self.assertEqual(self.post('/api/trading/orders',BASE,headers={'X-CSRF-Token':'token'}).status_code,403)
