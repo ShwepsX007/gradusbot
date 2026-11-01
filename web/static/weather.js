@@ -126,9 +126,15 @@
       const ms=Number(item[0])*1000, temp=Number(item[1]);
       if (!Number.isFinite(ms) || !Number.isFinite(temp) || ms > now) continue;
       const local=localClock(ms,tz,formatter);
-      if (local?.day === day) points.push({ms,temp,seconds:local.seconds,time:local.time});
+      if (local) points.push({ms,temp,seconds:local.seconds,time:local.time,day:local.day});
     }
-    return points.sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
+    // Compare actual observation instants, not clock position (the DST hour can repeat).
+    points.sort((a,b)=>a.ms-b.ms);
+    for (let i=0;i<points.length;i++) {
+      const p=points[i],prev=points[i-1];
+      p.trend=!prev || prev.ms===p.ms || p.temp===prev.temp ? null : p.temp>prev.temp?'up':'down';
+    }
+    return points.filter(p=>p.day===day).sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
   }
   // Last 24 elapsed hours, with no extrapolation beyond actual reports.
   function metarChart(history, unit='C', now=Date.now()) {

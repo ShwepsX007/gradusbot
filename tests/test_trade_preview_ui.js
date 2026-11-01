@@ -2,11 +2,23 @@
 const assert=require('assert'),fs=require('fs'),{JSDOM,VirtualConsole}=require('jsdom');
 const vc=new VirtualConsole();vc.on('jsdomError',e=>{throw e});
 const dom=new JSDOM(fs.readFileSync('web/static/index.html','utf8'),{url:'http://127.0.0.1:8108',runScripts:'outside-only',pretendToBeVisual:true,virtualConsole:vc});
-const w=dom.window;let requests=[],accountFails=false;
+const w=dom.window;let requests=[],accountFails=false,cancelMode='unknown',alerts=[],deferAccount=false,releaseAccount=null;
+const fixedNow=Date.parse('2026-06-01T12:00:00Z'),NativeDate=w.Date;
+w.Date=class extends NativeDate{constructor(...args){super(...(args.length?args:[fixedNow]))}static now(){return fixedNow}};
+const id1='0x'+'1'.repeat(64),id2='0x'+'2'.repeat(64),id3='0x'+'3'.repeat(64);
+let accountOrders=[
+ {asset_id:'102',side:'BUY',price:0.78,original_size:10,size_matched:3,status:'LIVE',id:id1},
+ {asset_id:'102',side:'BUY',price:0.75,original_size:4,size_matched:1,status:'LIVE',id:id2},
+ {asset_id:'101',side:'SELL',price:0.24,original_size:6,size_matched:0,status:'LIVE',id:id3},
+ {asset_id:'999',side:'SELL',price:0.24,original_size:6,size_matched:0,status:'LIVE',id:'0x'+'4'.repeat(64)}
+];
+w.alert=message=>alerts.push(message);
 const station={id:1,name:'Manila',station_code:'RPLL',station_type:'metar',enabled:0};
 const bindings=[{id:1,market_slug:'first',market_name:'First'},{id:2,market_slug:'second',market_name:'Second'}];
 const opts=[{label:'25°C',prob:20,token_yes:'101',token_no:'102'},{label:'26°C',prob:30,token_yes:'201',token_no:'202'}];
 const books={pairs:[{yes:'101',no:'102'},{yes:'201',no:'202'}],books:{'101':{bids:[{price:'0.2',size:'10'}],asks:[{price:'0.24',size:'11'}],fetched_at:Date.now()/1000},'102':{bids:[{price:'0.75',size:'15'}],asks:[{price:'0.78',size:'10'}],fetched_at:Date.now()/1000},'201':{bids:[],asks:[],fetched_at:Date.now()/1000},'202':{bids:[],asks:[],fetched_at:Date.now()/1000}},requested_at:Date.now()/1000};
+const optsSecond=[{label:'Другой рынок',prob:20,token_yes:'301',token_no:'302'}];
+const booksSecond={pairs:[{yes:'301',no:'302'}],books:{'301':{bids:[],asks:[],fetched_at:fixedNow/1000},'302':{bids:[],asks:[],fetched_at:fixedNow/1000}},requested_at:fixedNow/1000};
 w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
  if(url==='/api/session')data={csrf:'test'};
  else if(url==='/api/settings')data={units:'C'};
@@ -15,15 +27,22 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
  else if(url==='/api/trading/monitor')data={status:'ok',checked_at:Date.now()/1000,snapshot:null};
  else if(url==='/api/trading/control')data={enabled:JSON.parse(o.body).enabled};
  else if(url==='/api/trading/orders')data={state:'accepted',order_id:'0x'+ '1'.repeat(64)};
+ else if(url==='/api/trading/cancel'){
+   const id=JSON.parse(o.body).order_id;if(cancelMode==='canceled')accountOrders=accountOrders.filter(x=>x.id!==id);
+   data={state:cancelMode};
+ }
  else if(url==='/api/trading/account-config'&&o.method==='POST')data={configured:true,wallet:'0x111',signature_type:3};
  else if(url==='/api/trading/account-config')data={configured:false};
  else if(url==='/api/trading/account'&&accountFails)return {status:503,ok:false,json:async()=>({error:'нет связи'})};
- else if(url==='/api/trading/account')data={wallet:'0x111',collateral_balance:'12.345678',orders_first_page:true,positions_maybe_partial:false,errors:[],positions:[{event_slug:'first',title:'Manila',outcome:'Yes',asset:'101',size:2,avg_price:0.24,current_price:0.3,cash_pnl:0.6}],orders:[{asset_id:'102',side:'BUY',price:0.78,original_size:10,size_matched:3,status:'LIVE',id:'order123'}]};
+ else if(url==='/api/trading/account'){
+   data={wallet:'0x111',collateral_balance:'12.345678',orders_first_page:true,positions_maybe_partial:false,errors:[],positions:[{event_slug:'first',title:'Manila',outcome:'Yes',asset:'101',size:2,avg_price:0.24,current_price:0.3,cash_pnl:0.6}],orders:accountOrders};
+   if(deferAccount){deferAccount=false;await new Promise(resolve=>{releaseAccount=resolve})}
+ }
  else if(url==='/api/stations')data=[station];
- else if(url==='/api/stations/1/weather')data={station,forecast:{},metar:{}};
+ else if(url==='/api/stations/1/weather')data={station,forecast:{timezone:'UTC',daily:{sunrise:['2026-06-01T06:00'],sunset:['2026-06-01T18:00']}},metar:{temp:15},history:[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t])};
  else if(url==='/api/stations/1/bindings')data=bindings;
- else if(url.endsWith('/books'))data=books;
- else if(url.startsWith('/api/market/'))data={market:{title:'Weather',options:opts,closed:false},positions:[]};
+ else if(url.endsWith('/books'))data=url.includes('/second/')?booksSecond:books;
+ else if(url.startsWith('/api/market/'))data={market:{title:'Weather',options:url.endsWith('/second')?optsSecond:opts,closed:false},positions:[]};
  else throw Error('Unexpected '+url);
  return {status:200,ok:true,json:async()=>data};
 };
@@ -33,6 +52,9 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert(w.document.querySelector('#trade-preview').textContent.includes('SL/TP пока не работают'));
  assert(w.document.querySelector('#trade-sl').disabled);
  assert(w.document.querySelector('#trade-submit').disabled);
+ assert.equal(w.document.querySelector('#sun-dot').getAttribute('r'),'10');assert.equal(w.document.querySelector('#sun-glow').getAttribute('r'),'13.5');
+ assert.deepEqual([...w.document.querySelectorAll('.arc-trend')].map(x=>x.textContent),['↑','↓']);
+ assert.equal(w.document.querySelectorAll('.arc-observation').length,4);
  const pick=w.document.querySelector('.quote-pick[data-index="0"][data-token="no"][data-side="ask"]');assert(pick);pick.click();
  assert.equal(w.document.querySelector('#trade-option').value,'0');assert.equal(w.document.querySelector('#trade-token').value,'no');
  assert.equal(w.document.querySelector('#trade-action').value,'BUY');assert.equal(w.document.querySelector('#trade-price').value,'78');
@@ -51,16 +73,50 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert(w.document.querySelector('#trade-journal').textContent.includes('подтверждено 2, ошибка 0'));
  assert(w.document.querySelector('#trade-journal').textContent.includes('не равно окончательному исполнению'));
  assert(w.document.querySelector('#account-positions').textContent.includes('Manila'));
- assert(w.document.querySelector('#account-orders').textContent.includes('order123'));
+ assert(w.document.querySelector('#account-orders').textContent.includes(id1));
  assert(w.document.querySelector('#account-orders').textContent.includes('сопоставлено 3'));
+ const tradeOrders=w.document.querySelector('#trade-live-orders');
+ assert(tradeOrders.textContent.includes('25°C · NO'));assert(tradeOrders.textContent.includes('Покупка · 78¢'));
+ assert(tradeOrders.textContent.includes('не сопоставлено 7'));assert(tradeOrders.textContent.includes('Первая страница CLOB'));
+ assert(!tradeOrders.textContent.includes('0x'+'4'.repeat(64)));assert.equal(tradeOrders.querySelectorAll('.account-cancel').length,3);
+ assert(w.document.querySelector('.book-own-badge').textContent.includes('3'));
  w.document.querySelector('.book-toggle').click();
+ let bookSides=w.document.querySelectorAll('.book-side'),yesSide=bookSides[0],noSide=bookSides[1];
+ assert(yesSide.querySelector(`.book-entry .book-own-order [data-id="${id3}"]`));
+ assert(noSide.querySelector(`.book-entry .book-own-order [data-id="${id2}"]`));
+ assert([...noSide.querySelectorAll('.book-own-order')].some(x=>x.querySelector(`[data-id="${id1}"]`)&&x.textContent.includes('вне показанных')));
+ assert(noSide.textContent.includes('не сопоставлено 7'));
+ const savedYesBook=books.books['101'];books.books['101']=null;w.renderMarketOptions();
+ assert(w.document.querySelectorAll('.book-side')[0].textContent.includes('стакан недоступен'));
+ assert(w.document.querySelectorAll('.book-side')[0].querySelector(`[data-id="${id3}"]`));
+ books.books['101']=savedYesBook;w.renderMarketOptions();
+ bookSides=w.document.querySelectorAll('.book-side');yesSide=bookSides[0];noSide=bookSides[1];
+ assert(w.document.querySelector('.book-disclaimer').textContent.includes('совпадение цены не подтверждает'));
+ w.confirm=()=>false;noSide.querySelector('.book-entry .account-cancel').click();await tick();
+ assert.equal(requests.filter(([url])=>url==='/api/trading/cancel').length,0);
+ w.confirm=()=>true;cancelMode='canceled';deferAccount=true;w.document.querySelector('#trade-live-refresh').click();await tick();assert(releaseAccount);
+ noSide.querySelector('.book-entry .account-cancel').click();await tick();
+ assert(w.document.querySelector(`#trade-live-orders [data-id="${id2}"]`).disabled);
+ const beforeRelease=requests.filter(([url])=>url==='/api/trading/account').length;releaseAccount();await tick();await tick();
+ assert(requests.filter(([url])=>url==='/api/trading/account').length>beforeRelease); // fresh read after in-flight snapshot
+ assert.equal(requests.filter(([url])=>url==='/api/trading/cancel').length,1);
+ assert.equal(JSON.parse(requests.find(([url])=>url==='/api/trading/cancel')[1].body).order_id,id2);
+ assert(alerts.at(-1).includes('Отмена подтверждена'));assert(!w.document.querySelector('#trade-live-orders').textContent.includes(id2));
+ cancelMode='unknown';w.document.querySelector(`#trade-live-orders [data-id="${id1}"]`).click();await tick();await tick();
+ assert.equal(requests.filter(([url])=>url==='/api/trading/cancel').length,2);assert(alerts.at(-1).includes('неизвестен'));
+ assert(w.document.querySelector('#trade-cancel-status').textContent.includes('Результат отмены неизвестен'));
+ assert(w.document.querySelector('#trade-live-orders').textContent.includes(id1));
+ w.Date.now=()=>fixedNow+70000;w.renderAccountSnapshot();assert(w.document.querySelector('#trade-live-orders').textContent.includes('УСТАРЕЛО'));
+ assert(w.document.querySelector('.book-disclaimer').textContent.includes('УСТАРЕЛ'));w.Date.now=()=>fixedNow;w.renderAccountSnapshot();
+
  w.document.querySelector('.book-details .quote-pick[data-token="yes"][data-side="bid"]').click();
  assert.equal(w.document.querySelector('#trade-action').value,'SELL');assert.equal(w.document.querySelector('#trade-token').value,'yes');assert.equal(w.document.querySelector('#trade-price').value,'20');
  const tabs=[...w.document.querySelectorAll('.market-tab')];assert.equal(tabs.length,2);tabs[1].click();await tick();await tick();
  assert.equal(w.document.querySelector('#trade-size').value,'');
+ assert(!w.document.querySelector('#trade-live-orders').textContent.includes(id1));assert.equal(w.document.querySelectorAll('.book-own-badge').length,0);
  w.document.querySelectorAll('.market-tab')[0].click();await tick();await tick();
  assert.equal(w.document.querySelector('#trade-size').value,'10');assert.equal(w.document.querySelector('#trade-price').value,'20');
- assert(!requests.some(([,o])=>o.method==='POST'));
+ assert(!requests.some(([url,o])=>url==='/api/trading/orders'&&o.method==='POST'));
  w.document.querySelector('[data-page="settings"]').click();await tick();
  assert.equal(w.document.querySelector('#account-form button').disabled,false);
  const form=w.document.querySelector('#account-form');
@@ -92,9 +148,15 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  w.document.querySelector('.account-close-draft').click();await tick();
  assert.equal(w.document.querySelector('#trade-action').value,'SELL');assert.equal(w.document.querySelector('#trade-size').value,'2');
  assert.equal(w.document.querySelector('#trade-price').value,'20');assert.equal(requests.filter(([url])=>url==='/api/trading/orders').length,1);
+ accountOrders=[...accountOrders,{asset_id:'101',side:'SELL',price:0.24,original_size:2,size_matched:3,status:'<img id=xss>',id:'<invalid>'}];
+ w.document.querySelector('#trade-live-refresh').click();await tick();await tick();
+ const invalid=[...w.document.querySelectorAll('#trade-live-orders .trade-live-order')].find(x=>x.textContent.includes('<invalid>'));
+ assert(invalid&&invalid.querySelector('button').disabled);assert(invalid.textContent.includes('не сопоставлено —'));assert(!w.document.querySelector('#xss'));
  accountFails=true;w.document.querySelector('#trade-live-refresh').click();await tick();await tick();
  assert.equal(w.document.querySelector('#trade-live-balance').textContent,'Не загружен');
  assert(w.document.querySelector('#trade-live-positions').textContent.includes('недоступны'));
+ assert(w.document.querySelector('#trade-live-orders').textContent.includes('недоступны'));
+ assert.equal(w.document.querySelectorAll('.book-own-order').length,0);
  assert(w.document.querySelector('#account-status').textContent.includes('нет связи'));
  assert.equal(requests.filter(([url])=>url==='/api/trading/orders').length,1);
 

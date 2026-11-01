@@ -28,12 +28,19 @@ assert.ok(dailyPath(rise,set).includes('L'));
 const rows=[[Date.parse('2026-06-01T03:30:00Z')/1000,12],[Date.parse('2026-06-01T04:30:00Z')/1000,13]];
 assert.deepEqual(observationsForDay(rows,'America/New_York','2026-05-31', Date.parse('2026-06-02T00:00:00Z')).map(x=>x.temp),[12]);
 assert.deepEqual(observationsForDay(rows,'America/New_York','2026-06-01', Date.parse('2026-06-02T00:00:00Z')).map(x=>x.temp),[13]);
+assert.equal(observationsForDay(rows,'America/New_York','2026-06-01',Date.parse('2026-06-02T00:00:00Z'))[0].trend,'up');
 assert.deepEqual(observationsForDay(rows,'America/New_York','2026-06-01', Date.parse('2026-06-01T04:00:00Z')),[]);
 console.log('Daily solar curve helpers: OK');
 // Repeated local hour at the end of daylight saving time: both observations
 // belong to the same station-local date and are retained.
 const dst = [[Date.parse('2026-11-01T05:30:00Z')/1000,10],[Date.parse('2026-11-01T06:30:00Z')/1000,11]];
 assert.deepEqual(observationsForDay(dst,'America/New_York','2026-11-01',Date.parse('2026-11-02T00:00:00Z')).map(x=>x.time),['01:30','01:30']);
+const trends=[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t]);
+assert.deepEqual(observationsForDay(trends,'UTC','2026-06-01',Date.parse('2026-06-02T00:00:00Z')).map(x=>x.trend),[null,'up',null,'down']);
+const dstBack=[[Date.parse('2026-11-01T05:45:00Z')/1000,10],[Date.parse('2026-11-01T06:15:00Z')/1000,11]];
+const dstObservations=observationsForDay(dstBack,'America/New_York','2026-11-01',Date.parse('2026-11-02T00:00:00Z'));
+assert.deepEqual(dstObservations.map(x=>[x.time,x.trend]),[['01:15','up'],['01:45',null]]);
+console.log('Observation trends use chronological previous reading: OK');
 
 const {metarChart,nearestChartPoint} = require('../web/static/weather.js');
 const now=Date.parse('2026-06-01T12:00:00Z');
