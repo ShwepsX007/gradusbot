@@ -67,10 +67,17 @@ def init_web_db():
         conn.execute('CREATE TABLE IF NOT EXISTS web_trading_migrations (name TEXT PRIMARY KEY)')
         migration=conn.execute('INSERT OR IGNORE INTO web_trading_migrations(name) VALUES(?)',('manual-opt-in-v1',))
         if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
+        migration=conn.execute('INSERT OR IGNORE INTO web_trading_migrations(name) VALUES(?)',('reconciliation-opt-in-v1',))
+        if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_order_intents (
             nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, slug TEXT NOT NULL, asset TEXT NOT NULL,
             side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL, order_type TEXT NOT NULL,
             state TEXT NOT NULL, order_id TEXT, created REAL NOT NULL, updated REAL NOT NULL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_order_reconciliation (
+            nonce TEXT PRIMARY KEY, expected_id TEXT, credential_fingerprint TEXT,
+            assessment TEXT NOT NULL DEFAULT 'unverified', checked_at REAL,
+            order_status TEXT, size_matched TEXT, confirmed_size TEXT, failed_size TEXT,
+            reason TEXT, FOREIGN KEY(nonce) REFERENCES web_order_intents(nonce))''')
 
 
 
@@ -362,6 +369,8 @@ def trading_intents():
         if not c: return jsonify(intents=[])
         slug=request.args.get('slug','')
         if slug and not re.fullmatch(r'[a-z0-9-]{1,200}',slug): return jsonify(error='Неверное событие.'),400
+        from web import order_reconciliation
+        order_reconciliation.reconcile_wallet(c)
         rows=trading_orders.list_intents(c['funder'] or c['signer'])
         if slug:
             rows=[row for row in rows if row['slug']==slug]

@@ -1,11 +1,12 @@
 """One-shot CLOB manual orders. An uncertain outcome is never retried automatically."""
 import json
+import os
 import re
 import time
 from decimal import Decimal, InvalidOperation
 
 import database as db
-from web import trading_account
+from web import trading_account, order_reconciliation as reconciliation
 from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions, OrderPayload, OrderType
 
 
@@ -71,8 +72,10 @@ def _reserve(data, wallet):
             return dict(existing),False
         control=conn.execute('SELECT enabled FROM web_trading_control WHERE id=1').fetchone()
         if not control or not control['enabled']: raise TradeError('Торговля выключена в настройках.')
-        unknown=conn.execute("SELECT 1 FROM web_order_intents WHERE wallet=? AND asset=? AND state IN ('pending','unknown')",(wallet,data['asset'])).fetchone()
-        if unknown: raise TradeError('По этому исходу есть заявка с неизвестным результатом. Сверьте её на Polymarket; повторная отправка заблокирована.')
+        blocked=conn.execute("""SELECT 1 FROM web_order_intents i LEFT JOIN web_order_reconciliation r ON r.nonce=i.nonce
+            WHERE lower(i.wallet)=lower(?) AND i.asset=? AND
+            (i.state IN ('pending','unknown') OR (i.state='accepted' AND (r.assessment IS NULL OR r.assessment!='terminal'))) LIMIT 1""",(wallet,data['asset'])).fetchone()
+        if blocked: raise TradeError('По этому исходу есть незавершённая или несверенная заявка. Новая отправка заблокирована; проверьте журнал и Polymarket.')
         conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated)
                         VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
                      (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now))
@@ -81,7 +84,7 @@ def _reserve(data, wallet):
 
 def _finish(nonce,state,order_id=None):
     with db.get_db() as conn:
-        conn.execute('UPDATE web_order_intents SET state=?,order_id=?,updated=? WHERE nonce=?',
+        conn.execute("UPDATE web_order_intents SET state=?,order_id=?,updated=? WHERE nonce=? AND state='pending'",
                      (state,order_id,time.time(),nonce))
 
 
@@ -98,8 +101,22 @@ def find_intent(wallet, nonce):
 
 def list_intents(wallet):
     with db.get_db() as conn:
-        rows=conn.execute("SELECT * FROM web_order_intents WHERE wallet=? ORDER BY CASE WHEN state IN ('pending','unknown') THEN 0 ELSE 1 END, created DESC LIMIT 100",(wallet,)).fetchall()
-    return [public_intent(dict(r)) for r in rows]
+        rows=conn.execute("""SELECT i.* FROM web_order_intents i LEFT JOIN web_order_reconciliation r ON r.nonce=i.nonce
+            WHERE lower(i.wallet)=lower(?) ORDER BY CASE WHEN i.state IN ('pending','unknown') OR
+            (i.state='accepted' AND (r.assessment IS NULL OR r.assessment!='terminal')) THEN 0 ELSE 1 END,
+            i.created DESC LIMIT 100""",(wallet,)).fetchall()
+        nonces=[r['nonce'] for r in rows]
+        evidence={}
+        if nonces:
+            placeholders=','.join('?' for _ in nonces)
+            evidence={r['nonce']:dict(r) for r in conn.execute("SELECT nonce,expected_id,assessment,checked_at,order_status,size_matched,confirmed_size,failed_size,reason FROM web_order_reconciliation WHERE nonce IN ("+placeholders+")",nonces).fetchall()}
+    result=[]
+    for r in rows:
+        item=public_intent(dict(r)); recon=evidence.get(item['nonce'])
+        if recon:
+            recon.pop('nonce',None);item['reconciliation']=recon
+        result.append(item)
+    return result
 
 
 def annotate_order_statuses(intents, credentials, limit=3):
@@ -156,23 +173,49 @@ def submit(body, event):
         if not isinstance(book.get('neg_risk'),bool): raise ValueError()
     except TradeError: raise
     except Exception: raise TradeError('Не удалось проверить параметры стакана. Ордер не отправлен.') from None
+    try:
+        lock_fd=reconciliation.acquire_order_lock(nonce)
+    except (OSError,ValueError):
+        previous=find_intent(wallet,nonce)
+        if previous: return previous
+        raise TradeError('Другая отправка или сверка ещё выполняется. Проверьте журнал перед новой попыткой.') from None
+    try:
+        return _submit_locked(data,wallet,client,c,book,tick)
+    finally:
+        os.close(lock_fd)
+
+
+def _submit_locked(data,wallet,client,c,book,tick):
+    nonce,asset,side,kind,price,size=(data[k] for k in ('nonce','asset','side','order_type','price','size'))
     prior,created=_reserve(data,wallet)
     if not created: return public_intent(prior)
     try:
+        if getattr(client,'retry_on_error',None) is not False:
+            raise ValueError('SDK retry must be disabled')
         order=client.create_order(OrderArgsV2(token_id=asset,side=side,price=float(price),size=float(size)),
-              PartialCreateOrderOptions(tick_size=format(tick.normalize(),'f'),neg_risk=book['neg_risk']))
+              PartialCreateOrderOptions(tick_size=format(tick.normalize(),'f'),neg_risk=book['neg_risk'],version=2))
+        expected_id=reconciliation.order_hash(order,c,client.signer,neg_risk=book['neg_risk'],asset=asset,side=side,price=price,size=size)
+        reconciliation.record_hash(nonce,expected_id,c)
+        if trading_account.load()!=c: raise ValueError('account changed')
     except Exception:
         _finish(nonce,'not_sent')
-        raise TradeError('Не удалось подготовить подпись. Ордер не отправлен.') from None
+        raise TradeError('Не удалось проверить подпись, параметры или версию SDK 1.2.1. Ордер не отправлен.') from None
     # From this point even a network exception is an unknown outcome. Never retry.
     try:
         result=client.post_order(order,OrderType.GTC if kind=='GTC' else OrderType.FAK)
     except Exception:
         _finish(nonce,'unknown')
         return {'nonce':nonce,'state':'unknown','order_id':None}
+    if isinstance(result,dict) and result.get('success') is True and isinstance(result.get('orderID'),str) and result['orderID'].lower()==expected_id:
+        _finish(nonce,'accepted',expected_id)
+        return {'nonce':nonce,'state':'accepted','order_id':expected_id}
     if isinstance(result,dict) and result.get('success') is True and isinstance(result.get('orderID'),str) and result['orderID']:
-        _finish(nonce,'accepted',result['orderID'])
-        return {'nonce':nonce,'state':'accepted','order_id':result['orderID']}
+        # A contradictory exchange ID is not safely recoverable by looking up either ID alone.
+        with db.get_db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("UPDATE web_order_intents SET state='unknown',order_id=NULL,updated=? WHERE nonce=?",(time.time(),nonce))
+            conn.execute("UPDATE web_order_reconciliation SET assessment='conflict',reason=? WHERE nonce=?",('Идентификатор CLOB не совпал с локальным хешем. Требуется ручная проверка.',nonce))
+        return {'nonce':nonce,'state':'unknown','order_id':None}
     # Even rejected/malformed results are conservative: do not infer no submission.
     _finish(nonce,'unknown')
     return {'nonce':nonce,'state':'unknown','order_id':None}

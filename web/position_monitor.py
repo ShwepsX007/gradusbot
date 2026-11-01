@@ -43,22 +43,28 @@ def _save(status, wallet=None, payload=None, fingerprint=None):
 
 
 def poll_once():
-    """One independent read. Errors never become empty positions or zero balance."""
+    """Independent account and order reads. Neither submits or cancels orders."""
+    credentials=None
     try:
         credentials=trading_account.load()
         if not credentials:
             _save('not_configured');return
         wallet=credentials['funder'] or credentials['signer']
         snapshot=trading_account.account_snapshot()
-        # Never retain a snapshot for credentials replaced while requests were running.
         if credentials != trading_account.load() or snapshot.get('wallet') != wallet:
             _save('account_changed');return
         if not isinstance(snapshot.get('errors'),list):
             raise ValueError('invalid account snapshot')
         _save('partial' if snapshot['errors'] else 'ok',wallet,snapshot,_fingerprint(credentials))
     except Exception:
-        # Do not log SDK exceptions, request bodies, wallet keys, or credentials.
         _save('error')
+    finally:
+        # A failing account snapshot must not prevent independent order reconciliation.
+        if credentials:
+            try:
+                from web import order_reconciliation
+                if credentials==trading_account.load(): order_reconciliation.reconcile_wallet(credentials)
+            except Exception: pass
 
 
 def read_status(credentials):

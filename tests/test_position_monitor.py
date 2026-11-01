@@ -39,6 +39,14 @@ class PositionMonitorTests(unittest.TestCase):
         with patch.object(account,'load',side_effect=[self.c,different]),patch.object(account,'account_snapshot',return_value=self.snapshot): monitor.poll_once()
         self.assertEqual(monitor.read_status(different)['status'],'account_changed')
         self.assertIsNone(monitor.read_status(different)['snapshot'])
+    def test_order_reconciliation_runs_independently_and_not_for_replaced_credentials(self):
+        from web import order_reconciliation
+        with patch.object(order_reconciliation,'reconcile_wallet') as rec, patch.object(account,'account_snapshot',side_effect=RuntimeError('offline')):
+            monitor.poll_once();rec.assert_called_once_with(self.c)
+        other={**self.c,'api_key':'new'}
+        with patch.object(order_reconciliation,'reconcile_wallet') as rec, patch.object(account,'load',side_effect=[self.c,other,other]), patch.object(account,'account_snapshot',return_value=self.snapshot):
+            monitor.poll_once();rec.assert_not_called()
+
     def test_singleton_lock_and_symlink(self):
         fd=monitor.acquire_lock()
         try:

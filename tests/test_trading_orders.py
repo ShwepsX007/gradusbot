@@ -16,10 +16,11 @@ class OrderTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.old_db=web.db.DB_FILE
         web.db.DB_FILE=os.path.join(self.tmp.name,'db');web.db.init_db();web.init_web_db()
         self.p=patch.object(account.config,'BASE_DIR',self.tmp.name);self.p.start();account.save(KEY)
-        self.client=Mock();self.client.get_order_book.return_value=BOOK.copy();self.client.create_order.return_value='signed';self.client.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
+        self.client=Mock();self.client.retry_on_error=False;self.client.get_order_book.return_value=BOOK.copy();self.client.create_order.return_value='signed';self.client.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
         self.cp=patch.object(account,'build_client',return_value=self.client);self.cp.start()
+        self.hp=patch.object(orders.reconciliation,'order_hash',return_value='0x'+'1'*64);self.hp.start()
     def tearDown(self):
-        self.cp.stop();self.p.stop();web.db.DB_FILE=self.old_db;self.tmp.cleanup()
+        self.hp.stop();self.cp.stop();self.p.stop();web.db.DB_FILE=self.old_db;self.tmp.cleanup()
 
     def test_upgrade_requires_fresh_opt_in_only_once(self):
         orders.set_enabled(True)
@@ -138,8 +139,8 @@ class OrderEndpointTests(unittest.TestCase):
         self.assertEqual(self.post('/api/trading/control',payload,headers={'X-CSRF-Token':'token'},environ_overrides={'SERVER_NAME':'0.0.0.0'}).status_code,403)
         self.assertEqual(self.post('/api/trading/control',{**payload,'current_password':'wrong'},headers={'X-CSRF-Token':'token'}).status_code,400)
         self.assertEqual(self.post('/api/trading/control',payload,headers={'X-CSRF-Token':'token'}).status_code,200)
-        fake=Mock();fake.get_order_book.return_value=BOOK;fake.create_order.return_value='signed';fake.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
-        with patch.object(web,'event_for_station',return_value=EVENT),patch.object(account,'build_client',return_value=fake):
+        fake=Mock();fake.retry_on_error=False;fake.get_order_book.return_value=BOOK;fake.create_order.return_value='signed';fake.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
+        with patch.object(web,'event_for_station',return_value=EVENT),patch.object(account,'build_client',return_value=fake),patch.object(orders.reconciliation,'order_hash',return_value='0x'+'1'*64):
             self.assertEqual(self.post('/api/trading/orders',BASE,headers={'X-CSRF-Token':'token'}).get_json()['state'],'accepted')
         self.assertEqual(fake.post_order.call_count,1)
         with patch.object(web,'event_for_station',side_effect=RuntimeError('offline')):
