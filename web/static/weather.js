@@ -83,6 +83,38 @@
     for(let t=120;t<86400;t+=120) samples.add(t);
     return [...samples].sort((a,b)=>a-b).map((t,i)=>{const p=curvePoint(t,sunrise,sunset);return `${i?'L':'M'}${p.x.toFixed(2)},${p.y.toFixed(2)}`}).join(' ');
   }
+  function hourlyExtremaForDay(forecast, day) {
+    const hourly=forecast?.hourly;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '') || !Array.isArray(hourly?.time) || !Array.isArray(hourly?.temperature_2m)) return null;
+    const points=[];
+    hourly.time.forEach((t,i)=>{
+      if(typeof t!=='string' || !t.startsWith(day+'T'))return;
+      const match=t.match(/^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      const temp=hourly.temperature_2m[i];
+      if(!match||+match[1]>23||+match[2]>59||+(match[3]||0)>59||typeof temp!=='number'||!Number.isFinite(temp))return;
+      points.push({time:`${match[1]}:${match[2]}`,seconds:+match[1]*3600 + +match[2]*60 + +(match[3]||0),temp});
+    });
+    if(!points.length)return null;
+    points.sort((a,b)=>a.seconds-b.seconds);
+    return {min:points.reduce((a,b)=>b.temp<a.temp?b:a),max:points.reduce((a,b)=>b.temp>a.temp?b:a),count:points.length};
+  }
+  function metarIcon(metar, isDay=true) {
+    if(!metar || typeof metar!=='object')return {kind:'unknown',label:'Нет данных METAR'};
+    const precip=Array.isArray(metar.precipitation?.codes)?metar.precipitation.codes:[];
+    const desc=metar.precipitation?.description;
+    if(precip.length){
+      const codes=precip.join(' ');
+      const kind=/TS/.test(codes)?'storm':/(?:SN|SG|IC|PL|GR|GS)/.test(codes)?'snow':'rain';
+      return {kind,label:desc||'Осадки по METAR'};
+    }
+    const code=metar.cloud?.code;
+    const label=metar.cloud?.description;
+    if(['CLR','NSC','CAVOK'].includes(code))return {kind:'clear-neutral',label:label||'Значимой облачности не обнаружено'};
+    if(['SKC','NCD'].includes(code))return {kind:isDay===null?'clear-neutral':isDay?'clear':'clear-night',label:label||'Облака не обнаружены'};
+    if(['FEW','SCT'].includes(code))return {kind:isDay===null?'cloudy':isDay?'partial':'partial-night',label:label||'Переменная облачность'};
+    if(['BKN','OVC','VV'].includes(code))return {kind:'cloudy',label:label||'Облачно'};
+    return {kind:'unknown',label:'Состояние погоды не указано в METAR'};
+  }
   function observationsForDay(history, tz, day, now = Date.now()) {
     if (!Array.isArray(history) || !tz || !day) return [];
     let formatter;
@@ -136,7 +168,7 @@
     while(lo<hi){const mid=Math.floor((lo+hi)/2);if(points[mid].ms<ms)lo=mid+1;else hi=mid}
     return lo>0 && Math.abs(points[lo-1].ms-ms)<=Math.abs(points[lo].ms-ms)?lo-1:lo;
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

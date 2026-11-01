@@ -70,3 +70,25 @@ assert.equal(new Date(nepalTicks[0].ms).toISOString(),'2026-06-01T00:15:00.000Z'
 assert.ok(nepalTicks.every(t=>t.time.endsWith(':00')||t.time.endsWith(':30')));
 assert.deepEqual(metarChart([[now/1000,1e200]],'C',now).points,[]);
 console.log('Half-hour station-local grid and invalid temperatures: OK');
+
+const {hourlyExtremaForDay, metarIcon}=require('../web/static/weather.js');
+const f={hourly:{time:['2026-06-01T12:00','2026-06-01T02:00','2026-06-01T09:00','2026-06-01T16:00','2026-06-02T00:00','2026-06-01T25:00','bad'],temperature_2m:[14,3,14,0,99,-99,1]}};
+assert.deepEqual(hourlyExtremaForDay(f,'2026-06-01'),{min:{time:'16:00',seconds:57600,temp:0},max:{time:'09:00',seconds:32400,temp:14},count:4});
+assert.deepEqual(hourlyExtremaForDay(f,'2026-06-02').min,{time:'00:00',seconds:0,temp:99});
+assert.equal(hourlyExtremaForDay(f,'2026-06-03'),null);
+assert.equal(hourlyExtremaForDay({hourly:{time:['2026-06-01T12:00'],temperature_2m:[null]}},'2026-06-01'),null);
+assert.equal(hourlyExtremaForDay({hourly:{time:['2026-06-01T12:00'],temperature_2m:[NaN]}},'2026-06-01'),null);
+assert.equal(hourlyExtremaForDay({},'2026-06-01'),null);
+assert.equal(metarIcon(null).kind,'unknown');
+assert.equal(metarIcon({cloud:{code:'SKC',description:'Ясно'},precipitation:{codes:[]}},true).kind,'clear');
+assert.equal(metarIcon({cloud:{code:'SKC'},precipitation:{codes:[]}},false).kind,'clear-night');
+assert.equal(metarIcon({cloud:{code:'SKC'}},null).kind,'clear-neutral');
+assert.equal(metarIcon({cloud:{code:'CLR',description:'Низкая облачность не обнаружена'}},true).kind,'clear-neutral');
+assert.equal(metarIcon({cloud:{code:'SCT'}},true).kind,'partial');
+assert.equal(metarIcon({cloud:{code:'SCT'}},false).kind,'partial-night');
+assert.equal(metarIcon({cloud:{code:'BKN'}}).kind,'cloudy');
+assert.deepEqual(metarIcon({cloud:{code:'SKC'},precipitation:{codes:['-RA'],description:'Слабые осадки: дождь'}}),{kind:'rain',label:'Слабые осадки: дождь'});
+assert.equal(metarIcon({precipitation:{codes:['SN']}}).kind,'snow');
+assert.equal(metarIcon({precipitation:{codes:['VCTS'],description:'Гроза поблизости'}}).kind,'storm');
+assert.equal(metarIcon({cloud:{code:null}}).kind,'unknown');
+console.log('Daily model extrema and observed METAR icons: OK');
