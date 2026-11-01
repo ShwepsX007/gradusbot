@@ -334,8 +334,10 @@ def record_web_metar(sid, metar):
     if not math.isfinite(temp) or obs_time < now - 8 * 24 * 3600 or obs_time > now + 300:
         return
     with db.get_db() as conn:
-        # Observations are deduplicated by their source timestamp, not poll time.
-        conn.execute('INSERT OR IGNORE INTO web_metar_history (station_id,obs_time,temp) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)', (sid, obs_time, temp, sid))
+        # Deduplicate repeated polls, but retain a corrected report for the same observation time.
+        conn.execute('''INSERT INTO web_metar_history (station_id,obs_time,temp)
+            SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)
+            ON CONFLICT(station_id,obs_time) DO UPDATE SET temp=excluded.temp''', (sid, obs_time, temp, sid))
         conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 8 * 24 * 3600))
 
 
@@ -346,6 +348,14 @@ def combined_history(sid):
             'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>?',
             (sid, time.time() - 8 * 24 * 3600))])
     return sorted(points, key=lambda p: p[0])
+
+
+def metar_chart_history(sid):
+    # Bot history stores poll times, not METAR observation times; do not mix them.
+    with db.get_db() as conn:
+        return [[r['obs_time'], r['temp']] for r in conn.execute(
+            'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>=? ORDER BY obs_time',
+            (sid, time.time() - 24 * 3600))]
 
 
 def save_solar_days(sid, forecast_data):
@@ -380,7 +390,7 @@ def get_solar_days(sid):
 def weather(sid):
     station = db.get_station(sid)
     if not station: return jsonify(error='Станция не найдена'), 404
-    result = {'station': public_station(station), 'history': combined_history(sid), 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
+    result = {'station': public_station(station), 'history': combined_history(sid), 'metar_history': metar_chart_history(sid), 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
     if not station['enabled']:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
@@ -407,6 +417,7 @@ def weather(sid):
     if metar:
         record_web_metar(sid, metar)
         result['history'] = combined_history(sid)
+        result['metar_history'] = metar_chart_history(sid)
     info = station_info(code)
     result['info'] = info
     if info and info.get('lat') is not None and info.get('lon') is not None:

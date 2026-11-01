@@ -88,7 +88,35 @@
     }
     return points.sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, DAY_START_X, DAY_WIDTH, HORIZON};
+  // Last 24 elapsed hours, with no extrapolation beyond actual reports.
+  function metarChart(history, unit='C', now=Date.now()) {
+    const start=now-86400000, byTime=new Map();
+    if (Array.isArray(history)) for (const row of history) {
+      if (!Array.isArray(row) || row[0] == null || row[1] == null || row[0] === '' || row[1] === '') continue;
+      const ms=Number(row[0])*1000, c=Number(row[1]);
+      if (Number.isFinite(ms) && Number.isFinite(c) && ms>=start && ms<=now) byTime.set(ms,c);
+    }
+    const points=[...byTime].sort((a,b)=>a[0]-b[0]).map(([ms,c])=>({ms,c,value:unit==='F'?c*9/5+32:c}));
+    if (!points.length) return {points:[],ticks:[],start,end:now,segments:[]};
+    const values=points.map(p=>p.value), lo=Math.min(...values), hi=Math.max(...values);
+    const pad=Math.max((hi-lo)*0.12,unit==='F'?0.9:0.5);
+    const desired=(hi-lo+pad*2)/4, power=Math.pow(10,Math.floor(Math.log10(desired)));
+    const normalized=desired/power, step=(normalized<=1?1:normalized<=2?2:normalized<=2.5?2.5:normalized<=5?5:10)*power;
+    const min=Math.floor((lo-pad)/step)*step, max=Math.ceil((hi+pad)/step)*step;
+    const ticks=[];
+    for(let i=0;i<=Math.round((max-min)/step);i++){const value=+(min+i*step).toPrecision(12);ticks.push({value,y:100-(value-min)/(max-min)*100})}
+    for(const p of points){p.x=(p.ms-start)/86400000*100;p.y=100-(p.value-min)/(max-min)*100}
+    const segments=[];
+    for(const p of points){if(!segments.length || p.ms-segments[segments.length-1].at(-1).ms>2*3600000)segments.push([]);segments.at(-1).push(p)}
+    return {points,ticks,segments,start,end:now,min,max,step};
+  }
+  function nearestChartPoint(points, ms) {
+    if (!points.length || !Number.isFinite(ms)) return -1;
+    let lo=0,hi=points.length-1;
+    while(lo<hi){const mid=Math.floor((lo+hi)/2);if(points[mid].ms<ms)lo=mid+1;else hi=mid}
+    return lo>0 && Math.abs(points[lo-1].ms-ms)<=Math.abs(points[lo].ms-ms)?lo-1:lo;
+  }
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, metarChart, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

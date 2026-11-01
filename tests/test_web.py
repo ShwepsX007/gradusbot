@@ -247,10 +247,27 @@ class TerminalTests(unittest.TestCase):
             second = self.client.get(f'/api/stations/{sid}/weather').get_json()
         self.assertEqual(first['history'], [[obs, 21.0]])
         self.assertEqual(second['history'], first['history'])
+        self.assertEqual(first['metar_history'], [[obs, 21.0]])
         self.assertEqual(web.db.get_station_history(sid), [])
         self.assertEqual(self.client.delete(f'/api/stations/{sid}', json={}).status_code, 200)
         with web.db.get_db() as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_history').fetchone()[0], 0)
+
+    def test_chart_uses_only_real_metar_times_and_updates_corrected_reports(self):
+        sid = self.add_station()['id']
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': True})
+        now = int(time.time())
+        web.db.add_station_history(sid, 77)  # Poll time, not observation time.
+        web.record_web_metar(sid, {'temp': 15.1, 'obs_time': now - 3600})
+        web.record_web_metar(sid, {'temp': 15.3, 'obs_time': now - 3600})
+        web.record_web_metar(sid, {'temp': 11, 'obs_time': now - 25 * 3600})
+        web.record_web_metar(sid, {'temp': 16, 'obs_time': now + 120})
+        self.client.patch(f'/api/stations/{sid}', json={'enabled': False})
+        result = self.client.get(f'/api/stations/{sid}/weather').get_json()
+        self.assertEqual(result['metar_history'], [[now - 3600, 15.3], [now + 120, 16.0]])
+        self.assertIn(77, [p[1] for p in result['history']])
+        with web.db.get_db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_history WHERE obs_time=?', (now - 3600,)).fetchone()[0], 1)
 
     def test_seven_day_web_history_retained_and_disabled_is_read_only(self):
         sid = self.add_station()['id']

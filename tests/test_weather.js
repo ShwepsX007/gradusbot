@@ -34,3 +34,22 @@ console.log('Daily solar curve helpers: OK');
 // belong to the same station-local date and are retained.
 const dst = [[Date.parse('2026-11-01T05:30:00Z')/1000,10],[Date.parse('2026-11-01T06:30:00Z')/1000,11]];
 assert.deepEqual(observationsForDay(dst,'America/New_York','2026-11-01',Date.parse('2026-11-02T00:00:00Z')).map(x=>x.time),['01:30','01:30']);
+
+const {metarChart,nearestChartPoint} = require('../web/static/weather.js');
+const now=Date.parse('2026-06-01T12:00:00Z');
+assert.deepEqual(metarChart([], 'C', now).points, []);
+const source=[[now/1000-86400, 12.5],[now/1000-3600, 14.3],[now/1000-3600, 14.4],[now/1000, 13],[now/1000+1, 40],[null,15],[now/1000-90000,5],['',3]];
+const chart=metarChart(source,'C',now);
+assert.deepEqual(chart.points.map(p=>p.c),[12.5,14.4,13]);
+assert.equal(chart.points[0].x,0);assert.equal(chart.points.at(-1).x,100);
+assert.ok(chart.min<12.5 && chart.max>14.4);
+assert.ok(chart.ticks.length>=3 && chart.ticks.length<=8);
+assert.equal(chart.segments.length,2); // long gap is not connected
+assert.equal(nearestChartPoint(chart.points,now-3500000),1);
+assert.equal(nearestChartPoint(chart.points,now+100000),2);
+assert.equal(nearestChartPoint([],now),-1);
+const single=metarChart([[now/1000,0]],'F',now);
+assert.equal(single.points[0].value,32);
+assert.ok(single.min<32 && single.max>32 && single.points[0].y>0 && single.points[0].y<100);
+assert.equal(metarChart([[now/1000,10],[now/1000-10,11]],'C',now).segments.length,1);
+console.log('METAR chart scaling and selection: OK');
