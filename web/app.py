@@ -21,6 +21,8 @@ import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
 from web.market_station import identify_station
+from web.orderbook import fetch_event_books
+from collections import OrderedDict
 
 app = Flask(__name__, static_folder='static')
 # Authentication is fail-closed; a missing or weak secret never enables the panel.
@@ -606,6 +608,29 @@ def market(slug):
     if not data: return jsonify(error='Рынок временно недоступен'), 502
     m = db.get_market_by_slug(slug)
     return jsonify(market=data, history=db.get_market_history(m['id']) if m else [], positions=[{k: p.get(k) for k in ('id','is_demo','slug','side','size','sl','tp','entry_price','question','outcome')} for p in db.get_positions() if p.get('slug') == slug])
+
+
+# Keep CLOB network waits independent of weather/market caches and cap cache size.
+_books_lock = threading.Lock()
+_books_cache = OrderedDict()
+
+
+@app.get('/api/market/<slug>/books')
+def market_books(slug):
+    if not valid_slug(slug): return jsonify(error='Некорректный slug'), 400
+    with _books_lock:
+        entry = _books_cache.get(slug)
+        if entry and time.time() - entry[0] < 20:
+            _books_cache.move_to_end(slug)
+            return jsonify(entry[1])
+        event = event_for_station(slug)
+        if not event: return jsonify(error='Не удалось загрузить данные события'), 502
+        data = fetch_event_books(event)
+        _books_cache[slug] = (time.time(), data)
+        _books_cache.move_to_end(slug)
+        while len(_books_cache) > 32:
+            _books_cache.popitem(last=False)
+    return jsonify(data)
 
 
 @app.get('/api/search')

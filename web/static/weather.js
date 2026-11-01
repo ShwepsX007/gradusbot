@@ -60,17 +60,27 @@
   const DAY_START_X = 45, DAY_WIDTH = 710, HORIZON = 128;
   function curvePoint(seconds, sunrise, sunset) {
     if (![seconds,sunrise,sunset].every(Number.isFinite) || sunrise < 0 || sunset > 86400 || sunrise >= sunset || seconds < 0 || seconds > 86400) return null;
-    const smooth = t => t*t*(3-2*t);
+    // Monotone cubic Hermite segments: matching slopes at sunrise and sunset
+    // make the transition from night to day smooth rather than kinked.
+    const mid=(sunrise+sunset)/2, half=mid-sunrise;
+    const harmonic=(a,b)=>a && b ? 2*a*b/(a+b) : (a||b);
+    const riseSlope=-harmonic(sunrise ? 45/sunrise : 0, 70/half);
+    const setSlope=harmonic(sunset<86400 ? 45/(86400-sunset) : 0, 70/half);
+    function hermite(t,x0,x1,y0,y1,m0,m1){
+      const h=x1-x0,u=(t-x0)/h;
+      return (2*u**3-3*u**2+1)*y0+(u**3-2*u**2+u)*h*m0+(-2*u**3+3*u**2)*y1+(u**3-u**2)*h*m1;
+    }
     let y;
-    if (seconds < sunrise) y = HORIZON + 45*(1-smooth(seconds/sunrise));
-    else if (seconds <= sunset) { const t=(seconds-sunrise)/(sunset-sunrise); y=HORIZON-70*4*t*(1-t); }
-    else y=HORIZON+45*smooth((seconds-sunset)/(86400-sunset));
+    if(seconds<sunrise)y=hermite(seconds,0,sunrise,HORIZON+45,HORIZON,0,riseSlope);
+    else if(seconds<=mid)y=hermite(seconds,sunrise,mid,HORIZON,HORIZON-70,riseSlope,0);
+    else if(seconds<=sunset)y=hermite(seconds,mid,sunset,HORIZON-70,HORIZON,0,setSlope);
+    else y=hermite(seconds,sunset,86400,HORIZON,HORIZON+45,setSlope,0);
     return {x:DAY_START_X + DAY_WIDTH*seconds/86400, y};
   }
   function dailyPath(sunrise, sunset) {
     if (!curvePoint(0, sunrise, sunset)) return null;
     const samples = new Set([0, 86400, sunrise, sunset]);
-    for(let t=600;t<86400;t+=600) samples.add(t);
+    for(let t=120;t<86400;t+=120) samples.add(t);
     return [...samples].sort((a,b)=>a-b).map((t,i)=>{const p=curvePoint(t,sunrise,sunset);return `${i?'L':'M'}${p.x.toFixed(2)},${p.y.toFixed(2)}`}).join(' ');
   }
   function observationsForDay(history, tz, day, now = Date.now()) {
@@ -94,21 +104,31 @@
     if (Array.isArray(history)) for (const row of history) {
       if (!Array.isArray(row) || row[0] == null || row[1] == null || row[0] === '' || row[1] === '') continue;
       const ms=Number(row[0])*1000, c=Number(row[1]);
-      if (Number.isFinite(ms) && Number.isFinite(c) && ms>=start && ms<=now) byTime.set(ms,c);
+      if (Number.isFinite(ms) && Number.isFinite(c) && c>=-150 && c<=150 && ms>=start && ms<=now) byTime.set(ms,c);
     }
-    const points=[...byTime].sort((a,b)=>a[0]-b[0]).map(([ms,c])=>({ms,c,value:unit==='F'?c*9/5+32:c}));
+    // The grid is anchored in whole degrees Celsius, with Fahrenheit equivalents.
+    const points=[...byTime].sort((a,b)=>a[0]-b[0]).map(([ms,c])=>({ms,c,value:c}));
     if (!points.length) return {points:[],ticks:[],start,end:now,segments:[]};
-    const values=points.map(p=>p.value), lo=Math.min(...values), hi=Math.max(...values);
-    const pad=Math.max((hi-lo)*0.12,unit==='F'?0.9:0.5);
-    const desired=(hi-lo+pad*2)/4, power=Math.pow(10,Math.floor(Math.log10(desired)));
-    const normalized=desired/power, step=(normalized<=1?1:normalized<=2?2:normalized<=2.5?2.5:normalized<=5?5:10)*power;
-    const min=Math.floor((lo-pad)/step)*step, max=Math.ceil((hi+pad)/step)*step;
+    const values=points.map(p=>p.c), lo=Math.min(...values), hi=Math.max(...values);
+    const min=Math.floor(lo)-1, max=Math.ceil(hi)+1, step=1;
     const ticks=[];
-    for(let i=0;i<=Math.round((max-min)/step);i++){const value=+(min+i*step).toPrecision(12);ticks.push({value,y:100-(value-min)/(max-min)*100})}
-    for(const p of points){p.x=(p.ms-start)/86400000*100;p.y=100-(p.value-min)/(max-min)*100}
+    for(let value=min;value<=max;value++)ticks.push({value,y:100-(value-min)/(max-min)*100});
+    for(const p of points){p.x=(p.ms-start)/86400000*100;p.y=100-(p.c-min)/(max-min)*100}
     const segments=[];
     for(const p of points){if(!segments.length || p.ms-segments[segments.length-1].at(-1).ms>2*3600000)segments.push([]);segments.at(-1).push(p)}
     return {points,ticks,segments,start,end:now,min,max,step};
+  }
+  function halfHourTicks(start, end, tz) {
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end<=start || end-start>86400000) return [];
+    let formatter;
+    try { formatter=new Intl.DateTimeFormat('en-GB',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}); }
+    catch { return []; }
+    const ticks=[];
+    for(let t=Math.ceil(start/60000)*60000;t<=end;t+=60000){
+      const local=localClock(t,tz,formatter);
+      if(local && local.seconds%1800===0)ticks.push({x:(t-start)/(end-start)*100,time:local.time,ms:t});
+    }
+    return ticks;
   }
   function nearestChartPoint(points, ms) {
     if (!points.length || !Number.isFinite(ms)) return -1;
@@ -116,7 +136,7 @@
     while(lo<hi){const mid=Math.floor((lo+hi)/2);if(points[mid].ms<ms)lo=mid+1;else hi=mid}
     return lo>0 && Math.abs(points[lo-1].ms-ms)<=Math.abs(points[lo].ms-ms)?lo-1:lo;
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, metarChart, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

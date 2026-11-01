@@ -43,13 +43,30 @@ const chart=metarChart(source,'C',now);
 assert.deepEqual(chart.points.map(p=>p.c),[12.5,14.4,13]);
 assert.equal(chart.points[0].x,0);assert.equal(chart.points.at(-1).x,100);
 assert.ok(chart.min<12.5 && chart.max>14.4);
-assert.ok(chart.ticks.length>=3 && chart.ticks.length<=8);
+assert.ok(chart.ticks.every((t,i,a)=>!i || t.value-a[i-1].value===1));
+assert.ok(chart.ticks.every(t=>Number.isInteger(t.value)));
 assert.equal(chart.segments.length,2); // long gap is not connected
 assert.equal(nearestChartPoint(chart.points,now-3500000),1);
 assert.equal(nearestChartPoint(chart.points,now+100000),2);
 assert.equal(nearestChartPoint([],now),-1);
 const single=metarChart([[now/1000,0]],'F',now);
-assert.equal(single.points[0].value,32);
-assert.ok(single.min<32 && single.max>32 && single.points[0].y>0 && single.points[0].y<100);
+assert.equal(single.points[0].value,0);
+assert.ok(single.min<0 && single.max>0 && single.points[0].y>0 && single.points[0].y<100);
 assert.equal(metarChart([[now/1000,10],[now/1000-10,11]],'C',now).segments.length,1);
 console.log('METAR chart scaling and selection: OK');
+
+for(const crossing of [rise,set]){
+  const before=(curvePoint(crossing,rise,set).y-curvePoint(crossing-1,rise,set).y);
+  const after=(curvePoint(crossing+1,rise,set).y-curvePoint(crossing,rise,set).y);
+  assert.ok(Math.abs(before-after)<1e-6,`continuous slope at ${crossing}: ${before} vs ${after}`);
+}
+console.log('Smooth day/night transition: OK');
+
+const {halfHourTicks}=require('../web/static/weather.js');
+const dstTicks=halfHourTicks(Date.parse('2026-11-01T04:00:00Z'),Date.parse('2026-11-01T08:00:00Z'),'America/New_York');
+assert.equal(dstTicks.filter(t=>t.time==='01:30').length,2);
+const nepalTicks=halfHourTicks(Date.parse('2026-06-01T00:00:00Z'),Date.parse('2026-06-01T02:00:00Z'),'Asia/Kathmandu');
+assert.equal(new Date(nepalTicks[0].ms).toISOString(),'2026-06-01T00:15:00.000Z');
+assert.ok(nepalTicks.every(t=>t.time.endsWith(':00')||t.time.endsWith(':30')));
+assert.deepEqual(metarChart([[now/1000,1e200]],'C',now).points,[]);
+console.log('Half-hour station-local grid and invalid temperatures: OK');

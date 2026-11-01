@@ -47,26 +47,32 @@ function chartTime(ms,detail=false){
   catch{return new Date(ms).toISOString().replace('T',' ').slice(0,16)+' UTC'}
 }
 function hideChartSelection(){chartState.selected=null;$('#chart-crosshair').classList.add('hidden');$('#chart-tooltip').classList.add('hidden')}
-function selectChartPoint(index){
+function selectChartPoint(index,autoScroll=false){
   const p=chartState.points[index];if(!p){hideChartSelection();return}
-  chartState.selected=p.ms;const cross=$('#chart-crosshair');cross.classList.remove('hidden');
+  chartState.selected=p.ms;if(autoScroll){const sc=$('#chart-scroll'),x=p.x/100*$('#chart-plot').clientWidth;if(x<sc.scrollLeft+35||x>sc.scrollLeft+sc.clientWidth-35)sc.scrollLeft=Math.max(0,x-sc.clientWidth/2)}const cross=$('#chart-crosshair');cross.classList.remove('hidden');
   cross.querySelector('.cross-x').style.left=p.x+'%';cross.querySelector('.cross-y').style.top=p.y+'%';
   cross.querySelector('.cross-dot').style.left=p.x+'%';cross.querySelector('.cross-dot').style.top=p.y+'%';
   const tip=$('#chart-tooltip');tip.classList.remove('hidden');$('#chart-tooltip-temp').textContent=chartTemp(p.c);$('#chart-tooltip-time').textContent=chartTime(p.ms,true);
-  const plot=$('#chart-plot'),width=plot.clientWidth,height=plot.clientHeight,tw=tip.offsetWidth,th=tip.offsetHeight;
+  const plot=$('#chart-plot'),scroll=$('#chart-scroll'),width=plot.clientWidth,height=plot.clientHeight,tw=tip.offsetWidth,th=tip.offsetHeight;
   let left=p.x/100*width+14,top=p.y/100*height-th-12;
-  if(left+tw>width-4)left=p.x/100*width-tw-14;
-  tip.style.left=Math.max(4,Math.min(width-tw-4,left))+'px';tip.style.top=Math.max(4,Math.min(height-th-4,top))+'px';
+  const viewLeft=scroll.scrollLeft,viewRight=Math.min(width,viewLeft+scroll.clientWidth);
+  if(left+tw>viewRight-4)left=p.x/100*width-tw-14;
+  tip.style.left=Math.max(viewLeft+4,Math.min(viewRight-tw-4,left))+'px';tip.style.top=Math.max(4,Math.min(height-th-4,top))+'px';
 }
 function drawChart(history,tz){
   let previous=chartState.selected;
   try{new Intl.DateTimeFormat('ru-RU',{timeZone:tz||'UTC'});chartState.timezone=tz||'UTC';chartState.isUTC=!tz}catch{chartState.timezone='UTC';chartState.isUTC=true}
   const chart=WeatherView.metarChart(history,state.units),pts=chart.points;chartState.points=pts;chartState.start=chart.start;chartState.end=chart.end;
   $('#chart-zone').textContent=chartState.isUTC?'Время: UTC (часовой пояс станции недоступен)':'Время станции: '+chartState.timezone;
-  $('#chart-axis').innerHTML=Array.from({length:5},(_,i)=>`<span>${esc(chartTime(chart.start+(chart.end-chart.start)*i/4))}</span>`).join('');
+  // Align ticks to the station's actual wall-clock half-hours, including DST changes.
+  const timeTicks=WeatherView.halfHourTicks(chart.start,chart.end,chartState.timezone);
+  $('#chart-axis').innerHTML=timeTicks.map(t=>`<span style="left:${t.x}%" title="${esc(chartTime(t.ms,true))}">${esc(t.time)}</span>`).join('');
+  $('#chart-time-grid').innerHTML=timeTicks.map(t=>`<i style="left:${t.x}%"></i>`).join('');
   $('#chart-empty').classList.toggle('hidden',!!pts.length);
   $('#history-chart').innerHTML=chart.segments.filter(segment=>segment.length>1).map(segment=>`<polyline points="${segment.map(p=>(p.x*10).toFixed(2)+','+(p.y*10).toFixed(2)).join(' ')}" fill="none" stroke="#b5e8b8" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join('');
-  $('#chart-grid').innerHTML=chart.ticks.map(t=>`<div class="chart-tick" style="top:${t.y}%"><span>${esc(chartNumber(t.value))}°${state.units==='F'?'F':'C'}</span></div>`).join('');
+  $('#chart-grid').innerHTML=chart.ticks.map(t=>`<div class="chart-tick" style="top:${t.y}%"><span>${esc(chartNumber(t.value))}°C <small>${esc(chartNumber(t.value*9/5+32))}°F</small></span></div>`).join('');
+  const area=$('.chart-area'),plot=$('#chart-plot'),scroll=$('#chart-scroll'),follow=!chartState.drawn||chartState.station!==state.selected||scroll.scrollLeft+scroll.clientWidth>=scroll.scrollWidth-20;chartState.station=state.selected;
+  const height=Math.max(210,(chart.ticks.length-1)*26);area.style.height=(height+36)+'px';plot.style.height=height+'px';if(follow)scroll.scrollLeft=scroll.scrollWidth;chartState.drawn=true;
   $('#chart-plot').style.background=chart.ticks.map(t=>`linear-gradient(to bottom,transparent calc(${t.y}% - .5px),#2e3a3c calc(${t.y}% - .5px),#2e3a3c calc(${t.y}% + .5px),transparent calc(${t.y}% + .5px))`).join(',');
   let lastLabel=-Infinity,labels='';
   pts.forEach((p,i)=>{labels+=`<i class="chart-point ${i===pts.length-1?'latest':''}" style="left:${p.x}%;top:${p.y}%"></i>`;if(p.x-lastLabel>=15){labels+=`<span class="chart-point-label" style="left:${Math.max(5,Math.min(95,p.x))}%;top:${p.y}%">${esc(chartTemp(p.c))}</span>`;lastLabel=p.x}});
@@ -81,7 +87,7 @@ function chartPointer(e){const rect=chartPlot.getBoundingClientRect();if(!rect.w
 chartPlot.addEventListener('pointermove',chartPointer);
 chartPlot.addEventListener('pointerdown',chartPointer);
 chartPlot.addEventListener('pointerleave',e=>{if(e.pointerType!=='touch')hideChartSelection()});
-chartPlot.addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End','Escape'].includes(e.key))return;e.preventDefault();if(e.key==='Escape'){hideChartSelection();return}const pts=chartState.points;let i=pts.findIndex(p=>p.ms===chartState.selected);if(e.key==='Home')i=0;else if(e.key==='End')i=pts.length-1;else if(i<0)i=e.key==='ArrowLeft'?pts.length-1:0;else i=Math.max(0,Math.min(pts.length-1,i+(e.key==='ArrowLeft'?-1:1)));selectChartPoint(i)});
+chartPlot.addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End','Escape'].includes(e.key))return;e.preventDefault();if(e.key==='Escape'){hideChartSelection();return}const pts=chartState.points;let i=pts.findIndex(p=>p.ms===chartState.selected);if(e.key==='Home')i=0;else if(e.key==='End')i=pts.length-1;else if(i<0)i=e.key==='ArrowLeft'?pts.length-1:0;else i=Math.max(0,Math.min(pts.length-1,i+(e.key==='ArrowLeft'?-1:1)));selectChartPoint(i,true)});
 
 function localDate(tz){if(!tz)return null;try{let parts=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());let get=k=>parts.find(p=>p.type===k)?.value;return `${get('year')}-${get('month')}-${get('day')}`}catch{return null}}
 const {precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, observationsForDay, DAY_START_X, DAY_WIDTH} = WeatherView;
@@ -130,8 +136,58 @@ function updateClock(){
 $('#arc-prev').onclick=()=>{if(state.arcOffset>-6){state.arcOffset--;updateClock()}};
 $('#arc-next').onclick=()=>{if(state.arcOffset<0){state.arcOffset++;updateClock()}};
 function renderMarketTabs(){let b=state.bindings;$('#market-count').textContent=String(b.length).padStart(2,'0');$('#market-tabs').innerHTML=b.map(x=>`<button class="market-tab ${x.market_slug===state.market?'active':''}" data-slug="${esc(x.market_slug)}">${esc(x.market_name)}</button>`).join('');$$('.market-tab').forEach(btn=>btn.onclick=()=>{state.market=btn.dataset.slug;renderMarketTabs();loadMarket()})}
-async function loadMarket(){if(!state.market){renderMarket(null);return}if(state.demo){renderMarket({market:{title:state.market==='demo'?'Максимальная температура в Нью-Йорке':'Максимальная температура в Нью-Йорке · завтра',options:demoOptions,closed:false},positions:[]});return}const slug=state.market;try{let m=await api('/api/market/'+encodeURIComponent(slug));if(slug===state.market)renderMarket(m)}catch(e){renderMarket(null,e.message)}}
-function renderMarket(data,error){let m=data?.market,binding=state.bindings.find(x=>x.market_slug===state.market);$('#market-title').textContent=binding?.market_name||m?.title||'Нет данных рынка';$('#market-description').textContent=error||(!m?'Найдите рынок или добавьте ссылку на событие.':state.demo?'Демонстрационные значения · не реальные котировки':(binding?.market_name!==m.title?'Оригинал: '+m.title:'Вероятности исходов по данным события Polymarket'));$('#market-state').textContent=state.demo?'ДЕМО':m?.closed?'ЗАКРЫТ':'СОБЫТИЕ';$('#market-link').href=state.demo||!state.market?'https://polymarket.com':'https://polymarket.com/event/'+encodeURIComponent(state.market);$('#market-options').innerHTML=m?.options?.length?m.options.map(o=>{let n=typeof o.prob==='number'?Math.max(0,Math.min(100,o.prob)):null;return `<div class="option-row"><span class="option-name">${esc(o.label)}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span><span class="option-price">${n==null?'—':n+'¢'}</span><span class="trade-disabled" title="Торговля через веб-панель пока недоступна">Только просмотр</span></div>`}).join(''):'<div class="empty-state">Выберите или добавьте рынок</div>';let pos=data?.positions||[];$('#positions-count').textContent=`Позиций бота: ${pos.length}`;for(const id of ['rename-market','unlink-market','delete-market'])$('#'+id).classList.toggle('hidden',state.demo||!state.market);$('#positions').innerHTML=pos.length?'<b>ПОЗИЦИИ ИЗ БАЗЫ БОТА</b>'+pos.map(p=>`<div class="position-row">${esc(p.is_demo?'ДЕМО · ':'')}${esc(p.question||p.outcome||'Позиция')} · ${esc(p.side)} · ${esc(p.size)} shares · вход ${esc(p.entry_price)} · SL ${esc(p.sl??'—')} / TP ${esc(p.tp??'—')}</div>`).join(''):''}
+let bookSlug=null,bookData=null,bookMessage='',bookChoice=null,marketData=null;
+const bookInFlight=new Set();
+async function loadMarket(){
+  if(!state.market){bookSlug=null;bookData=null;marketData=null;renderMarket(null);return}
+  if(bookSlug!==state.market){bookSlug=state.market;bookData=null;bookChoice=null;marketData=null;bookMessage='Загрузка стакана…';renderMarket(null,'Загрузка события…')}
+  if(state.demo){bookMessage='Демо: реальные заявки стакана не отображаются.';marketData={market:{title:state.market==='demo'?'Максимальная температура в Нью-Йорке':'Максимальная температура в Нью-Йорке · завтра',options:demoOptions,closed:false},positions:[]};renderMarket(marketData);return}
+  const slug=state.market;
+  try{let m=await api('/api/market/'+encodeURIComponent(slug));if(slug!==state.market)return;marketData=m;renderMarket(m);loadOrderBooks()}
+  catch(e){if(slug===state.market){marketData=null;renderMarket(null,e.message)}}
+}
+async function loadOrderBooks(){
+  const slug=state.market;if(!slug||state.demo||document.hidden||bookInFlight.has(slug))return;
+  bookInFlight.add(slug);
+  try{
+    const data=await api('/api/market/'+encodeURIComponent(slug)+'/books');if(slug!==state.market)return;
+    bookData=data;const total=Object.keys(data.books||{}).length,received=Object.values(data.books||{}).filter(Boolean).length;
+    const time=new Date(data.requested_at*1000).toLocaleTimeString('ru-RU');
+    bookMessage=!total?'Нет подтверждённых токенов YES/NO для стакана.':!received?'Не удалось получить стаканы CLOB; попробуем снова.':`Снимки CLOB: ${received} из ${total} · проверка ${time} · обновление примерно раз в 30 сек.`;
+    if(data.limited)bookMessage+=' Слишком много исходов: часть стаканов не запрошена.';
+  }catch(e){if(slug!==state.market)return;bookData=null;bookMessage='Стакан временно недоступен: '+e.message}
+  finally{bookInFlight.delete(slug);if(slug===state.market&&marketData)renderMarket(marketData)}
+}
+function bookFor(option,side){
+  if(!bookData||!option.token_yes||!option.token_no)return null;
+  const pair=(bookData.pairs||[]).find(p=>p.yes===option.token_yes&&p.no===option.token_no);
+  if(!pair)return null;
+  return bookData.books?.[pair[side]]||null;
+}
+function priceCents(value){const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n*100)+'¢':'—'}
+function shares(value){const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n):'—'}
+function quote(book){if(!book)return '<span class="quote-missing">нет данных</span>';const ask=book.asks?.[0],bid=book.bids?.[0];return `<div class="quote"><b>${ask?esc(priceCents(ask.price)):'—'}</b><small>купить · ${ask?esc(shares(ask.size))+' шт.':'нет заявок'}</small><small>продать · ${bid?esc(priceCents(bid.price)):'нет заявок'}</small></div>`}
+function bookSide(title,book){
+  if(!book)return `<section class="book-side"><h4>${title}</h4><p>Стакан недоступен или отсутствует.</p></section>`;
+  const levels=(items,kind)=>items?.length?items.map(x=>`<div class="book-level"><span class="${kind}">${esc(priceCents(x.price))}</span><span>${esc(shares(x.size))}</span></div>`).join(''):'<div class="book-empty">Нет заявок</div>';
+  return `<section class="book-side"><h4>${title}</h4><div class="book-updated">Получен: ${esc(new Date(book.fetched_at*1000).toLocaleTimeString('ru-RU'))}</div><div class="book-columns"><div><div class="book-column-title">Покупатели · BID</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book.bids,'bid')}</div><div><div class="book-column-title">Продавцы · ASK</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book.asks,'ask')}</div></div></section>`;
+}
+function renderMarket(data,error){
+  let m=data?.market,binding=state.bindings.find(x=>x.market_slug===state.market);
+  $('#market-title').textContent=binding?.market_name||m?.title||'Нет данных рынка';
+  $('#market-description').textContent=error||(!m?'Найдите рынок или добавьте ссылку на событие.':state.demo?'Демонстрационные значения · не реальные котировки':(binding?.market_name!==m.title?'Оригинал: '+m.title:'Цены и заявки по исходам события Polymarket'));
+  $('#market-state').textContent=state.demo?'ДЕМО':m?.closed?'ЗАКРЫТ':'СОБЫТИЕ';
+  $('#market-link').href=state.demo||!state.market?'https://polymarket.com':'https://polymarket.com/event/'+encodeURIComponent(state.market);
+  $('#market-options').innerHTML=m?.options?.length?m.options.map((o,i)=>{
+    let n=typeof o.prob==='number'?Math.max(0,Math.min(100,o.prob)):null,yes=bookFor(o,'yes'),no=bookFor(o,'no');
+    return `<div class="option-row book-option"><span class="option-name">${esc(o.label)}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span>${quote(yes)}${quote(no)}<button class="book-toggle" data-index="${i}" aria-expanded="${bookChoice===i}">${bookChoice===i?'Скрыть':'Стакан'} ↕</button></div>${bookChoice===i?`<div class="book-details">${bookSide('YES · ДА',yes)}${bookSide('NO · НЕТ',no)}<p class="book-disclaimer">До 5 лучших ценовых уровней на каждой стороне. Количество — число контрактов, не число людей. YES и NO могут отражать общую ликвидность; не суммируйте их.</p></div>`:''}`
+  }).join(''):'<div class="empty-state">Выберите или добавьте рынок</div>';
+  $$('.book-toggle').forEach(btn=>btn.onclick=()=>{bookChoice=bookChoice===Number(btn.dataset.index)?null:Number(btn.dataset.index);renderMarket(marketData)});
+  $('#book-status').textContent=state.demo?'Демо: реальные заявки стакана не отображаются.':bookMessage||'Стакан CLOB загружается отдельно';
+  let pos=data?.positions||[];$('#positions-count').textContent=`Позиций бота: ${pos.length}`;for(const id of ['rename-market','unlink-market','delete-market'])$('#'+id).classList.toggle('hidden',state.demo||!state.market);
+  $('#positions').innerHTML=pos.length?'<b>ПОЗИЦИИ ИЗ БАЗЫ БОТА</b>'+pos.map(p=>`<div class="position-row">${esc(p.is_demo?'ДЕМО · ':'')}${esc(p.question||p.outcome||'Позиция')} · ${esc(p.side)} · ${esc(p.size)} shares · вход ${esc(p.entry_price)} · SL ${esc(p.sl??'—')} / TP ${esc(p.tp??'—')}</div>`).join(''):'';
+}
+
 $('#rename-market').onclick=async()=>{let binding=state.bindings.find(x=>x.market_slug===state.market);if(!binding)return;let name=prompt('Новое название рынка (изменится во всех станциях и в базе бота):',binding.market_name);if(name===null)return;try{await api('/api/markets/'+encodeURIComponent(binding.market_slug),{method:'PATCH',body:JSON.stringify({name})});await loadStation(true);toast('Рынок переименован')}catch(e){toast(e.message)}};
 $('#unlink-market').onclick=async()=>{let binding=state.bindings.find(x=>x.market_slug===state.market);if(!binding||!confirm('Отвязать рынок от станции? Настройки стратегии этой связки будут удалены. Ордера на бирже не отменяются.'))return;try{await api('/api/bindings/'+binding.id,{method:'DELETE',body:'{}'});await loadStation();toast('Рынок отвязан')}catch(e){toast(e.message)}};
 $('#delete-market').onclick=async()=>{if(!state.market||!confirm('Удалить рынок из общей базы бота? Будут удалены его история, привязки ко ВСЕМ станциям и настройки стратегий этих связок. Ордера на бирже не отменяются. Продолжить?'))return;try{await api('/api/markets/'+encodeURIComponent(state.market),{method:'DELETE',body:'{}'});await loadStation();toast('Рынок удалён')}catch(e){toast(e.message)}};
@@ -214,4 +270,4 @@ $('#market-resolve-form').onsubmit=e=>{e.preventDefault();resolveMarketFirst()};
 $('#market-first-search').onsubmit=async e=>{e.preventDefault();let target=$('#market-first-results');target.innerHTML='<div class="search-message">Поиск…</div>';try{let results=await api('/api/search?q='+encodeURIComponent(new FormData(e.currentTarget).get('q')));target.innerHTML=results.length?results.map(r=>`<div class="search-result"><span>${esc(r.title)}</span><button type="button" data-slug="${esc(r.slug)}">Выбрать</button></div>`).join(''):'<div class="search-message">Событий не найдено. Можно вставить ссылку ниже.</div>';target.querySelectorAll('button').forEach(b=>b.onclick=()=>{$('#market-resolve-form input').value=b.dataset.slug;resolveMarketFirst()})}catch(err){target.innerHTML=`<div class="search-message">${esc(err.message)}</div>`}};
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
-$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
