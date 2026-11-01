@@ -650,9 +650,11 @@ def build_temperature_scan():
             except Exception:
                 incomplete = True
                 break
+            quotes_at = time.time()  # Gamma's snapshot for this page, not the later station lookup time
             for event in data:
                 item = event_summary(event)
                 if item and item['slug'] not in seen:
+                    item['quotes_at'] = quotes_at
                     events.append(item); seen.add(item['slug'])
             if len(data) < SCAN_PAGE_SIZE: break
         else:

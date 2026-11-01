@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from web import app as web
-from web.temperature_scan import observation_date, event_summary, apply_timezone_batch
+from web.temperature_scan import observation_date, event_summary, apply_timezone_batch, yes_price_summary
 
 
 def event(slug='highest-temperature-in-manila-on-november-2-2026', source='https://aviationweather.gov/api/data/metar?ids=RPLL&format=raw'):
@@ -40,6 +40,37 @@ class ScanTests(unittest.TestCase):
         hk['description']='https://www.weather.gov.hk/en/cis/climat.htm'
         self.assertIsNone(event_summary(hk)['timezone'])
 
+    def test_yes_price_summary_uses_explicit_labels_and_highest_odds(self):
+        markets = [
+            {'groupItemTitle':'20°C', 'outcomes':'["Yes", "No"]', 'outcomePrices':'["0.35", "0.65"]', 'acceptingOrders':True},
+            {'groupItemTitle':'21°C', 'outcomes':['No','Yes'], 'outcomePrices':['0.72','0.28'], 'acceptingOrders':True},
+            {'groupItemTitle':'22°C', 'outcomes':['Yes','No'], 'outcomePrices':['0.2','0.8'], 'acceptingOrders':True},
+            {'question':'23°C or above?', 'outcomes':['Yes','No'], 'outcomePrices':[0.05,0.95]},
+            {'groupItemTitle':'zero', 'outcomes':['Yes','No'], 'outcomePrices':[0,1], 'acceptingOrders':True},
+            {'groupItemTitle':'suspended', 'outcomes':['Yes','No'], 'outcomePrices':[0.9,0.1], 'acceptingOrders':False},
+            {'groupItemTitle':'closed', 'outcomes':['Yes','No'], 'outcomePrices':[0.99,0.01], 'closed':True},
+            {'groupItemTitle':'not active', 'outcomes':['Yes','No'], 'outcomePrices':[1,0], 'active':False},
+        ]
+        top, maximum = yes_price_summary(markets)
+        self.assertEqual([q['label'] for q in top],['20°C','21°C','22°C'])
+        self.assertEqual([q['price'] for q in top],[0.35,0.28,0.2])
+        self.assertEqual(maximum, {'label':'23°C or above?', 'price':0.05, 'accepting_orders':False})
+        item = event();item['markets'] = markets
+        self.assertEqual(event_summary(item)['top_yes_prices'],top)
+        self.assertEqual(event_summary(item)['max_odds_yes'],maximum)
+
+    def test_yes_price_summary_rejects_bad_or_ambiguous_data(self):
+        def m(outcomes, prices): return {'groupItemTitle':'test','outcomes':outcomes,'outcomePrices':prices}
+        bad = [m(['Yes','Maybe'],[0.5,0.5]),m(['Yes','Yes'],[0.5,0.5]),m(['Yes','No'],[0.5]),
+               m('not json','[1,0]'),m(['Yes','No'],['NaN','0.5']),m(['Yes','No'],[True,0]),
+               m(['Yes','No'],[-0.01,1]),m(['Yes','No'],[1.01,0]),m(['Yes','No'],[None,0]),
+               {'outcomes':['Yes','No'],'outcomePrices':[0.5,0.5]}]
+        self.assertEqual(yes_price_summary(bad),([],None))
+        only_zero=m(['Yes','No'],[0,1])
+        self.assertEqual(yes_price_summary([only_zero])[1],None)
+        one=m(['Yes','No'],[1,0])
+        self.assertEqual(yes_price_summary([one])[1]['price'],1)
+
     def test_open_meteo_batch_mapping_never_guess(self):
         data=[{'timezone':'Asia/Manila'},{'location_id':1,'timezone':'America/New_York'}]
         self.assertEqual(apply_timezone_batch(['RPLL','KLGA'],data),{'RPLL':'Asia/Manila','KLGA':'America/New_York'})
@@ -56,6 +87,7 @@ class ScanTests(unittest.TestCase):
             data=web.build_temperature_scan()
         self.assertFalse(data['incomplete']); self.assertEqual(len(data['events']),2)
         self.assertEqual(data['events'][0]['timezone'],'Asia/Manila')
+        self.assertGreater(data['events'][0]['quotes_at'],0)
         self.assertEqual(get.call_args_list[0].args[1]['tag_slug'],'daily-temperature')
         self.assertEqual(get.call_args_list[1].args[1]['offset'],2)
         self.assertEqual(get.call_args_list[2].args[1]['tag_slug'],'temperature')

@@ -8,7 +8,7 @@ const dom=new JSDOM(html,{url:'https://terminal.example/',runScripts:'outside-on
 const {window:w}=dom;
 let stations=[],markets=[],bindings=[],calls=[],prompts=0;
 const candidate={code:'RPLL',kind:'Aviation Weather Center',field:'event.resolutionSource',url:'https://aviationweather.gov/api/data/metar?ids=RPLL'};
-const item={slug:'highest-temperature-in-manila-on-november-2-2026',title:'Manila',date:'2026-11-02',timezone:'Asia/Manila',station_code:'RPLL',station:{status:'found',candidate}};
+const item={slug:'highest-temperature-in-manila-on-november-2-2026',title:'Manila',date:'2026-11-02',timezone:'Asia/Manila',station_code:'RPLL',station:{status:'found',candidate},quotes_at:Date.now()/1000-180,top_yes_prices:[{label:'20°C',price:0.35,accepting_orders:true},{label:'21°C',price:0.28,accepting_orders:true},{label:'<img src=x onerror=alert(1)>',price:0.2,accepting_orders:false}],max_odds_yes:{label:'17°C',price:0.05,accepting_orders:true}};
 const hk={slug:'highest-temperature-in-hong-kong-on-november-2-2026',title:'Hong Kong',date:'2026-11-02',timezone:'Asia/Hong_Kong',station_code:null,station:{status:'unknown',candidate:null}};
 w.confirm=()=>{prompts++;return true};
 w.fetch=async (url,options={})=>{
@@ -37,10 +37,18 @@ w.eval(fs.readFileSync('web/static/weather.js','utf8'));w.eval(fs.readFileSync('
 const tick=()=>new Promise(r=>setTimeout(r,30));
 (async()=>{
   await tick();w.document.querySelector('[data-page="markets"]').click();await tick();
+  assert(w.document.querySelector('#all-markets').compareDocumentPosition(w.document.querySelector('.scan-panel')) & w.Node.DOCUMENT_POSITION_FOLLOWING);
   w.document.querySelector('#scan-temperature').click();await tick();
   assert.equal(w.document.querySelectorAll('.scan-card').length,2);
   assert(w.document.querySelector('#scan-status').textContent.includes('не полностью'));
   assert(w.document.querySelector('#scan-device').textContent.includes('Ваше время'));
+  const manila=w.document.querySelector(`[data-slug="${item.slug}"].scan-add`).closest('.scan-card');
+  assert.equal(manila.querySelectorAll('.scan-quote').length,3);
+  assert(manila.textContent.includes('20°C'));assert(manila.textContent.includes('35%'));assert(manila.textContent.includes('×2,86'));
+  assert(manila.textContent.includes('Макс. расчётный коэффициент YES: ×20 · 17°C (5%)'));
+  assert(manila.textContent.includes('снимок устарел'));assert(manila.textContent.includes('приём не подтверждён'));
+  assert.equal(manila.querySelectorAll('img').length,0);
+  assert(w.document.querySelector(`[data-slug="${hk.slug}"].scan-add`).closest('.scan-card').textContent.includes('Цены YES активных исходов недоступны'));
   w.document.querySelector(`[data-slug="${item.slug}"].scan-add`).click();await tick();await tick();
   assert.equal(prompts,0);assert.equal(stations.length,1);assert.equal(stations[0].enabled,false);
   assert(w.document.querySelector(`[data-slug="${item.slug}"].scan-add`).disabled);

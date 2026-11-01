@@ -249,6 +249,26 @@ const scanAdding=new Set();
 const deviceTz=Intl.DateTimeFormat().resolvedOptions().timeZone||null;
 function offsetLabel(minutes){if(minutes===null)return 'сравнение недоступно';if(minutes===0)return 'одинаковое время';const sign=minutes>0?'+':'−',m=Math.abs(minutes);return `${sign}${Math.floor(m/60)} ч${m%60?' '+m%60+' мин':''} относительно вас`}
 function scanPhaseClass(rank){return ['current','future','past','unknown','unknown'][rank]}
+function scanPricePercent(price){
+  if(price>0&&price<0.00005)return '<0,01%';
+  if(price<1&&price>0.99995)return '>99,99%';
+  return (price*100).toLocaleString('ru-RU',{maximumFractionDigits:2})+'%';
+}
+function scanMultiplier(price){
+  const multiple=1/price;
+  return price>0&&Number.isFinite(multiple)?'×'+multiple.toLocaleString('ru-RU',{maximumFractionDigits:2}):'—';
+}
+function scanQuotesHtml(e,now){
+  const quotes=Array.isArray(e.top_yes_prices)?e.top_yes_prices:[];
+  if(!quotes.length)return '<div class="scan-quotes-empty">Цены YES активных исходов недоступны</div>';
+  const age=Number(e.quotes_at)>0?now-Number(e.quotes_at)*1000:null;
+  const stamp=age!==null?new Date(Number(e.quotes_at)*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):'время неизвестно';
+  const stale=age!==null&&age>=120000?' · снимок устарел, обновите сканирование':'';
+  const chips=quotes.map(q=>`<span class="scan-quote"><span>${esc(q.label)}${q.accepting_orders?'':' · приём не подтверждён'}</span><b>${esc(scanPricePercent(q.price))}</b><small>${esc(scanMultiplier(q.price))}</small></span>`).join('');
+  const max=e.max_odds_yes;
+  const maximum=max?`<div class="scan-max-odds">Макс. расчётный коэффициент YES: <b>${esc(scanMultiplier(max.price))}</b> · ${esc(max.label)} (${esc(scanPricePercent(max.price))})${max.accepting_orders?'':' · приём не подтверждён'}</div>`:'';
+  return `<div class="scan-quotes"><div class="scan-quotes-label">ТОП-3 ПО ЦЕНЕ YES · GAMMA ${esc(stamp)}${esc(stale)}</div><div class="scan-quotes-list">${chips}</div>${maximum}</div>`;
+}
 function renderTemperatureScan(){
   if(!scanData)return;
   const now=Date.now(),own=WeatherView.localClock(now,deviceTz),filter=$('#scan-filter').value.trim().toLocaleLowerCase();
@@ -262,7 +282,7 @@ function renderTemperatureScan(){
     const source=c?`${esc(c.code)} · ${esc(c.kind)} · ${esc(c.field)}${trusted?'':' · требуется проверка'}`:e.station?.status==='conflict'?'Найдены разные станции — требуется проверка':'Источник станции не определён';
     const evidence=c?.url?`<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">Источник ↗</a>`:'';
     const displayTime=t.local?t.local.time:'—',date=e.date?e.date.split('-').reverse().join('.'):'не определена';
-    return `<article class="scan-card"><div class="scan-clock"><span>МЕСТНОЕ ВРЕМЯ</span><b>${esc(displayTime)}</b><small>${esc(t.local?t.local.day.split('-').reverse().join('.')+' · '+offsetLabel(t.difference):'Не определено')}</small></div><div class="scan-content"><div class="scan-meta"><span class="scan-phase ${scanPhaseClass(t.rank)}">${esc(t.phase)}</span><span>ДАТА РЫНКА: ${esc(date)}</span>${e.orders_suspended?'<span>ЗАЯВКИ ПРИОСТАНОВЛЕНЫ</span>':''}</div><h4>${esc(e.title)}</h4><div class="scan-source">${source} ${evidence}${e.timezone?`<span> · ${esc(e.timezone)}${e.timezone_basis?' · '+esc(e.timezone_basis):''}</span>`:''}</div></div><div class="scan-actions"><button type="button" class="button ${linked||saved&&!c?'secondary':'primary'} scan-add" data-slug="${esc(e.slug)}" ${linked||saved&&!c||scanAdding.has(e.slug)?'disabled':''}>${buttonText}</button><a href="https://polymarket.com/event/${encodeURIComponent(e.slug)}" target="_blank" rel="noopener noreferrer">Правила ↗</a></div></article>`;
+    return `<article class="scan-card"><div class="scan-clock"><span>МЕСТНОЕ ВРЕМЯ</span><b>${esc(displayTime)}</b><small>${esc(t.local?t.local.day.split('-').reverse().join('.')+' · '+offsetLabel(t.difference):'Не определено')}</small></div><div class="scan-content"><div class="scan-meta"><span class="scan-phase ${scanPhaseClass(t.rank)}">${esc(t.phase)}</span><span>ДАТА РЫНКА: ${esc(date)}</span>${e.orders_suspended?'<span>ЗАЯВКИ ПРИОСТАНОВЛЕНЫ</span>':''}</div><h4>${esc(e.title)}</h4><div class="scan-source">${source} ${evidence}${e.timezone?`<span> · ${esc(e.timezone)}${e.timezone_basis?' · '+esc(e.timezone_basis):''}</span>`:''}</div>${scanQuotesHtml(e,now)}</div><div class="scan-actions"><button type="button" class="button ${linked||saved&&!c?'secondary':'primary'} scan-add" data-slug="${esc(e.slug)}" ${linked||saved&&!c||scanAdding.has(e.slug)?'disabled':''}>${buttonText}</button><a href="https://polymarket.com/event/${encodeURIComponent(e.slug)}" target="_blank" rel="noopener noreferrer">Правила ↗</a></div></article>`;
   }).join(''):'<div class="empty-state">Подходящих событий не найдено.</div>';
   $$('.scan-add').forEach(button=>button.onclick=()=>addScannedMarket(button.dataset.slug,button));
 }
