@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 bot_database.db*
 .env
+
+# Local UI test dependencies and caches
+.cache/

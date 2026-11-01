@@ -244,9 +244,63 @@ function renderStations(){
   $$('.station-rename').forEach(b=>b.onclick=async()=>{let s=state.stations.find(x=>x.id===Number(b.dataset.id));if(!s)return;let name=prompt('Новое название станции:',s.name);if(name===null)return;try{await api(`/api/stations/${s.id}`,{method:'PATCH',body:JSON.stringify({name})});await loadStations(s.id);renderStations();toast('Станция переименована')}catch(e){toast(e.message)}});
   $$('.station-delete').forEach(b=>b.onclick=async()=>{let s=state.stations.find(x=>x.id===Number(b.dataset.id));if(!s||!confirm(`Удалить станцию ${s.name} (${s.station_code})? Будут удалены история и все привязки станции с их настройками стратегий. Рынки останутся в общей базе. Ордера на бирже не отменяются. Продолжить?`))return;try{await api(`/api/stations/${s.id}`,{method:'DELETE',body:'{}'});await loadStations();renderStations();toast('Станция удалена')}catch(e){toast(e.message)}});
 }
+let scanData=null,scanSaved=new Map(),scanBusy=false;
+const scanAdding=new Set();
+const deviceTz=Intl.DateTimeFormat().resolvedOptions().timeZone||null;
+function offsetLabel(minutes){if(minutes===null)return 'сравнение недоступно';if(minutes===0)return 'одинаковое время';const sign=minutes>0?'+':'−',m=Math.abs(minutes);return `${sign}${Math.floor(m/60)} ч${m%60?' '+m%60+' мин':''} относительно вас`}
+function scanPhaseClass(rank){return ['current','future','past','unknown','unknown'][rank]}
+function renderTemperatureScan(){
+  if(!scanData)return;
+  const now=Date.now(),own=WeatherView.localClock(now,deviceTz),filter=$('#scan-filter').value.trim().toLocaleLowerCase();
+  $('#scan-device').textContent=own?`Ваше время: ${own.time} · ${own.day.split('-').reverse().join('.')} · ${deviceTz}`:'Часовой пояс устройства не определён';
+  const rows=WeatherView.sortTemperatureMarkets(scanData.events,deviceTz,now).filter(({event})=>!filter||[event.title,event.slug,event.station_code].some(v=>String(v||'').toLocaleLowerCase().includes(filter)));
+  $('#scan-status').textContent=`Найдено событий: ${scanData.events.length}${filter?' · показано: '+rows.length:''}${scanData.scanned_at?' · сканирование в '+new Date(scanData.scanned_at*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):''}.`+(scanData.incomplete?' Каталог получен не полностью — повторите позже.':'')+(scanData.unknown_timezones?' Для части событий часовой пояс неизвестен.':'');
+  $('#scan-results').innerHTML=rows.length?rows.map(({event:e,time:t})=>{
+    const c=e.station?.candidate,existing=scanSaved.get(e.slug),linked=!!(c&&existing?.codes?.includes(c.code)),saved=!!existing;
+    const buttonText=scanAdding.has(e.slug)?'Проверка…':linked?'Добавлен ✓':saved?(c?'Привязать станцию':'Сохранён ✓'):'Добавить';
+    const trusted=c&&['Aviation Weather Center','Weather Underground'].includes(c.kind)&&c.url;
+    const source=c?`${esc(c.code)} · ${esc(c.kind)} · ${esc(c.field)}${trusted?'':' · требуется проверка'}`:e.station?.status==='conflict'?'Найдены разные станции — требуется проверка':'Источник станции не определён';
+    const evidence=c?.url?`<a href="${esc(c.url)}" target="_blank" rel="noopener noreferrer">Источник ↗</a>`:'';
+    const displayTime=t.local?t.local.time:'—',date=e.date?e.date.split('-').reverse().join('.'):'не определена';
+    return `<article class="scan-card"><div class="scan-clock"><span>МЕСТНОЕ ВРЕМЯ</span><b>${esc(displayTime)}</b><small>${esc(t.local?t.local.day.split('-').reverse().join('.')+' · '+offsetLabel(t.difference):'Не определено')}</small></div><div class="scan-content"><div class="scan-meta"><span class="scan-phase ${scanPhaseClass(t.rank)}">${esc(t.phase)}</span><span>ДАТА РЫНКА: ${esc(date)}</span>${e.orders_suspended?'<span>ЗАЯВКИ ПРИОСТАНОВЛЕНЫ</span>':''}</div><h4>${esc(e.title)}</h4><div class="scan-source">${source} ${evidence}${e.timezone?`<span> · ${esc(e.timezone)}${e.timezone_basis?' · '+esc(e.timezone_basis):''}</span>`:''}</div></div><div class="scan-actions"><button type="button" class="button ${linked||saved&&!c?'secondary':'primary'} scan-add" data-slug="${esc(e.slug)}" ${linked||saved&&!c||scanAdding.has(e.slug)?'disabled':''}>${buttonText}</button><a href="https://polymarket.com/event/${encodeURIComponent(e.slug)}" target="_blank" rel="noopener noreferrer">Правила ↗</a></div></article>`;
+  }).join(''):'<div class="empty-state">Подходящих событий не найдено.</div>';
+  $$('.scan-add').forEach(button=>button.onclick=()=>addScannedMarket(button.dataset.slug,button));
+}
+async function scanTemperatureMarkets(){
+  if(scanBusy)return;scanBusy=true;const button=$('#scan-temperature');button.disabled=true;$('#scan-status').textContent='Сканируем Polymarket и определяем часовые пояса станций. Это может занять некоторое время…';
+  try{scanData=await api('/api/temperature-scan');$('#scan-filters').classList.remove('hidden');await renderAllMarkets();renderTemperatureScan()}
+  catch(e){$('#scan-status').textContent='Не удалось получить список: '+e.message}
+  finally{scanBusy=false;button.disabled=false}
+}
+async function addScannedMarket(slug,button){
+  const item=scanData?.events?.find(e=>e.slug===slug);if(!item||scanAdding.has(slug))return;
+  scanAdding.add(slug);button.disabled=true;button.textContent='Проверка…';
+  try{
+    // Re-read rules at click time; server validates source again before creating a binding.
+    const result=await api('/api/market-station/resolve',{method:'POST',body:JSON.stringify({slug})});
+    if(result.status==='found'){
+      const c=result.candidate,prior=item.station?.candidate;
+      const trusted=['Aviation Weather Center','Weather Underground'].includes(c.kind)&&!!c.url;
+      const changed=prior?.code!==c.code||prior?.kind!==c.kind||prior?.url!==c.url;
+      if((changed||!trusted)&&!confirm(`Найдена станция ${c.code} (${c.kind}). Проверьте правила и источник рынка. Добавить и привязать эту станцию?`))return;
+      const response=await api('/api/market-station/add',{method:'POST',body:JSON.stringify({slug,code:result.candidate.code,confirm:true})});
+      await loadStations(state.demo?response.station.id:state.selected);
+      toast(response.already_bound?'Рынок уже привязан':response.created_station?'Рынок добавлен; новая станция выключена':'Рынок добавлен и привязан к станции');
+    }else{
+      await api('/api/markets',{method:'POST',body:JSON.stringify({slug})});
+      toast(result.status==='conflict'?'Рынок сохранён без станции: коды конфликтуют. Выберите станцию вручную.':'Рынок сохранён без станции. При необходимости выберите станцию вручную.');
+    }
+    await renderAllMarkets();
+  }catch(e){toast(e.message)}finally{scanAdding.delete(slug);button.disabled=false;renderTemperatureScan()}
+}
+$('#scan-temperature').onclick=scanTemperatureMarkets;
+$('#scan-filter').addEventListener('input',renderTemperatureScan);
+setInterval(()=>{if(scanData&&!document.hidden&& !$('#markets-page').classList.contains('hidden'))renderTemperatureScan()},60000);
 async function renderAllMarkets(){
   try{
     let [markets,all]=await Promise.all([api('/api/markets'),Promise.all(state.stations.map(async s=>({s,b:await api(`/api/stations/${s.id}/bindings`)})))]);
+    scanSaved=new Map(markets.map(m=>[m.slug,{codes:all.filter(x=>x.b.some(b=>b.market_slug===m.slug)).map(x=>x.s.station_code)}]));
+    renderTemperatureScan();
     if(!markets.length){$('#all-markets').innerHTML='<div class="empty-state">Рынков пока нет. Найдите и привяжите первый рынок.</div>';return}
     $('#all-markets').innerHTML=markets.map(m=>{let linked=all.filter(x=>x.b.some(b=>b.market_slug===m.slug));return `<div class="manage-row"><div><b>${esc(m.name)}</b><small>${linked.length?linked.map(x=>esc(x.s.name)).join(' · '):'Не привязан к станции'} · ${esc(m.slug)}</small></div><div class="manage-actions">${linked.length?`<button class="button secondary open-managed-market" data-id="${linked[0].s.id}" data-slug="${esc(m.slug)}">Открыть ↗</button>`:''}<button class="button secondary resolve-managed-market" data-slug="${esc(m.slug)}">Найти станцию</button><button class="button secondary rename-managed-market" data-slug="${esc(m.slug)}">Переименовать</button><button class="button danger delete-managed-market" data-slug="${esc(m.slug)}">Удалить</button></div></div>`}).join('');
     $$('.open-managed-market').forEach(b=>b.onclick=async()=>{state.selected=Number(b.dataset.id);page('weather');renderStationTabs();await loadStation();state.market=b.dataset.slug;renderMarketTabs();await loadMarket()});

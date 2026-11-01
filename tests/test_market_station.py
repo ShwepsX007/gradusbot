@@ -39,6 +39,31 @@ class ResolutionParsingTests(unittest.TestCase):
         self.assertEqual(result['candidate']['code'], 'KSEA')
         self.assertEqual(identify_station(None)['status'], 'unknown')
 
+class AviationSourceTests(unittest.TestCase):
+    def test_real_manila_and_html_escaped_query(self):
+        url='https://aviationweather.gov/api/data/metar?ids=RPLL&amp;format=raw&amp;date=2026-11-02T19:00:00Z&amp;hours=30'
+        result=identify_station({'resolutionSource':url, 'markets':[]})
+        self.assertEqual(result['status'],'found')
+        self.assertEqual(result['candidate']['code'],'RPLL')
+        self.assertEqual(result['candidate']['kind'],'Aviation Weather Center')
+        self.assertIn('&format=raw',result['candidate']['url'])
+
+    def test_real_source_market_description_and_conflicts(self):
+        result=identify_station({'markets':[{'description':'Source: https://aviationweather.gov/api/data/metar?format=raw&ids=KLGA'}]})
+        self.assertEqual(result['candidate']['code'],'KLGA')
+        conflict=identify_station({'resolutionSource':'https://aviationweather.gov/api/data/metar?ids=KLGA,KJFK'})
+        self.assertEqual(conflict['status'],'conflict')
+        self.assertIsNone(conflict['candidate'])
+
+    def test_reject_untrusted_urls_and_invalid_codes(self):
+        urls=['https://aviationweather.gov.evil.example/api/data/metar?ids=RPLL',
+              'https://evil.example/api/data/metar?ids=RPLL',
+              'https://aviationweather.gov/api/data/taf?ids=RPLL',
+              'https://aviationweather.gov/api/data/metar?ids=RPLL1',
+              'https://user@aviationweather.gov/api/data/metar?ids=RPLL']
+        for url in urls:
+            with self.subTest(url=url): self.assertEqual(identify_station({'resolutionSource':url})['status'],'unknown')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -92,3 +92,21 @@ assert.equal(metarIcon({precipitation:{codes:['SN']}}).kind,'snow');
 assert.equal(metarIcon({precipitation:{codes:['VCTS'],description:'Гроза поблизости'}}).kind,'storm');
 assert.equal(metarIcon({cloud:{code:null}}).kind,'unknown');
 console.log('Daily model extrema and observed METAR icons: OK');
+
+const {scanTimeInfo,sortTemperatureMarkets,zoneOffsetMinutes}=require('../web/static/weather.js');
+const scanNow=Date.parse('2026-11-01T15:30:00Z');
+const sample=[{title:'Токио',timezone:'Asia/Tokyo',date:'2026-11-02'},
+ {title:'Нью-Йорк',timezone:'America/New_York',date:'2026-11-01'},
+ {title:'Манила',timezone:'Asia/Manila',date:'2026-11-01'},
+ {title:'Завтра',timezone:'Europe/London',date:'2026-11-02'},
+ {title:'Нет данных',timezone:null,date:'2026-11-01'}];
+const sorted=sortTemperatureMarkets(sample,'Europe/Moscow',scanNow);
+assert.deepEqual(sorted.map(x=>x.event.title),['Токио','Нью-Йорк','Манила','Завтра','Нет данных']);
+assert.equal(scanTimeInfo(sample[2],'Europe/Moscow',scanNow).local.time,'23:30');
+assert.equal(scanTimeInfo(sample[2],'Europe/Moscow',scanNow).difference,300);
+assert.equal(scanTimeInfo(sample[0],'Europe/Moscow',scanNow).phase,'Идут местные сутки');
+assert.equal(zoneOffsetMinutes('America/New_York',scanNow),-300);
+assert.equal(zoneOffsetMinutes('Asia/Kathmandu',scanNow),345);
+assert.equal(scanTimeInfo({timezone:'not-a-zone'},'Europe/Moscow',scanNow).rank,4);
+assert.equal(scanTimeInfo({timezone:'Asia/Manila',date:'2026-10-31'},'Europe/Moscow',scanNow).phase,'Местные сутки прошли');
+console.log('Temperature market time ordering: OK');

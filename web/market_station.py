@@ -5,7 +5,7 @@ can change a market's result. Returned candidates still require human review.
 """
 import html
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 import utils
 
@@ -55,10 +55,31 @@ def wu_evidence(text):
             continue
 
 
+def awc_evidence(text):
+    """Accept station ids only from the actual AviationWeather METAR endpoint."""
+    for match in URL_RE.finditer(html.unescape(text)):
+        url = match.group(0).rstrip('.,);]')
+        try:
+            parsed = urlparse(url)
+            if (parsed.scheme.lower() not in ('http', 'https') or
+                parsed.hostname not in ('aviationweather.gov', 'www.aviationweather.gov') or
+                parsed.username or parsed.password or parsed.port not in (None, 80, 443) or
+                parsed.path.rstrip('/') != '/api/data/metar'):
+                continue
+            values = parse_qs(parsed.query, keep_blank_values=True).get('ids', [])
+            codes = [code.strip().upper() for value in values for code in value.split(',')]
+            if codes and all(re.fullmatch(r'[A-Z][A-Z0-9]{3}', code) for code in codes):
+                for code in codes:
+                    yield code, url
+        except ValueError:
+            continue
+
+
 def identify_station(event):
     found = {}
     for field, text in resolution_fields(event):
-        evidence = [(code, 'Weather Underground', url) for code, url in wu_evidence(text)]
+        evidence = [(code, 'Aviation Weather Center', url) for code, url in awc_evidence(text)]
+        evidence += [(code, 'Weather Underground', url) for code, url in wu_evidence(text)]
         evidence += [(m.group(1), 'ICAO в правилах', None) for m in ICAO_RE.finditer(text)]
         evidence += [(m.group(1), 'site в правилах', None) for m in SITE_RE.finditer(text)]
         for code, kind, url in evidence:

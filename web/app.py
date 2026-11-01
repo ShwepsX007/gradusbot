@@ -22,6 +22,7 @@ import utils
 from web.weather import cloud_description, precipitation_description
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
+from web.temperature_scan import event_summary, apply_timezone_batch
 from collections import OrderedDict
 
 app = Flask(__name__, static_folder='static')
@@ -473,12 +474,17 @@ def delete_binding(bid):
     return jsonify(ok=True)
 
 
-def event_for_station(slug):
+def event_for_station(slug, fresh=False):
     def load():
         data = upstream('https://gamma-api.polymarket.com/events/slug/' + slug)
         if isinstance(data, list):
             data = data[0] if data else None
         return data if isinstance(data, dict) and isinstance(data.get('title'), str) and data['title'].strip() else None
+    if fresh:
+        try: return load()
+        except Exception:
+            app.logger.warning('Failed to refresh market rules for %s', slug, exc_info=True)
+            return None
     return cached(('event-rules', slug), 120, load)
 
 
@@ -488,7 +494,7 @@ def market_input():
 
 
 def market_resolution(slug):
-    event = event_for_station(slug)
+    event = event_for_station(slug, fresh=True)
     if not event:
         return None, None
     result = identify_station(event)
@@ -559,6 +565,123 @@ def save_market_without_station():
         if not market:
             conn.execute("INSERT INTO markets (name,slug,enabled,last_probs) VALUES (?,?,1,'{}')", (event['title'], slug))
     return jsonify(ok=True, already_exists=already_exists)
+
+
+_scan_lock = threading.Lock()
+_scan_cache = None
+_scan_zones = OrderedDict()
+SCAN_PAGE_SIZE = 100
+SCAN_MAX_PAGES = 5
+SCAN_TIME_BUDGET = 55
+SCAN_TAGS = ('daily-temperature', 'temperature')
+
+
+def scan_station_locations(codes, deadline):
+    """Batch station lookup and share the bot's in-process AWC backoff/limiter."""
+    found = {}
+    for start in range(0, len(codes), 100):
+        batch = codes[start:start+100]
+        if time.monotonic() >= deadline or time.time() < utils._AWC_STATE['blocked_until'] or not utils.AWC_LIMITER.allow():
+            break
+        try:
+            r = utils.SESSION.get('https://aviationweather.gov/api/data/stationinfo',
+                params={'ids': ','.join(batch), 'format':'json'}, timeout=6)
+            if r.status_code in (403, 429):
+                utils._awc_penalty(r.status_code)
+                break
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list): continue
+            for item in data:
+                if not isinstance(item, dict): continue
+                code = str(item.get('icaoId') or item.get('id') or '').upper()
+                try:
+                    lat, lon = float(item['lat']), float(item['lon'])
+                    if code in batch and math.isfinite(lat) and math.isfinite(lon) and -90<=lat<=90 and -180<=lon<=180:
+                        found[code] = (lat, lon)
+                except (TypeError, ValueError, KeyError):
+                    continue
+        except (requests.RequestException, ValueError):
+            app.logger.warning('Station lookup failed during temperature scan')
+            break
+    return found
+
+
+def scan_station_zones(codes, deadline):
+    # Successful station-to-timezone mappings only; no city-name guesses.
+    found = {code: _scan_zones[code] for code in codes if code in _scan_zones}
+    pending = [code for code in codes if code not in found]
+    locations = scan_station_locations(pending, deadline) if pending else {}
+    for start in range(0, len(pending), 100):
+        batch = [code for code in pending[start:start+100] if code in locations]
+        if not batch or time.monotonic() >= deadline: continue
+        try:
+            data = upstream('https://api.open-meteo.com/v1/forecast', {
+                'latitude': ','.join(str(locations[c][0]) for c in batch),
+                'longitude': ','.join(str(locations[c][1]) for c in batch),
+                'timezone':'auto', 'forecast_days':1, 'daily':'sunrise'})
+            zones = apply_timezone_batch(batch, data)
+            found.update(zones)
+            for code, zone in zones.items():
+                _scan_zones[code] = zone
+                _scan_zones.move_to_end(code)
+            while len(_scan_zones) > 512: _scan_zones.popitem(last=False)
+        except Exception:
+            app.logger.warning('Timezone lookup failed during temperature scan')
+    return found
+
+
+def build_temperature_scan():
+    deadline = time.monotonic() + SCAN_TIME_BUDGET
+    discovery_deadline = deadline - 16  # reserve time for station and timezone lookup
+    events, seen, incomplete, successes = [], set(), False, 0
+    # Gamma distinguishes daily-temperature from the broader temperature tag.
+    for tag in SCAN_TAGS:
+        for page in range(SCAN_MAX_PAGES):
+            if time.monotonic() >= discovery_deadline:
+                incomplete = True
+                break
+            try:
+                data = upstream('https://gamma-api.polymarket.com/events', {
+                    'tag_slug':tag, 'active':'true', 'closed':'false',
+                    'limit':SCAN_PAGE_SIZE, 'offset':page*SCAN_PAGE_SIZE, 'order':'id', 'ascending':'false'})
+                if not isinstance(data, list): raise ValueError('Invalid events response')
+                successes += 1
+            except Exception:
+                incomplete = True
+                break
+            for event in data:
+                item = event_summary(event)
+                if item and item['slug'] not in seen:
+                    events.append(item); seen.add(item['slug'])
+            if len(data) < SCAN_PAGE_SIZE: break
+        else:
+            incomplete = True  # page limit reached; don't claim the list is complete
+    if not successes:
+        raise RuntimeError('Temperature event listings unavailable')
+    codes = sorted({e['station_code'] for e in events if e['station_code']})
+    zones = scan_station_zones(codes, deadline)
+    for event in events:
+        if event['station_code'] in zones:
+            event['timezone'] = zones[event['station_code']]
+            event['timezone_basis'] = 'Координаты станции AWC / Open-Meteo'
+    return {'events':events, 'incomplete':incomplete, 'scanned_at':time.time(),
+            'unknown_timezones':sum(1 for e in events if not e['timezone'])}
+
+
+@app.get('/api/temperature-scan')
+def temperature_scan():
+    global _scan_cache
+    with _scan_lock:
+        if _scan_cache and time.time() - _scan_cache[0] < 120:
+            return jsonify(_scan_cache[1])
+        try:
+            data = build_temperature_scan()
+        except Exception:
+            app.logger.warning('Temperature scan failed', exc_info=True)
+            return jsonify(error='Polymarket временно недоступен. Повторите сканирование позже.'), 502
+        _scan_cache = (time.time(), data)
+    return jsonify(data)
 
 
 @app.get('/api/markets')

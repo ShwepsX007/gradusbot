@@ -168,7 +168,25 @@
     while(lo<hi){const mid=Math.floor((lo+hi)/2);if(points[mid].ms<ms)lo=mid+1;else hi=mid}
     return lo>0 && Math.abs(points[lo-1].ms-ms)<=Math.abs(points[lo].ms-ms)?lo-1:lo;
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, DAY_START_X, DAY_WIDTH, HORIZON};
+  function zoneOffsetMinutes(tz, now) {
+    const clock=localClock(now,tz);if(!clock)return null;
+    const midnight=Date.parse(clock.day+'T00:00:00Z');
+    return Math.round((midnight+clock.seconds*1000-Math.floor(now/1000)*1000)/60000);
+  }
+  function scanTimeInfo(item, deviceTz, now=Date.now()) {
+    const local=localClock(now,item?.timezone);
+    if(!local)return {rank:4,seconds:Infinity,phase:'Местное время неизвестно',local:null,difference:null};
+    const target=item.date;
+    const rank=!target?3:target===local.day?0:target>local.day?1:2;
+    const phase=['Идут местные сутки','Местные сутки ещё не начались','Местные сутки прошли','Дата наблюдения не определена'][rank];
+    const stationOffset=zoneOffsetMinutes(item.timezone,now),deviceOffset=zoneOffsetMinutes(deviceTz,now);
+    return {rank,phase,seconds:local.seconds,local,difference:stationOffset!==null&&deviceOffset!==null?stationOffset-deviceOffset:null};
+  }
+  function sortTemperatureMarkets(events, deviceTz, now=Date.now()) {
+    return (Array.isArray(events)?events:[]).map(event=>({event,time:scanTimeInfo(event,deviceTz,now)}))
+      .sort((a,b)=>a.time.rank-b.time.rank||a.time.seconds-b.time.seconds||(a.event.date||'').localeCompare(b.event.date||'')||String(a.event.title).localeCompare(String(b.event.title)));
+  }
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

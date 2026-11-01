@@ -101,7 +101,17 @@ class TerminalTests(unittest.TestCase):
             self.assertTrue(repeat['already_bound'])
             self.assertEqual(len(web.db.get_stations()), 1)
             self.assertEqual(len(web.db.get_bindings(sid)), 1)
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(fetch.call_count, 4)  # resolution is refreshed before each confirmed binding
+
+    def test_rules_are_refreshed_before_binding(self):
+        first = {'title':'Manila','resolutionSource':'https://aviationweather.gov/api/data/metar?ids=RPLL'}
+        changed = {'title':'Manila','resolutionSource':'https://aviationweather.gov/api/data/metar?ids=KLGA'}
+        with patch.object(web, 'upstream', side_effect=[first, changed]):
+            self.assertEqual(self.client.post('/api/market-station/resolve',json={'slug':'market'}).get_json()['candidate']['code'],'RPLL')
+            response=self.client.post('/api/market-station/add',json={'slug':'market','code':'RPLL','confirm':True})
+        self.assertEqual(response.status_code,409)
+        self.assertEqual(web.db.get_stations(),[])
+        self.assertEqual(web.db.get_markets(),[])
 
     def test_market_first_reuses_station_and_preserves_custom_market_name(self):
         sid = web.db.add_station('New York', '', '', 'KLGA', 'metar')
