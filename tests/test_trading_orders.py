@@ -48,6 +48,67 @@ class OrderTests(unittest.TestCase):
         for changed in ({**EVENT,'closed':True},{**EVENT,'active':False}, {**EVENT,'markets':[{**EVENT['markets'][0],'acceptingOrders':False}]}):
             with self.assertRaises(orders.TradeError): orders.submit(BASE,changed)
 
+    def test_take_profit_is_explicit_single_gtc_sell_for_held_tokens(self):
+        orders.set_enabled(True)
+        self.client.get_balance_allowance.return_value={'balance':'10000000'}
+        body={**BASE,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
+        result=orders.submit(body,EVENT)
+        self.assertEqual(result['state'],'accepted');self.assertEqual(self.client.post_order.call_count,1)
+        params=self.client.get_balance_allowance.call_args.args[0]
+        self.assertEqual(params.asset_type,'CONDITIONAL');self.assertEqual(params.token_id,'1');self.assertEqual(params.signature_type,0)
+        self.assertEqual(self.client.update_balance_allowance.call_args.args[0],params)
+        row=orders.list_intents(account.load()['signer'])[0]
+        self.assertEqual(row['purpose'],'take_profit');self.assertEqual(row['side'],'SELL');self.assertEqual(row['order_type'],'GTC')
+        self.assertEqual(str(row['price']),'0.25');self.assertEqual(str(row['size']),'10')
+        self.assertEqual(orders.submit(body,EVENT)['state'],'accepted');self.assertEqual(self.client.post_order.call_count,1)
+        with self.assertRaises(orders.TradeError):orders.submit({**body,'nonce':'b'*32},EVENT)
+        self.assertEqual(self.client.post_order.call_count,1)
+
+    def test_take_profit_refuses_invalid_quantity_market_and_balance(self):
+        orders.set_enabled(True);self.client.get_balance_allowance.return_value={'balance':'10000000'}
+        body={**BASE,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
+        for changes in ({'confirm_take_profit':False},{'side':'BUY'},{'order_type':'FAK'},{'size':'4.99'},
+                        {'purpose':'other'},{'price':'0.251'},{'confirm':False}):
+            with self.subTest(changes=changes):
+                with self.assertRaises(orders.TradeError):orders.submit({**body,**changes},EVENT)
+        with self.assertRaises(orders.TradeError):orders.submit(body,{**EVENT,'closed':True})
+        for balance in [None,{}, {'balance':None},{'balance':True},{'balance':'9.0'},{'balance':'NaN'},{'balance':'9999999'}]:
+            self.client.get_balance_allowance.return_value=balance
+            with self.subTest(balance=balance):
+                with self.assertRaises(orders.TradeError):orders.submit(body,EVENT)
+        self.client.get_balance_allowance.side_effect=TimeoutError('private')
+        with self.assertRaises(orders.TradeError) as error:orders.submit(body,EVENT)
+        self.assertNotIn('private',str(error.exception))
+        self.client.create_order.assert_not_called();self.client.post_order.assert_not_called()
+        self.assertEqual(orders.list_intents(account.load()['signer']),[])
+
+    def test_take_profit_unknown_never_reposts_and_buy_reservation_blocks(self):
+        orders.set_enabled(True);self.client.get_balance_allowance.return_value={'balance':'20000000'}
+        orders.submit(BASE,EVENT)
+        tp={**BASE,'nonce':'b'*32,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
+        with self.assertRaises(orders.TradeError):orders.submit(tp,EVENT)
+        self.assertEqual(self.client.post_order.call_count,1)
+        with web.db.get_db() as conn:conn.execute("UPDATE web_order_reconciliation SET assessment='terminal' WHERE nonce=?",(BASE['nonce'],))
+        self.client.post_order.side_effect=TimeoutError()
+        self.assertEqual(orders.submit(tp,EVENT)['state'],'unknown')
+        self.assertEqual(orders.submit(tp,EVENT)['state'],'unknown')
+        with self.assertRaises(orders.TradeError):orders.submit({**tp,'nonce':'c'*32},EVENT)
+        self.assertEqual(self.client.post_order.call_count,2)
+
+    def test_intent_purpose_migration_preserves_existing_rows(self):
+        orders.set_enabled(True);orders.submit(BASE,EVENT);web.init_web_db();web.init_web_db()
+        row=orders.list_intents(account.load()['signer'])[0]
+        self.assertEqual(row['purpose'],'manual');self.assertTrue(orders.enabled())
+
+    def test_legacy_order_schema_migrates_with_existing_order(self):
+        with web.db.get_db() as conn:
+            conn.execute('DROP TABLE web_order_intents')
+            conn.execute("""CREATE TABLE web_order_intents(nonce TEXT PRIMARY KEY,wallet TEXT NOT NULL,slug TEXT NOT NULL,asset TEXT NOT NULL,side TEXT NOT NULL,price TEXT NOT NULL,size TEXT NOT NULL,order_type TEXT NOT NULL,state TEXT NOT NULL,order_id TEXT,created REAL NOT NULL,updated REAL NOT NULL)""")
+            conn.execute("INSERT INTO web_order_intents VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",('a'*32,account.load()['signer'],'test-event','1','BUY','0.25','10','GTC','accepted','0x'+'1'*64,1,1))
+        web.init_web_db();web.init_web_db()
+        row=orders.list_intents(account.load()['signer'])[0]
+        self.assertEqual(row['purpose'],'manual');self.assertEqual(row['order_id'],'0x'+'1'*64)
+
     def test_status_reads_show_partial_and_never_mutate_journal(self):
         orders.set_enabled(True);orders.submit(BASE,EVENT);rows=orders.list_intents(account.load()['signer'])
         oid='0x'+'1'*64

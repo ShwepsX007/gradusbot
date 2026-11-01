@@ -73,6 +73,9 @@ def init_web_db():
             nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, slug TEXT NOT NULL, asset TEXT NOT NULL,
             side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL, order_type TEXT NOT NULL,
             state TEXT NOT NULL, order_id TEXT, created REAL NOT NULL, updated REAL NOT NULL)''')
+        intent_columns={r['name'] for r in conn.execute('PRAGMA table_info(web_order_intents)')}
+        if 'purpose' not in intent_columns:
+            conn.execute("ALTER TABLE web_order_intents ADD COLUMN purpose TEXT NOT NULL DEFAULT 'manual'")
         conn.execute('''CREATE TABLE IF NOT EXISTS web_order_reconciliation (
             nonce TEXT PRIMARY KEY, expected_id TEXT, credential_fingerprint TEXT,
             assessment TEXT NOT NULL DEFAULT 'unverified', checked_at REAL,

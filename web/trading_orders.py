@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 
 import database as db
 from web import trading_account, order_reconciliation as reconciliation
-from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions, OrderPayload, OrderType
+from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions, OrderPayload, OrderType, AssetType, BalanceAllowanceParams
 
 
 class TradeError(Exception):
@@ -76,9 +76,9 @@ def _reserve(data, wallet):
             WHERE lower(i.wallet)=lower(?) AND i.asset=? AND
             (i.state IN ('pending','unknown') OR (i.state='accepted' AND (r.assessment IS NULL OR r.assessment!='terminal'))) LIMIT 1""",(wallet,data['asset'])).fetchone()
         if blocked: raise TradeError('По этому исходу есть незавершённая или несверенная заявка. Новая отправка заблокирована; проверьте журнал и Polymarket.')
-        conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
-                     (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now))
+        conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated,purpose)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                     (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now,data['purpose']))
     return None,True
 
 
@@ -89,7 +89,7 @@ def _finish(nonce,state,order_id=None):
 
 
 def public_intent(row):
-    return {k:row[k] for k in ('nonce','slug','asset','side','price','size','order_type','state','order_id','created','updated')}
+    return {k:row[k] for k in ('nonce','slug','asset','side','price','size','order_type','state','order_id','created','updated','purpose')}
 
 
 def find_intent(wallet, nonce):
@@ -143,6 +143,22 @@ def annotate_order_statuses(intents, credentials, limit=3):
     return intents
 
 
+def _check_take_profit_balance(client, credentials, asset, size):
+    """Refresh and check the conditional-token balance. This is not an atomic reservation."""
+    params=BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL,token_id=asset,signature_type=credentials['signature_type'])
+    try:
+        client.update_balance_allowance(params)
+        result=client.get_balance_allowance(params)
+        value=result.get('balance') if isinstance(result,dict) else None
+        if isinstance(value,bool) or not isinstance(value,(str,int)) or not re.fullmatch(r'[0-9]{1,40}',str(value)):
+            raise ValueError('invalid balance')
+        balance=Decimal(value)/Decimal(1000000)
+    except Exception:
+        raise TradeError('Не удалось проверить баланс долей в CLOB. Тейк не отправлен.') from None
+    if size>balance:
+        raise TradeError('Запрошено больше долей, чем показывает баланс CLOB. Тейк не отправлен.')
+
+
 def submit(body, event):
     if not isinstance(body,dict) or body.get('confirm') is not True: raise TradeError('Подтвердите отправку ордера.')
     nonce,slug,asset,selection=body.get('nonce'),body.get('slug'),body.get('asset'),body.get('selection')
@@ -152,7 +168,11 @@ def submit(body, event):
         raise TradeError('Неверный исход.')
     side,kind=body.get('side'),body.get('order_type')
     if side not in ('BUY','SELL') or kind not in ('GTC','FAK'): raise TradeError('Неверный тип ордера.')
-    if body.get('sl') or body.get('tp'): raise TradeError('SL/TP ещё не реализованы. Ордер не отправлен.')
+    purpose=body.get('purpose','manual')
+    if purpose not in ('manual','take_profit'): raise TradeError('Неверное назначение заявки.')
+    if purpose=='take_profit' and (side!='SELL' or kind!='GTC' or body.get('confirm_take_profit') is not True):
+        raise TradeError('Тейк для позиции — только подтверждённый лимитный SELL GTC.')
+    if body.get('sl') or body.get('tp'): raise TradeError('SL и автоматическая привязка тейка к BUY не реализованы. Ордер не отправлен.')
     price,size=parse_decimal(body.get('price')),parse_decimal(body.get('size'))
     if not 0<price<1 or not 0<size<=1000000 or size != size.quantize(Decimal('.01')):
         raise TradeError('Цена должна быть от 0 до 1, объём — положительным с точностью до 0,01 контракта.')
@@ -160,7 +180,7 @@ def submit(body, event):
     c=trading_account.load()
     if not c: raise TradeError('Сначала настройте аккаунт Polymarket.')
     wallet=c['funder'] or c['signer']
-    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind}
+    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind,'purpose':purpose}
     client=trading_account.build_client(c)
     try:
         book=client.get_order_book(asset)
@@ -173,6 +193,7 @@ def submit(body, event):
         if not isinstance(book.get('neg_risk'),bool): raise ValueError()
     except TradeError: raise
     except Exception: raise TradeError('Не удалось проверить параметры стакана. Ордер не отправлен.') from None
+    if purpose=='take_profit': _check_take_profit_balance(client,c,asset,size)
     try:
         lock_fd=reconciliation.acquire_order_lock(nonce)
     except (OSError,ValueError):

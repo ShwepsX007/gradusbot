@@ -217,6 +217,7 @@ function priceCents(value){const n=Number(value);return Number.isFinite(n)?new I
 function shares(value){if(value===null||value===undefined||value==='')return '—';const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n):'—'}
 let accountSnapshot=null,accountSnapshotAt=0,accountInFlight=null,accountAutoRefresh=false,tradeEnabled=false,tradeSending=false,accountGeneration=0,accountSource='';
 const cancelingOrders=new Set();
+let tpOrderIds=new Set();
 let renderedSnapshotStale=false;
 function confirmedMarketTokens(){
   const opts=marketData?.market?.options||[],pairs=bookData?.pairs||[],candidates=[];
@@ -247,7 +248,8 @@ function cancelButton(order){
 }
 function orderDescription(order){
   const remaining=orderRemaining(order),price=order.price==null?'—':priceCents(order.price);
-  return `${orderSide(order)} · ${price} · всего ${shares(order.original_size)} / сопоставлено ${shares(order.size_matched)} / не сопоставлено ${remaining===null?'—':shares(remaining)} шт. · ${order.status||'статус неизвестен'}`;
+  const isTp=typeof order.id==='string'&&tpOrderIds.has(order.id.toLowerCase());
+  return `${isTp?'Тейк · ':''}${orderSide(order)} · ${price} · всего ${shares(order.original_size)} / сопоставлено ${shares(order.size_matched)} / не сопоставлено ${remaining===null?'—':shares(remaining)} шт. · ${order.status||'статус неизвестен'}`;
 }
 function renderTradeOrders(){
   const target=$('#trade-live-orders'),tokens=confirmedMarketTokens(),orders=currentMarketOrders(tokens);
@@ -266,15 +268,17 @@ function renderTradeAccount(){
   const data=accountSnapshot,age=Math.max(0,Date.now()-accountSnapshotAt),stale=age>65000;
   balance.textContent=data.collateral_balance==null?'Недоступен':`${data.collateral_balance} pUSD`;
   updated.textContent=`Снимок: ${new Date(accountSnapshotAt).toLocaleTimeString('ru-RU')} · ${accountSource||'сверка'}${stale?' · УСТАРЕЛ':''} · доступный остаток может быть меньше`;
-  const opts=marketData?.market?.options||[],pairs=bookData?.pairs||[],tokens=new Map();
+  const opts=marketData?.market?.options||[],pairs=bookData?.pairs||[],tokens=new Map(),confirmed=confirmedMarketTokens();
   opts.forEach(o=>{const pair=pairs.find(p=>p.yes===o.token_yes&&p.no===o.token_no);if(pair){tokens.set(pair.yes,{label:o.label,side:'YES',book:bookFor(o,'yes')});tokens.set(pair.no,{label:o.label,side:'NO',book:bookFor(o,'no')})}});
   const ps=Array.isArray(data.positions)?data.positions.filter(p=>p.event_slug===state.market||tokens.has(p.asset)):null;
   if(!ps){positions.textContent='Позиции недоступны. Это не означает, что их нет.';return}
   if(!ps.length){positions.textContent=data.positions_maybe_partial?'В полученной странице позиция не найдена; снимок неполный.':'В полученном снимке нет позиций по этому событию.';return}
-  positions.innerHTML=ps.map(p=>{
+  positions.innerHTML=ps.map((p,i)=>{
     const t=tokens.get(p.asset),bid=t?.book?.bids?.[0],title=t?`${t.label} · ${t.side}`:`${p.title||'Позиция'} · ${p.outcome||'исход'}`;
-    return `<div class="trade-live-position"><b>${esc(title)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price==null?'—':esc(priceCents(p.avg_price))} · цена Data API ${p.current_price==null?'—':esc(priceCents(p.current_price))} · BID ${bid?esc(priceCents(bid.price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(shares(p.cash_pnl))+' USDC'}</span></div>`;
+    const action=confirmed.has(p.asset)&&Number.isFinite(Number(p.size))&&Number(p.size)>0?`<button type="button" class="button secondary trade-prepare-tp" data-index="${i}">Подготовить тейк</button>`:'';
+    return `<div class="trade-live-position"><b>${esc(title)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price==null?'—':esc(priceCents(p.avg_price))} · цена Data API ${p.current_price==null?'—':esc(priceCents(p.current_price))} · BID ${bid?esc(priceCents(bid.price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(shares(p.cash_pnl))+' USDC'}</span>${action}</div>`;
   }).join('')+(data.positions_maybe_partial?'<small>Список позиций неполный.</small>':'');
+  positions.querySelectorAll('.trade-prepare-tp').forEach(button=>button.onclick=()=>prepareTakeProfit(ps[Number(button.dataset.index)]));
 }
 function renderAccountSnapshot(refreshBook=true){
   const status=$('#account-status'),positions=$('#account-positions'),orders=$('#account-orders');
@@ -293,7 +297,7 @@ function renderAccountSnapshot(refreshBook=true){
     const p=ps[Number(button.dataset.index)];if(!p)return;
     const index=opts.findIndex(o=>{let pair=pairs.find(x=>x.yes===o.token_yes&&x.no===o.token_no);return pair&&(pair.yes===p.asset||pair.no===p.asset)});
     if(index<0)return;const option=opts[index],token=option.token_yes===p.asset?'yes':'no',book=bookFor(option,token),bid=book?.bids?.[0];
-    const d=getDraft();d.index=String(index);d.token=token;d.action='SELL';d.size=String(Math.floor(Number(p.size)*100)/100);d.price=bid?String(Math.round(Number(bid.price)*1000000)/10000):'';
+    const d=getDraft();clearTakeProfit(d);d.index=String(index);d.token=token;d.action='SELL';d.size=String(Math.floor(Number(p.size)*100)/100);d.price=bid?String(Math.round(Number(bid.price)*1000000)/10000):'';
     draftOptionsKey='';renderTradeDraft(marketData.market);$('#trade-send-status').textContent='Черновик продажи: проверьте количество, цену и свежесть позиции. До подтверждения ордер не отправляется.';$('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});
   });
 
@@ -332,11 +336,11 @@ async function loadMonitorStatus(){
     const labels={ok:'снимок получен',partial:'снимок получен с ошибками',stale:'нет свежего снимка',error:'ошибка',not_running:'не запущено',not_configured:'аккаунт не настроен',account_changed:'аккаунт изменён; нужна новая сверка'};
     const when=result.checked_at?` · ${new Date(result.checked_at*1000).toLocaleTimeString('ru-RU')}`:'';
     const interval=Number.isInteger(result.interval_seconds)?` · интервал ${result.interval_seconds} с`:'';
-    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}${interval}. Только чтение, SL/TP не выполняются.`;
+    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}${interval}. Только чтение. SL и авто-тейк на BUY не работают; выставленный SELL GTC исполняет биржа.`;
     if(!accountSnapshot&&result.snapshot&&['ok','partial'].includes(result.status)){
       accountSnapshot=result.snapshot;accountSnapshotAt=result.checked_at*1000;accountSource='фоновый монитор';renderAccountSnapshot();
     }
-  }catch(e){if(generation===accountGeneration)$('#trade-monitor-status').textContent='Фоновое наблюдение недоступно. SL/TP не выполняются.'}
+  }catch(e){if(generation===accountGeneration)$('#trade-monitor-status').textContent='Фоновое наблюдение недоступно. SL и авто-тейк на BUY не работают; выставленный SELL GTC остаётся на бирже.'}
 }
 
 
@@ -345,15 +349,21 @@ async function loadTradeJournal(){
     const slug=state.market;if(!slug){$('#trade-journal').innerHTML='';return}
     const data=await api('/api/trading/intents?slug='+encodeURIComponent(slug));if(state.market!==slug)return;
     const rows=(data.intents||[]).filter(x=>x.slug===slug);
+    tpOrderIds=new Set(rows.filter(x=>x.purpose==='take_profit'&&typeof x.order_id==='string'&&/^0x[0-9a-fA-F]{64}$/.test(x.order_id)).map(x=>x.order_id.toLowerCase()));renderTradeOrders();
     $('#trade-journal').innerHTML=rows.length?'<div class="account-list-title">ЖУРНАЛ ОТПРАВОК И СВЕРКА СДЕЛОК</div>'+rows.map(x=>{
       const state=x.state==='accepted'?'Подтверждён ордер CLOB':x.state==='not_sent'?'Не отправлен':'РЕЗУЛЬТАТ НЕИЗВЕСТЕН — не повторяйте';
+      const r=x.reconciliation;let tpStatus='';
+      if(x.purpose==='take_profit'){
+        const confirmed=r?.confirmed_size==null?null:Number(r.confirmed_size),failed=r?.failed_size==null?null:Number(r.failed_size),total=Number(x.size);
+        tpStatus=r?.assessment==='terminal'&&Number.isFinite(confirmed)&&confirmed===total&&failed===0?'ТЕЙК: ПОЛНОСТЬЮ ИСПОЛНЕН И ПОДТВЕРЖДЁН':confirmed>0&&confirmed<total?'Тейк: частичное исполнение подтверждено':confirmed===total&&total>0?'Тейк: объём подтверждён, окончательный статус ордера проверяется':'Тейк: исполнение не подтверждено';
+      }
       const ex=x.exchange?.available?` · CLOB: ${x.exchange.status}, сопоставлено ${x.exchange.size_matched} из ${x.exchange.original_size} шт. (не равно окончательному исполнению)`:x.exchange?' · Статус CLOB не получен':'';
-      const r=x.reconciliation, info=r?.size_matched!=null?` Сверка: ${r.order_status}, сопоставлено ${r.size_matched}; подтверждено ${r.confirmed_size}, ошибка ${r.failed_size} шт.`:'';
+      const info=r?.size_matched!=null?` Сверка: ${r.order_status}, сопоставлено ${r.size_matched}; подтверждено ${r.confirmed_size}, ошибка ${r.failed_size} шт.`:'';
       const reason=r?.reason?` ${r.reason}`:'';
       const id=x.order_id?` ID ${x.order_id}`:r?.expected_id?` Расчётный ID ${r.expected_id} (не доказательство отправки)`:` Запись ${x.nonce}`;
-      return `<div class="account-item"><b>${esc(x.side)} · ${esc(x.price)} pUSD · ${esc(x.size)} шт. · ${esc(x.order_type)}</b><span>${esc(state+ex+info+reason+id)}</span></div>`;
+      return `<div class="account-item"><b>${x.purpose==='take_profit'?'ТЕЙК · ':''}${esc(x.side)} · ${esc(x.price)} pUSD · ${esc(x.size)} шт. · ${esc(x.order_type)}</b><span>${esc((tpStatus?tpStatus+' · ':'')+state+ex+info+reason+id)}</span></div>`;
     }).join(''):'';
-  }catch(e){$('#trade-journal').textContent='Журнал отправок недоступен.'}
+  }catch(e){tpOrderIds=new Set();renderTradeOrders();$('#trade-journal').textContent='Журнал отправок недоступен.'}
 }
 function newTradeNonce(){const a=new Uint8Array(16);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}
 $('#trade-submit').onclick=async()=>{
@@ -361,13 +371,18 @@ $('#trade-submit').onclick=async()=>{
   if(d.index===''||!o||!bookFor(o,d.token)){toast('Выберите подтверждённый исход с доступным стаканом.');return}
   const price=Number(d.price),size=Number(d.size),asset=d.token==='yes'?o.token_yes:o.token_no;
   if(!Number.isFinite(price)||price<=0||price>=100||!Number.isFinite(size)||size<=0){toast('Укажите допустимую цену и количество.');return}
-  if(!confirm(`РЕАЛЬНЫЙ ОРДЕР: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · ${d.action} · ${d.type} · ${d.price}¢ · ${d.size} контрактов. SL/TP не активны. Отправить?`))return;
-  const body={slug:state.market,asset,selection:d.token,side:d.action,order_type:d.type,price:(price/100).toFixed(6),size:d.size,nonce:newTradeNonce(),confirm:true};
+  const takeProfit=d.purpose==='take_profit';
+  if(takeProfit&&(d.action!=='SELL'||d.type!=='GTC'||d.tpAsset!==asset)){toast('Параметры тейка изменены; подготовьте его из позиции заново.');return}
+  if(takeProfit&&(!accountSnapshot||Date.now()-accountSnapshotAt>65000)){toast('Снимок позиции устарел. Обновите счёт и проверьте количество.');return}
+  const message=takeProfit?`РЕАЛЬНЫЙ ТЕЙК: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · SELL GTC · минимум ${d.price}¢ · ${d.size} долей. Может исполниться сразу; комиссия может уменьшить прибыль. Ордер останется на бирже при закрытии страницы и выключении торговли. Отправить?`:`РЕАЛЬНЫЙ ОРДЕР: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · ${d.action} · ${d.type} · ${d.price}¢ · ${d.size} контрактов. SL и авто-тейк на BUY не активны. Отправить?`;
+  if(!confirm(message))return;
+  const body={slug:state.market,asset,selection:d.token,side:d.action,order_type:d.type,price:(price/100).toFixed(6),size:d.size,nonce:newTradeNonce(),confirm:true,...(takeProfit?{purpose:'take_profit',confirm_take_profit:true}:{})};
   tradeSending=true;updateTradingControls();$('#trade-send-status').textContent='Отправляем заявку. Не закрывайте страницу и не повторяйте запрос.';
   try{const result=await api('/api/trading/orders',{method:'POST',body:JSON.stringify(body)});
+    if(takeProfit){clearTakeProfit(d);d.price='';d.size='';draftOptionsKey='';renderTradeDraft(marketData.market)}
     $('#trade-send-status').textContent=result.state==='accepted'?`Ордер принят CLOB: ${result.order_id}. Это не подтверждение исполнения; проверьте заявки и сделки.`:'Результат неизвестен. Не повторяйте заявку — проверьте Polymarket и журнал.';
     await loadAccountSnapshot();await loadTradeJournal();
-  }catch(err){$('#trade-send-status').textContent=err.message+' Если результат запроса неизвестен, не повторяйте: проверьте Polymarket и журнал.';await loadTradeJournal()}
+  }catch(err){if(takeProfit){clearTakeProfit(d);d.price='';d.size='';draftOptionsKey='';renderTradeDraft(marketData?.market)}$('#trade-send-status').textContent=err.message+' Если результат запроса неизвестен, не повторяйте: проверьте Polymarket и журнал.';await loadTradeJournal()}
   finally{tradeSending=false;updateTradingControls()}
 };
 
@@ -375,6 +390,21 @@ setInterval(()=>{if(accountAutoRefresh&&!document.hidden&&!$('#weather-page').cl
 setInterval(()=>{if(accountSnapshot&&(Date.now()-accountSnapshotAt>65000)!==renderedSnapshotStale)renderAccountSnapshot()},15000);
 let draftMarket=null,draftOptionsKey='',tradeDrafts=new Map(),draftMarketOptions=new Map();
 function getDraft(){if(!tradeDrafts.has(state.market))tradeDrafts.set(state.market,{index:'',token:'yes',action:'BUY',type:'GTC',price:'',size:'',sl:'',tp:''});return tradeDrafts.get(state.market)}
+function clearTakeProfit(d){if(d.purpose==='take_profit')$('#trade-send-status').textContent='Режим тейка снят. При необходимости подготовьте его из позиции заново.';d.purpose='manual';d.tpAsset=null}
+function renderTakeProfitMode(){
+  const active=getDraft().purpose==='take_profit',note=$('#tp-draft-note');note.classList.toggle('hidden',!active);
+  note.textContent=active?'ТЕЙК ДЛЯ КУПЛЕННЫХ ДОЛЕЙ: введите минимальную цену продажи в поле «Цена». Будет выставлен реальный SELL GTC; он может исполниться сразу или частично. Комиссии могут уменьшить прибыль. Не добавляет защиту к незавершённому BUY.':'';
+}
+function prepareTakeProfit(position){
+  if(!position||!accountSnapshot||Date.now()-accountSnapshotAt>65000){toast('Обновите снимок аккаунта перед подготовкой тейка.');return}
+  const match=confirmedMarketTokens().get(position.asset),qty=Number(position.size);
+  if(!match||!Number.isFinite(qty)||qty<=0){toast('Не удалось подтвердить исход и количество позиции.');return}
+  const amount=Math.floor(qty*100)/100;if(amount<=0){toast('Количество позиции меньше доступной точности заявки.');return}
+  const opts=marketData?.market?.options||[],index=opts.indexOf(match.option);if(index<0)return;
+  const d=getDraft();d.index=String(index);d.token=match.token;d.action='SELL';d.type='GTC';d.size=String(amount);d.price='';d.purpose='take_profit';d.tpAsset=position.asset;
+  draftOptionsKey='';renderTradeDraft(marketData.market);renderTakeProfitMode();$('#trade-send-status').textContent='Черновик тейка: укажите цену продажи и проверьте количество. До подтверждения ордер не отправляется.';
+  $('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});$('#trade-price').focus();
+}
 function draftEstimate(){
   const d=getDraft(),price=Number(d.price),size=Number(d.size);
   $('#trade-estimate').textContent=d.price!==''&&d.size!==''&&price>0&&price<100&&size>0?`Оценка: ${(price*size/100).toLocaleString('ru-RU',{maximumFractionDigits:4})} USDC без комиссий · не ордер`:'Укажите цену и количество для оценки суммы.';
@@ -389,15 +419,15 @@ function renderTradeDraft(m){
   $('#trade-option').innerHTML='<option value="">Выберите исход</option>'+opts.map((o,i)=>`<option value="${i}">${esc(o.label)}</option>`).join('');
   if(m&&(!opts[Number(d.index)]||d.index===''))d.index='';
   for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']])$('#trade-'+id).value=d[key];
-  draftEstimate();
+  draftEstimate();renderTakeProfitMode();
 }
 for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']]){
-  $('#trade-'+id).addEventListener('input',e=>{getDraft()[key]=e.currentTarget.value;draftEstimate()});
+  $('#trade-'+id).addEventListener('input',e=>{const d=getDraft();d[key]=e.currentTarget.value;if(['option','token','action','type'].includes(id)&&d.purpose==='take_profit'){clearTakeProfit(d);$('#trade-send-status').textContent='Режим тейка отключён из-за изменения исхода, стороны или типа заявки. Подготовьте тейк заново.'}draftEstimate();renderTakeProfitMode()});
 }
 function pickBookPrice(index,token,side,price){
   if(state.demo||!marketData?.market?.options?.[index]||!bookFor(marketData.market.options[index],token))return;
   const n=Number(price);if(!Number.isFinite(n)||n<=0||n>=1)return;
-  const d=getDraft();d.index=String(index);d.token=token;d.action=side==='ask'?'BUY':'SELL';d.price=String(Math.round(n*1000000)/10000);
+  const d=getDraft();clearTakeProfit(d);d.index=String(index);d.token=token;d.action=side==='ask'?'BUY':'SELL';d.price=String(Math.round(n*1000000)/10000);
   draftOptionsKey='';renderTradeDraft(marketData.market);
   $('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});
 }
@@ -636,27 +666,27 @@ $('#account-form').onsubmit=async e=>{
   data.auto_api=$('#account-api-mode').value==='auto';
   if(!confirm('Сохранить приватный ключ на сервере в незашифрованном файле с ограниченными правами?'))return;
   button.disabled=true;
-  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL/TP не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
+  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL и авто-тейк на BUY не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#account-delete').onclick=async e=>{
   const f=$('#account-form'),button=e.currentTarget,password=f.elements.current_password.value;
   if(!password){toast('Введите текущий пароль терминала');return}
   if(!confirm('Удалить сохранённые ключи с сервера? Открытые ордера и позиции на бирже не изменятся.'))return;
-  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL/TP не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
+  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL и авто-тейк на BUY не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#monitor-interval-form').onsubmit=async e=>{
   e.preventDefault();const form=e.currentTarget,button=form.querySelector('button'),n=Number(form.elements.interval_seconds.value);
   if(!Number.isInteger(n)||n<15||n>300){$('#monitor-interval-status').textContent='Укажите целое число секунд от 15 до 300.';return}
   button.disabled=true;
-  try{const result=await api('/api/trading/monitor-interval',{method:'POST',body:JSON.stringify({interval_seconds:n,confirm:true})});form.elements.interval_seconds.value=result.interval_seconds;$('#monitor-interval-status').textContent='Сохранено. Служба применит изменение при следующей проверке; SL/TP не работают.';await loadMonitorStatus()}
+  try{const result=await api('/api/trading/monitor-interval',{method:'POST',body:JSON.stringify({interval_seconds:n,confirm:true})});form.elements.interval_seconds.value=result.interval_seconds;$('#monitor-interval-status').textContent='Сохранено. Служба применит изменение при следующей проверке; SL и авто-тейк на BUY не работают.';await loadMonitorStatus()}
   catch(err){$('#monitor-interval-status').textContent=err.message}
   finally{button.disabled=false}
 };
 $('#trade-control-form').onsubmit=async e=>{
   e.preventDefault();const f=e.currentTarget,button=f.querySelector('button'),on=f.elements.enabled.value==='true';
-  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? Модуль не проверен на бирже, SL/TP и автономный мониторинг не работают.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
+  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? SL и авто-тейк на BUY не работают; лимитный тейк — реальный SELL GTC.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
   button.disabled=true;try{const result=await api('/api/trading/control',{method:'POST',body:JSON.stringify({enabled:on,confirm:true,current_password:f.elements.current_password.value})});f.elements.current_password.value='';tradeEnabled=result.enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';renderAccountSnapshot()}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };

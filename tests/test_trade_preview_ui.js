@@ -3,6 +3,7 @@ const assert=require('assert'),fs=require('fs'),{JSDOM,VirtualConsole}=require('
 const vc=new VirtualConsole();vc.on('jsdomError',e=>{throw e});
 const dom=new JSDOM(fs.readFileSync('web/static/index.html','utf8'),{url:'http://127.0.0.1:8108',runScripts:'outside-only',pretendToBeVisual:true,virtualConsole:vc});
 const w=dom.window;let requests=[],accountFails=false,cancelMode='unknown',alerts=[],deferAccount=false,releaseAccount=null;
+let accountPositionSize=2,journalRows=null;
 const fixedNow=Date.parse('2026-06-01T12:00:00Z'),NativeDate=w.Date;
 w.Date=class extends NativeDate{constructor(...args){super(...(args.length?args:[fixedNow]))}static now(){return fixedNow}};
 const id1='0x'+'1'.repeat(64),id2='0x'+'2'.repeat(64),id3='0x'+'3'.repeat(64);
@@ -23,7 +24,7 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
  if(url==='/api/session')data={csrf:'test'};
  else if(url==='/api/settings')data={units:'C'};
  else if(url==='/api/security-info')data={tunnel:true,trading_enabled:false};
- else if(url.startsWith('/api/trading/intents?'))data={intents:[{slug:'first',state:'accepted',side:'BUY',price:'0.25',size:'10',order_type:'GTC',order_id:'0x123',exchange:{available:true,status:'LIVE',original_size:'10',size_matched:'3.25'},reconciliation:{assessment:'active',order_status:'LIVE',size_matched:'3.25',confirmed_size:'2',failed_size:'0',reason:'Расчёт ещё не завершён.'}}]};
+ else if(url.startsWith('/api/trading/intents?'))data={intents:journalRows||[{slug:'first',state:'accepted',side:'BUY',price:'0.25',size:'10',order_type:'GTC',order_id:'0x123',exchange:{available:true,status:'LIVE',original_size:'10',size_matched:'3.25'},reconciliation:{assessment:'active',order_status:'LIVE',size_matched:'3.25',confirmed_size:'2',failed_size:'0',reason:'Расчёт ещё не завершён.'}}]};
  else if(url==='/api/copy-observer'&&o.method==='POST')data={wallet:'0x'+'a'.repeat(40)};
  else if(url==='/api/copy-observer')data={service:'running',service_checked_at:fixedNow/1000,leaders:[{id:1,label:'<img id=bad>',wallet:'0x'+'a'.repeat(40),enabled:1,interval_seconds:30,status:'ok',last_success:fixedNow/1000,mode:'percent',amount:'20',cap:'5'}],signals:[{side:'BUY',outcome:'Yes',title:'<img id=bad2>',label:'Leader',size:'10',price:'0.4',timestamp:fixedNow/1000,observed_at:fixedNow/1000,transaction_hash:'0xabc',estimate:{desired_shares:'2',desired_value:'0.8',available_shares:'8',best_price:'0.4',book_at:fixedNow/1000,capped:false}}]};
  else if(url.startsWith('/api/copy-observer/'))data={ok:true};
@@ -39,7 +40,7 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
  else if(url==='/api/trading/account-config')data={configured:false};
  else if(url==='/api/trading/account'&&accountFails)return {status:503,ok:false,json:async()=>({error:'нет связи'})};
  else if(url==='/api/trading/account'){
-   data={wallet:'0x111',collateral_balance:'12.345678',orders_first_page:true,positions_maybe_partial:false,errors:[],positions:[{event_slug:'first',title:'Manila',outcome:'Yes',asset:'101',size:2,avg_price:0.24,current_price:0.3,cash_pnl:0.6}],orders:accountOrders};
+   data={wallet:'0x111',collateral_balance:'12.345678',orders_first_page:true,positions_maybe_partial:false,errors:[],positions:[{event_slug:'first',title:'Manila',outcome:'Yes',asset:'101',size:accountPositionSize,avg_price:0.24,current_price:0.3,cash_pnl:0.6}],orders:accountOrders};
    if(deferAccount){deferAccount=false;await new Promise(resolve=>{releaseAccount=resolve})}
  }
  else if(url==='/api/stations')data=[station];
@@ -53,7 +54,7 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
 w.eval(fs.readFileSync('web/static/weather.js','utf8'));w.eval(fs.readFileSync('web/static/app.js','utf8'));
 const tick=()=>new Promise(r=>setTimeout(r,40));
 (async()=>{await tick();await tick();
- assert(w.document.querySelector('#trade-preview').textContent.includes('SL/TP пока не работают'));
+ assert(w.document.querySelector('#trade-preview').textContent.includes('авто-тейк на открытый BUY не работают'));
  assert(w.document.querySelector('#trade-sl').disabled);
  assert(w.document.querySelector('#trade-submit').disabled);
  assert.equal(w.document.querySelector('#sun-dot').getAttribute('r'),'10');assert.equal(w.document.querySelector('#sun-glow').getAttribute('r'),'13.5');
@@ -72,7 +73,7 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert(w.document.querySelector('#trade-live-positions').textContent.includes('BID 20'));
  assert(w.document.querySelector('#trade-live-updated').textContent.includes('Снимок:'));
  assert(w.document.querySelector('#trade-monitor-status').textContent.includes('снимок получен'));
- assert(w.document.querySelector('#trade-monitor-status').textContent.includes('SL/TP не выполняются'));
+ assert(w.document.querySelector('#trade-monitor-status').textContent.includes('авто-тейк на BUY не работают'));
  assert(w.document.querySelector('#trade-preview #trade-journal'));
  assert(w.document.querySelector('#trade-journal').textContent.includes('сопоставлено 3.25 из 10'));
  assert(w.document.querySelector('#trade-journal').textContent.includes('подтверждено 2, ошибка 0'));
@@ -127,7 +128,7 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  const intervalForm=w.document.querySelector('#monitor-interval-form');assert.equal(intervalForm.elements.interval_seconds.value,'30');
  intervalForm.elements.interval_seconds.value='45';intervalForm.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
  const intervalPost=requests.find(([url,o])=>url==='/api/trading/monitor-interval'&&o.method==='POST');assert(intervalPost);assert.deepEqual(JSON.parse(intervalPost[1].body),{interval_seconds:45,confirm:true});
- assert(intervalForm.textContent.includes('SL/TP не работают'));
+ assert(intervalForm.textContent.includes('авто-тейк на BUY не работают'));
  const form=w.document.querySelector('#account-form');
  assert.equal(form.elements.signature_type.value,'');
  const mode=w.document.querySelector('#account-api-mode');
@@ -171,6 +172,33 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
 
 
 
+ // A real, explicitly confirmed GTC sell can be prepared only from a position.
+ accountFails=false;accountPositionSize=6;
+ journalRows=[{slug:'first',purpose:'take_profit',state:'accepted',side:'SELL',price:'0.50',size:'6',order_type:'GTC',order_id:id3,exchange:{available:true,status:'LIVE',original_size:'6',size_matched:'3'},reconciliation:{assessment:'active',order_status:'LIVE',size_matched:'3',confirmed_size:'2',failed_size:'0',reason:'ещё открыт'}}];
+ w.document.querySelector('#trade-live-refresh').click();await tick();await tick();
+ assert(w.document.querySelector('#trade-journal').textContent.includes('Тейк: частичное исполнение подтверждено'));
+ assert(w.document.querySelector('#trade-live-orders').textContent.includes('Тейк · Продажа'));
+ const tp=w.document.querySelector('.trade-prepare-tp');assert(tp);tp.click();
+ assert.equal(w.document.querySelector('#trade-action').value,'SELL');assert.equal(w.document.querySelector('#trade-type').value,'GTC');
+ assert.equal(w.document.querySelector('#trade-size').value,'6');assert.equal(w.document.querySelector('#trade-price').value,'');
+ assert(w.document.querySelector('#tp-draft-note').textContent.includes('реальный SELL GTC'));
+ const price=w.document.querySelector('#trade-price');price.value='50';price.dispatchEvent(new w.Event('input'));
+ const beforeTp=requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length;
+ w.confirm=()=>false;w.document.querySelector('#trade-submit').click();await tick();
+ assert.equal(requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length,beforeTp);
+ let confirmText='';w.confirm=message=>{confirmText=message;return true};w.document.querySelector('#trade-submit').click();await tick();await tick();
+ const posts=requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST');assert.equal(posts.length,beforeTp+1);
+ const tpBody=JSON.parse(posts[posts.length-1][1].body);assert.equal(tpBody.purpose,'take_profit');assert.equal(tpBody.confirm_take_profit,true);assert.equal(tpBody.side,'SELL');assert.equal(tpBody.order_type,'GTC');assert.equal(tpBody.price,'0.500000');assert.equal(tpBody.size,'6');
+ assert(confirmText.includes('Может исполниться сразу'));assert(confirmText.includes('выключении торговли'));
+ assert(w.document.querySelector('#tp-draft-note').classList.contains('hidden'));
+ journalRows[0].reconciliation={assessment:'terminal',order_status:'MATCHED',size_matched:'6',confirmed_size:'6',failed_size:'0'};
+ w.document.querySelector('#trade-live-refresh').click();await tick();await tick();
+ assert(w.document.querySelector('#trade-journal').textContent.includes('ПОЛНОСТЬЮ ИСПОЛНЕН И ПОДТВЕРЖДЁН'));
+ // Changing the outcome removes the TP designation rather than silently selling another token as TP.
+ w.document.querySelector('.trade-prepare-tp').click();const token=w.document.querySelector('#trade-token');token.value='no';token.dispatchEvent(new w.Event('input'));
+ assert(w.document.querySelector('#tp-draft-note').classList.contains('hidden'));
+ assert(w.document.querySelector('#trade-send-status').textContent.includes('Режим тейка отключён'));
+ w.confirm=()=>true;
  const tradePostsBeforeCopy=requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length;
  w.document.querySelector('[data-page="copy"]').click();await tick();
  assert(w.document.querySelector('#copy-page').textContent.includes('Реальные заявки не отправляются'));
