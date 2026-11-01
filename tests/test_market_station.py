@@ -60,6 +60,8 @@ class AviationSourceTests(unittest.TestCase):
               'https://evil.example/api/data/metar?ids=RPLL',
               'https://aviationweather.gov/api/data/taf?ids=RPLL',
               'https://aviationweather.gov/api/data/metar?ids=RPLL1',
+              'https://aviationweather.gov/api/data/metar?ids=RPLL,INVALID',
+              'https://aviationweather.gov/api/data/metar?ids=RPLL&ids=',
               'https://user@aviationweather.gov/api/data/metar?ids=RPLL']
         for url in urls:
             with self.subTest(url=url): self.assertEqual(identify_station({'resolutionSource':url})['status'],'unknown')
