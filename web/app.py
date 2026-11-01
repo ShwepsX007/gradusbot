@@ -59,6 +59,14 @@ def init_web_db():
             PRIMARY KEY (station_id, day))''')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_auth_password (
             id INTEGER PRIMARY KEY CHECK(id=1), password_hash TEXT NOT NULL)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_trading_control (
+            id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0)''')
+        conn.execute('INSERT OR IGNORE INTO web_trading_control(id,enabled) VALUES(1,0)')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_order_intents (
+            nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, slug TEXT NOT NULL, asset TEXT NOT NULL,
+            side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL, order_type TEXT NOT NULL,
+            state TEXT NOT NULL, order_id TEXT, created REAL NOT NULL, updated REAL NOT NULL)''')
+
 
 
 init_web_db()
@@ -259,7 +267,10 @@ def session_info():
 
 @app.get('/api/security-info')
 def security_info():
-    return jsonify(tunnel=bool(trusted_ssh_tunnel()), trading_enabled=False)
+    tunnel=bool(trusted_ssh_tunnel())
+    if not tunnel: return jsonify(tunnel=False, trading_enabled=False)
+    from web import trading_orders
+    return jsonify(tunnel=True, trading_enabled=trading_orders.enabled())
 
 
 @app.route('/api/trading/account-config', methods=['GET', 'POST', 'DELETE'])
@@ -279,6 +290,8 @@ def trading_account_config():
     except (ValueError, TypeError): valid = False
     if not valid: return jsonify(error='Неверный пароль терминала.'), 400
     try:
+        from web import trading_orders
+        trading_orders.set_enabled(False)  # credentials are changing; a fresh opt-in is required
         if request.method == 'DELETE':
             trading_account.delete()
             info = {'configured':False}
@@ -301,6 +314,76 @@ def trading_account_snapshot():
     except Exception:
         app.logger.warning('Account snapshot failed')
         return jsonify(error='Аккаунт временно недоступен.'), 503
+
+
+@app.post('/api/trading/control')
+def trading_control():
+    if not trusted_ssh_tunnel(): return jsonify(error='Торговля доступна только через SSH-туннель.'), 403
+    from web import trading_account, trading_orders
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or not isinstance(data.get('enabled'),bool) or data.get('confirm') is not True:
+        return jsonify(error='Требуется явное подтверждение.'), 400
+    if not login_allowed('trade-control:'+(request.remote_addr or 'unknown')):
+        return jsonify(error='Слишком много попыток. Повторите позже.'),429
+    password=data.get('current_password')
+    try: valid=isinstance(password,str) and len(password)<=256 and check_password_hash(current_password_hash(),password)
+    except (ValueError,TypeError): valid=False
+    if not valid: return jsonify(error='Неверный пароль терминала.'),400
+    try:
+        if data['enabled'] and not trading_account.load(): return jsonify(error='Сначала настройте аккаунт Polymarket.'),400
+        trading_orders.set_enabled(data['enabled'])
+    except trading_orders.TradeError as exc: return jsonify(error=str(exc)),400
+    except Exception: return jsonify(error='Не удалось изменить настройку торговли.'),503
+    with _login_lock: _login_attempts.pop('trade-control:'+(request.remote_addr or 'unknown'),None)
+    return jsonify(enabled=data['enabled'])
+
+
+@app.get('/api/trading/intents')
+def trading_intents():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import trading_account, trading_orders
+    try:
+        c=trading_account.load()
+        if not c: return jsonify(intents=[])
+        return jsonify(intents=trading_orders.list_intents(c['funder'] or c['signer']))
+    except Exception: return jsonify(error='Не удалось получить журнал заявок.'),503
+
+
+@app.post('/api/trading/orders')
+def trading_submit_order():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import trading_orders
+    if not trading_orders.enabled(): return jsonify(error='Торговля выключена в настройках.'),403
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or not isinstance(data.get('slug'),str) or not re.fullmatch(r'[a-z0-9-]{1,200}',data['slug']):
+        return jsonify(error='Неверное событие.'),400
+    # A retry must return the previously persisted state before any network call.
+    try:
+        from web import trading_account
+        c=trading_account.load()
+        if c:
+            prior=trading_orders.find_intent(c['funder'] or c['signer'],data.get('nonce'))
+            if prior: return jsonify(prior)
+    except Exception:
+        return jsonify(error='Не удалось проверить журнал. Не повторяйте заявку до сверки.'),503
+    event=event_for_station(data['slug'],fresh=True)
+    if not event: return jsonify(error='Не удалось проверить событие. Ордер не отправлен.'),503
+    try: return jsonify(trading_orders.submit(data,event))
+    except trading_orders.TradeError as exc: return jsonify(error=str(exc)),400
+    except Exception:
+        app.logger.error('Order request failed; do not retry without reconciliation')
+        return jsonify(error='Не удалось определить состояние заявки. Проверьте Polymarket перед повтором.'),503
+
+
+@app.post('/api/trading/cancel')
+def trading_cancel_order():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import trading_orders
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or data.get('confirm') is not True: return jsonify(error='Подтвердите отмену.'),400
+    try: return jsonify(trading_orders.cancel(data.get('order_id')))
+    except trading_orders.TradeError as exc: return jsonify(error=str(exc)),400
+    except Exception: return jsonify(error='Результат отмены неизвестен. Проверьте ордер на Polymarket.'),503
 
 
 @app.post('/api/change-password')

@@ -79,8 +79,22 @@ def validate(data):
             'funder':funder, **api}
 
 
+def derive_api_credentials(data):
+    # Validate the wallet before contacting CLOB. The placeholders never leave
+    # this process; credentials returned by the SDK are not logged or sent to UI.
+    checked = validate({**data, 'api_key':'placeholder', 'api_secret':'placeholder', 'api_passphrase':'placeholder'})
+    logging.getLogger('py_clob_client_v2.http_helpers.helpers').setLevel(logging.CRITICAL)
+    try:
+        client = ClobClient(host=HOST, chain_id=POLYGON, key=checked['private_key'], retry_on_error=False)
+        keys = client.create_or_derive_api_key(nonce=0)
+        derived = {**data, 'api_key':keys.api_key, 'api_secret':keys.api_secret, 'api_passphrase':keys.api_passphrase}
+        return validate(derived)
+    except Exception:
+        raise AccountError('Не удалось получить ключи CLOB автоматически. Проверьте связь с Polymarket или введите ключи вручную.') from None
+
+
 def save(data):
-    credentials = validate(data)
+    credentials = derive_api_credentials(data) if isinstance(data, dict) and data.get('auto_api') is True else validate(data)
     directory = _private_directory(create=True)
     # Validate existing destination first; never follow symlinks or trust weak permissions.
     if os.path.lexists(os.path.join(directory, 'account.json')):
