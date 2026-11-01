@@ -16,7 +16,13 @@ class TerminalTests(unittest.TestCase):
         web.db.init_db()
         web.init_web_db()
         web._cache.clear()
+        web.app.config.update(WEB_AUTH_CONFIGURED=True, WEB_USERNAME='testuser', WEB_PASSWORD_HASH='testhash')
         self.client = web.app.test_client()
+        with self.client.session_transaction() as sess:
+            sess['auth_user'] = 'testuser'
+            sess['auth_version'] = web.auth_version()
+            sess['csrf'] = 'test-csrf'
+        self.client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
 
     def tearDown(self):
         web.db.DB_FILE = self.old_db

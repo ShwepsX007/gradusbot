@@ -1,5 +1,8 @@
 """Local, read-only trading companion for the existing Gradus bot."""
 import math
+import hashlib
+import hmac
+import secrets
 import os
 import re
 import sys
@@ -8,8 +11,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, render_template, redirect, session, url_for
 import requests
+from werkzeug.security import check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
@@ -18,6 +23,23 @@ from web.weather import cloud_description, precipitation_description
 from web.market_station import identify_station
 
 app = Flask(__name__, static_folder='static')
+# Authentication is fail-closed; a missing or weak secret never enables the panel.
+_auth_secret = os.environ.get('GRADUS_SESSION_SECRET', '')
+app.config.update(
+    SECRET_KEY=_auth_secret or secrets.token_urlsafe(48),
+    WEB_USERNAME=os.environ.get('GRADUS_USERNAME', ''),
+    WEB_PASSWORD_HASH=os.environ.get('GRADUS_PASSWORD_HASH', ''),
+    WEB_AUTH_CONFIGURED=bool(len(_auth_secret) >= 32 and os.environ.get('GRADUS_USERNAME') and os.environ.get('GRADUS_PASSWORD_HASH')),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_REFRESH_EACH_REQUEST=False,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.environ.get('WEB_COOKIE_SECURE', '1') != '0',
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
+# Enable ONLY when a trusted reverse proxy is the sole entry to Gunicorn.
+if os.environ.get('WEB_TRUST_PROXY') == '1':
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 db.init_db()
 
 
@@ -89,22 +111,130 @@ def humidity(temp, dew):
         return None
 
 
+_login_lock = threading.Lock()
+_login_attempts = {}
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_ATTEMPTS = 5
+
+
+def auth_version():
+    material = app.config['WEB_USERNAME'] + '\0' + app.config['WEB_PASSWORD_HASH']
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def is_authenticated():
+    return session.get('auth_user') == app.config['WEB_USERNAME'] and hmac.compare_digest(str(session.get('auth_version', '')), auth_version())
+
+
+def csrf_token():
+    token = session.get('csrf')
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session['csrf'] = token
+    return token
+
+
+def login_allowed(address):
+    now = time.monotonic()
+    with _login_lock:
+        # Bound memory even under distributed scans; this limit is per process.
+        if len(_login_attempts) >= 4096:
+            for key in list(_login_attempts):
+                if not any(now - t < LOGIN_WINDOW_SECONDS for t in _login_attempts[key]):
+                    del _login_attempts[key]
+        if address not in _login_attempts and len(_login_attempts) >= 4096:
+            return False
+        hits = [t for t in _login_attempts.get(address, []) if now - t < LOGIN_WINDOW_SECONDS]
+        if len(hits) >= LOGIN_ATTEMPTS:
+            _login_attempts[address] = hits
+            return False
+        hits.append(now)
+        _login_attempts[address] = hits
+        return True
+
+
+def origin_ok():
+    origin = request.headers.get('Origin')
+    if not origin:
+        return True  # Non-browser clients still need the unpredictable CSRF token.
+    try:
+        parsed = urlparse(origin)
+        return parsed.scheme == request.scheme and parsed.netloc == request.host
+    except ValueError:
+        return False
+
+
 @app.after_request
 def security(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'same-origin'
     return response
 
 
 @app.before_request
-def guard_mutations():
+def access_control():
+    if not app.config['WEB_AUTH_CONFIGURED']:
+        return 'Вход не настроен. Настройте GRADUS_USERNAME, GRADUS_PASSWORD_HASH и GRADUS_SESSION_SECRET на сервере.', 503
+    public = request.endpoint == 'login' or request.path == '/static/login.css'
+    if not public and not is_authenticated():
+        if request.path.startswith('/api/'):
+            return jsonify(error='Требуется вход'), 401
+        return redirect(url_for('login'))
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
-        # Block cross-origin browser requests, including simple form submissions.
-        origin = request.headers.get('Origin')
-        if origin and urlparse(origin).netloc != request.host:
+        if not origin_ok():
             return jsonify(error='Недопустимый источник запроса'), 403
-        if not request.is_json:
-            return jsonify(error='Требуется JSON'), 415
+        if request.endpoint == 'login':
+            supplied = request.form.get('csrf_token', '')
+        else:
+            if not request.is_json:
+                return jsonify(error='Требуется JSON'), 415
+            supplied = request.headers.get('X-CSRF-Token', '')
+        expected = session.get('csrf', '')
+        if not expected or not supplied or not hmac.compare_digest(str(expected).encode('utf-8'), str(supplied).encode('utf-8')):
+            return jsonify(error='Проверка безопасности не пройдена. Обновите страницу.'), 403
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if is_authenticated():
+        return redirect(url_for('index'))
+    error = None
+    status = 200
+    if request.method == 'POST':
+        address = request.remote_addr or 'unknown'
+        if not login_allowed(address):
+            error, status = 'Слишком много попыток. Попробуйте через 15 минут.', 429
+        else:
+            username = request.form.get('username', '')
+            password = request.form.get('password', '')
+            # Verify the hash even for an incorrect username to reduce timing leakage.
+            try:
+                password_ok = check_password_hash(app.config['WEB_PASSWORD_HASH'], password[:256])
+            except (ValueError, TypeError):
+                password_ok = False
+            if hmac.compare_digest(username.encode('utf-8'), app.config['WEB_USERNAME'].encode('utf-8')) and password_ok and len(password) <= 256:
+                with _login_lock:
+                    _login_attempts.pop(address, None)
+                session.clear()
+                session.permanent = True
+                session['auth_user'] = app.config['WEB_USERNAME']
+                session['auth_version'] = auth_version()
+                csrf_token()
+                return redirect(url_for('index'))
+            error, status = 'Неверный логин или пароль.', 401
+    return render_template('login.html', csrf=csrf_token(), error=error, insecure=not request.is_secure), status
+
+
+@app.get('/api/session')
+def session_info():
+    return jsonify(csrf=csrf_token())
+
+
+@app.post('/api/logout')
+def logout():
+    session.clear()
+    return jsonify(ok=True)
 
 
 @app.get('/')
