@@ -212,15 +212,32 @@ function bookFor(option,side){
 }
 function priceCents(value){const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n*100)+'¢':'—'}
 function shares(value){if(value===null||value===undefined||value==='')return '—';const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n):'—'}
-let accountSnapshot=null,accountSnapshotAt=0,accountInFlight=false,accountAutoRefresh=false,tradeEnabled=false,tradeSending=false;
+let accountSnapshot=null,accountSnapshotAt=0,accountInFlight=false,accountAutoRefresh=false,tradeEnabled=false,tradeSending=false,accountGeneration=0,accountSource='';
 function updateTradingControls(){const enabled=tradeEnabled&&!state.demo;$('#trade-submit').disabled=!enabled||tradeSending;$('#trade-submit').textContent=tradeSending?'Отправляем…':enabled?'Отправить реальный ордер':'Торговля выключена';$('.trade-preview-badge').textContent=enabled?'РЕАЛЬНАЯ ТОРГОВЛЯ ВКЛЮЧЕНА':'РЕАЛЬНАЯ ТОРГОВЛЯ ВЫКЛЮЧЕНА';$('.readonly').innerHTML=enabled?'<i></i> РЕАЛЬНАЯ ТОРГОВЛЯ':'<i></i> ТОЛЬКО НАБЛЮДЕНИЕ';}
+function renderTradeAccount(){
+  const balance=$('#trade-live-balance'),updated=$('#trade-live-updated'),positions=$('#trade-live-positions');
+  if(!accountSnapshot){balance.textContent='Не загружен';updated.textContent='Нет свежего снимка аккаунта.';positions.textContent='Позиции недоступны. Это не означает, что их нет.';return}
+  const data=accountSnapshot,age=Math.max(0,Date.now()-accountSnapshotAt),stale=age>65000;
+  balance.textContent=data.collateral_balance==null?'Недоступен':`${data.collateral_balance} pUSD`;
+  updated.textContent=`Снимок: ${new Date(accountSnapshotAt).toLocaleTimeString('ru-RU')} · ${accountSource||'сверка'}${stale?' · УСТАРЕЛ':''} · доступный остаток может быть меньше`;
+  const opts=marketData?.market?.options||[],pairs=bookData?.pairs||[],tokens=new Map();
+  opts.forEach(o=>{const pair=pairs.find(p=>p.yes===o.token_yes&&p.no===o.token_no);if(pair){tokens.set(pair.yes,{label:o.label,side:'YES',book:bookFor(o,'yes')});tokens.set(pair.no,{label:o.label,side:'NO',book:bookFor(o,'no')})}});
+  const ps=Array.isArray(data.positions)?data.positions.filter(p=>p.event_slug===state.market||tokens.has(p.asset)):null;
+  if(!ps){positions.textContent='Позиции недоступны. Это не означает, что их нет.';return}
+  if(!ps.length){positions.textContent=data.positions_maybe_partial?'В полученной странице позиция не найдена; снимок неполный.':'В полученном снимке нет позиций по этому событию.';return}
+  positions.innerHTML=ps.map(p=>{
+    const t=tokens.get(p.asset),bid=t?.book?.bids?.[0],title=t?`${t.label} · ${t.side}`:`${p.title||'Позиция'} · ${p.outcome||'исход'}`;
+    return `<div class="trade-live-position"><b>${esc(title)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price==null?'—':esc(priceCents(p.avg_price))} · цена Data API ${p.current_price==null?'—':esc(priceCents(p.current_price))} · BID ${bid?esc(priceCents(bid.price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(shares(p.cash_pnl))+' USDC'}</span></div>`;
+  }).join('')+(data.positions_maybe_partial?'<small>Список позиций неполный.</small>':'');
+}
 function renderAccountSnapshot(){
   const status=$('#account-status'),positions=$('#account-positions'),orders=$('#account-orders');
-  if(!accountSnapshot){positions.innerHTML='';orders.innerHTML='';$('#account-balance').textContent='';return}
+  if(!accountSnapshot){positions.innerHTML='';orders.innerHTML='';$('#account-balance').textContent='';renderTradeAccount();return}
   const data=accountSnapshot,opts=marketData?.market?.options||[],pairs=bookData?.pairs||[];
   const tokens=new Map();opts.forEach(o=>{const pair=pairs.find(p=>p.yes===o.token_yes&&p.no===o.token_no);if(pair){tokens.set(pair.yes,`${o.label} · YES`);tokens.set(pair.no,`${o.label} · NO`)}});
   const ps=Array.isArray(data.positions)?data.positions.filter(p=>p.event_slug===state.market||tokens.has(p.asset)):null;
   const os=Array.isArray(data.orders)?data.orders.filter(o=>tokens.has(o.asset_id)):null;
+  renderTradeAccount();
   status.textContent=`Снимок: ${new Date(accountSnapshotAt).toLocaleTimeString('ru-RU')} · кошелёк ${data.wallet}. Ордера — только первая страница CLOB.`+(data.positions_maybe_partial?' Позиции могут быть неполными.':'')+(data.errors?.length?' '+data.errors.join(' '):'');
   $('#account-balance').textContent=data.collateral_balance!=null?`Баланс залога CLOB: ${data.collateral_balance} pUSD · снимок; доступная сумма может быть меньше из-за открытых ордеров и комиссий.`:'Баланс CLOB недоступен; это не означает нулевой баланс.';
   positions.innerHTML=ps?'<div class="account-list-title">ПОЗИЦИИ DATA API · ВЫБРАННОЕ СОБЫТИЕ</div>'+(ps.length?ps.map((p,i)=>`<div class="account-item"><b>${esc(p.title||p.outcome||'Позиция')} · ${esc(p.outcome)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price!=null?esc(priceCents(p.avg_price)):'—'} · текущая ${p.current_price!=null?esc(priceCents(p.current_price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(p.cash_pnl)+' USDC'}${p.redeemable?' · доступно погашение':''}</span>${tokens.has(p.asset)&&p.size>0?`<button type="button" class="button secondary account-close-draft" data-index="${i}">Подготовить продажу</button>`:''}</div>`).join(''):'<div class="account-empty">Нет позиций по выбранному событию в полученном снимке.</div>'):'<div class="account-empty">Позиции недоступны; это не означает, что их нет.</div>';
@@ -238,12 +255,28 @@ function renderAccountSnapshot(){
   });
 }
 async function loadAccountSnapshot(){
-  if(accountInFlight)return;accountInFlight=true;const b=$('#account-refresh');b.disabled=true;$('#account-status').textContent='Получаем позиции и заявки Polymarket…';
-  try{accountSnapshot=await api('/api/trading/account');accountSnapshotAt=Date.now();accountAutoRefresh=true;renderAccountSnapshot();await loadTradeJournal()}
-  catch(e){accountAutoRefresh=false;accountSnapshot=null;$('#account-positions').innerHTML='';$('#account-orders').innerHTML='';$('#account-balance').textContent='Баланс недоступен.';$('#account-status').textContent='Сверка не выполнена: '+e.message}
-  finally{accountInFlight=false;b.disabled=false}
+  if(accountInFlight)return;accountInFlight=true;accountAutoRefresh=true;const generation=accountGeneration,b=$('#account-refresh');b.disabled=true;$('#trade-live-refresh').disabled=true;$('#account-status').textContent='Получаем позиции и заявки Polymarket…';
+  try{const snapshot=await api('/api/trading/account');if(generation!==accountGeneration)return;accountSnapshot=snapshot;accountSnapshotAt=Date.now();accountSource='сверка страницы';renderAccountSnapshot();await loadTradeJournal()}
+  catch(e){if(generation!==accountGeneration)return;accountSnapshot=null;$('#account-positions').innerHTML='';$('#account-orders').innerHTML='';$('#account-balance').textContent='Баланс недоступен.';$('#account-status').textContent='Сверка не выполнена: '+e.message;renderTradeAccount()}
+  finally{accountInFlight=false;b.disabled=false;$('#trade-live-refresh').disabled=false}
+  await loadMonitorStatus();
 }
 $('#account-refresh').onclick=loadAccountSnapshot;
+$('#trade-live-refresh').onclick=loadAccountSnapshot;
+async function loadMonitorStatus(){
+  const generation=accountGeneration;
+  try{
+    const result=await api('/api/trading/monitor');if(generation!==accountGeneration)return;
+    const labels={ok:'снимок получен',partial:'снимок получен с ошибками',stale:'нет свежего снимка',error:'ошибка',not_running:'не запущено',not_configured:'аккаунт не настроен',account_changed:'аккаунт изменён; нужна новая сверка'};
+    const when=result.checked_at?` · ${new Date(result.checked_at*1000).toLocaleTimeString('ru-RU')}`:'';
+    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}. Только чтение, SL/TP не выполняются.`;
+    if(!accountSnapshot&&result.snapshot&&['ok','partial'].includes(result.status)){
+      accountSnapshot=result.snapshot;accountSnapshotAt=result.checked_at*1000;accountSource='фоновый монитор';renderAccountSnapshot();
+    }
+  }catch(e){if(generation===accountGeneration)$('#trade-monitor-status').textContent='Фоновое наблюдение недоступно. SL/TP не выполняются.'}
+}
+
+
 async function loadTradeJournal(){
   try{
     const slug=state.market;if(!slug){$('#trade-journal').innerHTML='';return}
@@ -273,6 +306,7 @@ $('#trade-submit').onclick=async()=>{
 };
 
 setInterval(()=>{if(accountAutoRefresh&&!document.hidden&&!$('#weather-page').classList.contains('hidden'))loadAccountSnapshot()},30000);
+setInterval(()=>{if(accountSnapshot)renderTradeAccount()},15000);
 let draftMarket=null,draftOptionsKey='',tradeDrafts=new Map(),draftMarketOptions=new Map();
 function getDraft(){if(!tradeDrafts.has(state.market))tradeDrafts.set(state.market,{index:'',token:'yes',action:'BUY',type:'GTC',price:'',size:'',sl:'',tp:''});return tradeDrafts.get(state.market)}
 function draftEstimate(){
@@ -504,14 +538,14 @@ $('#account-form').onsubmit=async e=>{
   data.auto_api=$('#account-api-mode').value==='auto';
   if(!confirm('Сохранить приватный ключ на сервере в незашифрованном файле с ограниченными правами?'))return;
   button.disabled=true;
-  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
+  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL/TP не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#account-delete').onclick=async e=>{
   const f=$('#account-form'),button=e.currentTarget,password=f.elements.current_password.value;
   if(!password){toast('Введите текущий пароль терминала');return}
   if(!confirm('Удалить сохранённые ключи с сервера? Открытые ордера и позиции на бирже не изменятся.'))return;
-  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
+  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL/TP не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#trade-control-form').onsubmit=async e=>{
@@ -528,4 +562,4 @@ $('#password-form').onsubmit=async e=>{
   catch(err){toast(err.message);button.disabled=false}
 };
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
-$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(s=>{tradeEnabled=!!s.trading_enabled;updateTradingControls()}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));

@@ -312,6 +312,14 @@ def trading_account_config():
     return jsonify(info)
 
 
+@app.get('/api/trading/monitor')
+def trading_monitor_status():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import position_monitor, trading_account
+    try: return jsonify(position_monitor.read_status(trading_account.load()))
+    except Exception: return jsonify(error='Состояние фонового наблюдения недоступно.'),503
+
+
 @app.get('/api/trading/account')
 def trading_account_snapshot():
     if not trusted_ssh_tunnel(): return jsonify(error='Аккаунт доступен только через SSH-туннель.'), 403

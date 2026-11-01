@@ -1,0 +1,16 @@
+[Unit]
+Description=Gradus Polymarket read-only position monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradus-web
+WorkingDirectory=/opt/gradusbot-web
+ExecStart=/bin/sh /opt/gradusbot-web/web/run_position_monitor.sh
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
