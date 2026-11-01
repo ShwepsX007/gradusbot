@@ -262,6 +262,47 @@ def security_info():
     return jsonify(tunnel=bool(trusted_ssh_tunnel()), trading_enabled=False)
 
 
+@app.route('/api/trading/account-config', methods=['GET', 'POST', 'DELETE'])
+def trading_account_config():
+    if not trusted_ssh_tunnel():
+        return jsonify(error='Настройки аккаунта доступны только через SSH-туннель.'), 403
+    from web import trading_account
+    if request.method == 'GET':
+        try: return jsonify(trading_account.public_config())
+        except trading_account.AccountError as exc: return jsonify(error=str(exc)), 503
+    if not login_allowed('trading-config:' + (request.remote_addr or 'unknown')):
+        return jsonify(error='Слишком много попыток. Повторите через 15 минут.'), 429
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('current_password'), str):
+        return jsonify(error='Введите текущий пароль терминала.'), 400
+    try: valid = len(data['current_password']) <= 256 and check_password_hash(current_password_hash(), data['current_password'])
+    except (ValueError, TypeError): valid = False
+    if not valid: return jsonify(error='Неверный пароль терминала.'), 400
+    try:
+        if request.method == 'DELETE':
+            trading_account.delete()
+            info = {'configured':False}
+        else:
+            info = trading_account.save(data)
+    except trading_account.AccountError as exc: return jsonify(error=str(exc)), 400
+    except Exception:
+        app.logger.error('Failed to save trading account credentials')  # never log request body or exceptions
+        return jsonify(error='Не удалось безопасно сохранить настройки. Проверьте права папки на сервере.'), 503
+    with _login_lock: _login_attempts.pop('trading-config:' + (request.remote_addr or 'unknown'), None)
+    return jsonify(info)
+
+
+@app.get('/api/trading/account')
+def trading_account_snapshot():
+    if not trusted_ssh_tunnel(): return jsonify(error='Аккаунт доступен только через SSH-туннель.'), 403
+    from web import trading_account
+    try: return jsonify(trading_account.account_snapshot())
+    except trading_account.AccountError as exc: return jsonify(error=str(exc)), 400
+    except Exception:
+        app.logger.warning('Account snapshot failed')
+        return jsonify(error='Аккаунт временно недоступен.'), 503
+
+
 @app.post('/api/change-password')
 def change_password():
     if not trusted_ssh_tunnel():

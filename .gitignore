@@ -6,3 +6,6 @@ bot_database.db*
 
 # Local UI test dependencies and caches
 .cache/
+
+# Local Polymarket credentials (never commit)
+.gradus-private/
