@@ -24,6 +24,9 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
  else if(url==='/api/settings')data={units:'C'};
  else if(url==='/api/security-info')data={tunnel:true,trading_enabled:false};
  else if(url.startsWith('/api/trading/intents?'))data={intents:[{slug:'first',state:'accepted',side:'BUY',price:'0.25',size:'10',order_type:'GTC',order_id:'0x123',exchange:{available:true,status:'LIVE',original_size:'10',size_matched:'3.25'},reconciliation:{assessment:'active',order_status:'LIVE',size_matched:'3.25',confirmed_size:'2',failed_size:'0',reason:'Расчёт ещё не завершён.'}}]};
+ else if(url==='/api/copy-observer'&&o.method==='POST')data={wallet:'0x'+'a'.repeat(40)};
+ else if(url==='/api/copy-observer')data={service:'running',service_checked_at:fixedNow/1000,leaders:[{id:1,label:'<img id=bad>',wallet:'0x'+'a'.repeat(40),enabled:1,interval_seconds:30,status:'ok',last_success:fixedNow/1000,mode:'percent',amount:'20',cap:'5'}],signals:[{side:'BUY',outcome:'Yes',title:'<img id=bad2>',label:'Leader',size:'10',price:'0.4',timestamp:fixedNow/1000,observed_at:fixedNow/1000,transaction_hash:'0xabc',estimate:{desired_shares:'2',desired_value:'0.8',available_shares:'8',best_price:'0.4',book_at:fixedNow/1000,capped:false}}]};
+ else if(url.startsWith('/api/copy-observer/'))data={ok:true};
  else if(url==='/api/trading/monitor')data={status:'ok',checked_at:Date.now()/1000,snapshot:null,interval_seconds:30};
  else if(url==='/api/trading/monitor-interval')data={interval_seconds:o.method==='POST'?JSON.parse(o.body).interval_seconds:30};
  else if(url==='/api/trading/control')data={enabled:JSON.parse(o.body).enabled};
@@ -168,5 +171,27 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
 
 
 
+ const tradePostsBeforeCopy=requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length;
+ w.document.querySelector('[data-page="copy"]').click();await tick();
+ assert(w.document.querySelector('#copy-page').textContent.includes('Реальные заявки не отправляются'));
+ assert(w.document.querySelector('#copy-signals').textContent.includes('2 долей'));
+ assert(!w.document.querySelector('#bad'));assert(!w.document.querySelector('#bad2'));
+ const copyForm=w.document.querySelector('#copy-form');copyForm.elements.profile.value='0x'+'a'.repeat(40);
+ copyForm.elements.mode.value='percent';copyForm.elements.mode.dispatchEvent(new w.Event('change'));
+ assert(w.document.querySelector('#copy-amount-label').textContent.includes('Процент'));
+ copyForm.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
+ const copyPost=requests.find(([url,o])=>url==='/api/copy-observer'&&o.method==='POST');assert(copyPost);
+ assert.equal(JSON.parse(copyPost[1].body).mode,'percent');assert.equal(JSON.parse(copyPost[1].body).confirm,true);
+ assert.equal(requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length,tradePostsBeforeCopy);
+ w.document.querySelector('[data-copy-edit]').click();assert.equal(copyForm.elements.amount.value,'20');
+ assert(w.document.querySelector('#copy-profile-label').classList.contains('hidden'));copyForm.elements.amount.value='25';
+ copyForm.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
+ const editPost=requests.find(([url,o])=>url==='/api/copy-observer/1'&&o.method==='PATCH'&&JSON.parse(o.body).settings);assert(editPost);
+ assert.equal(JSON.parse(editPost[1].body).settings.amount,'25');
+ assert(!w.document.querySelector('#copy-profile-label').classList.contains('hidden'));
+ w.document.querySelector('[data-copy-toggle]').click();await tick();
+ assert(requests.some(([url,o])=>url==='/api/copy-observer/1'&&o.method==='PATCH'));
+ w.document.querySelector('[data-copy-delete]').click();await tick();
+ assert(requests.some(([url,o])=>url==='/api/copy-observer/1'&&o.method==='DELETE'));
  console.log('Trade preview UI: OK');w.close();
 })().catch(e=>{console.error(e);w.close();process.exitCode=1});

@@ -12,7 +12,7 @@ let csrfToken = '';
 let toastTimer;
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok)throw Error(data.error||'Ошибка запроса');return data}
-function page(name){$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='settings'){loadSettings();loadSecurityInfo()}}
+function page(name){$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='copy')loadCopyObserver();if(name==='settings'){loadSettings();loadSecurityInfo()}}
 $$('.nav').forEach(x=>x.onclick=()=>page(x.dataset.page));
 function showDialog(id){$(`#${id}`).showModal()}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
@@ -668,4 +668,54 @@ $('#password-form').onsubmit=async e=>{
   catch(err){toast(err.message);button.disabled=false}
 };
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
+// Read-only public trade observation. Never calls the trading or cancellation APIs.
+let copyBusy=false,copyGeneration=0;
+function copyTime(stamp){return Number.isFinite(Number(stamp))&&Number(stamp)>0?new Date(Number(stamp)*1000).toLocaleString('ru-RU'):'—'}
+function copyAmountMode(){
+  const mode=$('#copy-mode').value,label=$('#copy-amount-label');label.style.display=mode==='same'?'none':'';
+  label.childNodes[0].textContent=mode==='percent'?'Процент от долей трейдера':'Сумма на каждую сделку, pUSD';
+}
+$('#copy-mode').addEventListener('change',copyAmountMode);copyAmountMode();
+async function loadCopyObserver(){
+  const generation=++copyGeneration;
+  try{const data=await api('/api/copy-observer');if(generation!==copyGeneration)return;
+    const status={running:'свежий сигнал',stale:'давно не отвечала',not_running:'не запущена'};
+    $('#copy-service-status').textContent=`Служба наблюдения: ${status[data.service]||'неизвестно'}${data.service_checked_at?' · '+copyTime(data.service_checked_at):''}. Только публичное чтение.`;
+    const leaders=Array.isArray(data.leaders)?data.leaders:[];
+    $('#copy-leaders').innerHTML=leaders.length?leaders.map(l=>{
+      const labels={fixed:`${esc(l.amount)} pUSD на исполнение`,same:'равное число долей',percent:`${esc(l.amount)}% от долей`};
+      const stale=l.last_success&&(Date.now()/1000-Number(l.last_success)>Math.max(90,3*Number(l.interval_seconds)));
+      const state=!l.enabled?'пауза':l.status==='error'?'ошибка чтения':stale?'данные устарели':l.status==='ok'?'наблюдение':'ожидает проверки';
+      return `<article class="copy-leader"><div><strong>${esc(l.label)}</strong><code>${esc(l.wallet)}</code><small>${esc(state)} · проверка ${esc(l.interval_seconds)} с · последняя успешная: ${esc(copyTime(l.last_success))}</small>${l.error_reason?`<small>Причина: ${esc(l.error_reason)}</small>`:''}<small>${labels[l.mode]||'—'} · потолок ${esc(l.cap)} pUSD на расчёт</small></div><div class="copy-actions"><button type="button" class="button secondary" data-copy-edit="${Number(l.id)}">Настроить</button><button type="button" class="button secondary" data-copy-toggle="${Number(l.id)}" data-enabled="${l.enabled?0:1}">${l.enabled?'Пауза':'Продолжить'}</button><button type="button" class="button danger" data-copy-delete="${Number(l.id)}">Удалить</button></div></article>`;
+    }).join(''):'Нет наблюдаемых трейдеров.';
+    $('#copy-leaders').querySelectorAll('[data-copy-edit]').forEach(b=>b.onclick=()=>{
+      const l=leaders.find(x=>Number(x.id)===Number(b.dataset.copyEdit));if(!l)return;
+      const form=$('#copy-form');form.dataset.editId=String(l.id);for(const field of ['mode','amount','cap','interval_seconds'])form.elements[field].value=l[field];
+      form.elements.profile.required=false;$('#copy-profile-label').classList.add('hidden');$('#copy-form-heading').textContent='Настройки наблюдения: '+l.label;
+      form.querySelector('button[type=submit]').textContent='Сохранить настройки';$('#copy-edit-cancel').classList.remove('hidden');$('#copy-form-status').textContent='Изменения применяются только к новым оценкам.';copyAmountMode();
+    });
+    $('#copy-leaders').querySelectorAll('[data-copy-toggle]').forEach(b=>b.onclick=async()=>{const on=b.dataset.enabled==='1';if(on&&!confirm('Возобновить с текущего времени? Сделки во время паузы не обрабатываются.'))return;b.disabled=true;try{await api('/api/copy-observer/'+b.dataset.copyToggle,{method:'PATCH',body:JSON.stringify({enabled:on,confirm:true})});await loadCopyObserver()}catch(e){toast(e.message);b.disabled=false}});
+    $('#copy-leaders').querySelectorAll('[data-copy-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Удалить трейдера и сохранённые наблюдения?'))return;b.disabled=true;try{await api('/api/copy-observer/'+b.dataset.copyDelete,{method:'DELETE',body:JSON.stringify({confirm:true})});await loadCopyObserver()}catch(e){toast(e.message);b.disabled=false}});
+    const signals=Array.isArray(data.signals)?data.signals:[];
+    $('#copy-signals').innerHTML=signals.length?signals.map(s=>{
+      const x=s.estimate||{},buy=s.side==='BUY',best=x.best_price==null?'нет данных':`${esc(x.best_price)} pUSD`,depth=x.available_shares==null?'стакан недоступен':`${esc(x.available_shares)} долей на пяти уровнях`;
+      const target=buy?`Расчёт: ${esc(x.desired_shares)} долей ≈ ${esc(x.desired_value)} pUSD${x.capped?' · ограничено потолком':''}`:'Размер продажи не рассчитан: виртуальная позиция и доля выхода пока не моделируются.';
+      const eventLink=/^[a-z0-9-]{1,160}$/.test(s.event_slug||'')?` <a href="https://polymarket.com/event/${esc(s.event_slug)}" target="_blank" rel="noopener noreferrer">Рынок ↗</a>`:'';
+      return `<article class="copy-signal"><div class="copy-signal-head"><strong>${buy?'ПОКУПКА':'ПРОДАЖА'} · ${esc(s.outcome||'исход не указан')}</strong><span>${esc(copyTime(s.timestamp))} · обнаружена ${esc(copyTime(s.observed_at))}</span></div><b>${esc(s.title||'Без названия')}${eventLink}</b><small>${esc(s.label)} · ${esc(s.size)} долей по ${esc(s.price)} pUSD</small><small>${target}</small><small>Лучший ${buy?'ASK':'BID'}: ${best} · по цене трейдера или лучше: ${depth}</small><small>Снимок стакана: ${esc(copyTime(x.book_at))} · это не исполнение и не гарантия доступности.</small><code>${esc(s.transaction_hash)}</code></article>`;
+    }).join(''):'Новых сделок пока нет.';
+  }catch(e){if(generation===copyGeneration){$('#copy-service-status').textContent='Наблюдение недоступно: '+e.message;$('#copy-leaders').textContent='Не удалось загрузить трейдеров.';$('#copy-signals').textContent='Не удалось загрузить сделки.'}}
+}
+$('#copy-refresh').onclick=()=>loadCopyObserver();
+function resetCopyForm(){const form=$('#copy-form');delete form.dataset.editId;form.elements.profile.required=true;$('#copy-profile-label').classList.remove('hidden');$('#copy-form-heading').textContent='Добавить наблюдение';form.querySelector('button[type=submit]').textContent='Начать наблюдение';$('#copy-edit-cancel').classList.add('hidden');copyAmountMode()}
+$('#copy-edit-cancel').onclick=()=>{resetCopyForm();$('#copy-form-status').textContent=''};
+$('#copy-form').onsubmit=async e=>{e.preventDefault();if(copyBusy)return;const form=e.currentTarget,button=form.querySelector('button[type=submit]');const data=Object.fromEntries(new FormData(form));data.interval_seconds=Number(data.interval_seconds);data.confirm=true;const editing=form.dataset.editId;
+  if(!confirm(editing?'Сохранить настройки наблюдения? Реальные сделки не отправляются.':'Начать только наблюдение? Реальные сделки не отправляются.'))return;
+  copyBusy=true;button.disabled=true;$('#copy-form-status').textContent=editing?'Сохраняем настройки…':'Проверяем профиль…';
+  try{
+    if(editing){await api('/api/copy-observer/'+editing,{method:'PATCH',body:JSON.stringify({settings:data,confirm:true})});resetCopyForm();$('#copy-form-status').textContent='Настройки сохранены для новых оценок.'}
+    else{const result=await api('/api/copy-observer',{method:'POST',body:JSON.stringify(data)});$('#copy-form-status').textContent=`Добавлен торговый кошелёк ${result.wallet}. Отслеживаются только новые сделки.`;form.elements.profile.value=''}
+    await loadCopyObserver()
+  }catch(err){$('#copy-form-status').textContent=err.message}finally{copyBusy=false;button.disabled=false}
+};
+setInterval(()=>{if(!document.hidden&&!$('#copy-page').classList.contains('hidden'))loadCopyObserver()},15000);
 $('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
