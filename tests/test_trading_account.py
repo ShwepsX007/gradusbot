@@ -77,6 +77,45 @@ class AccountEndpointTests(unittest.TestCase):
             sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='test-token'
     def tearDown(self):
         self.patch.stop();web.db.DB_FILE=self.old_db;web.app.config.clear();web.app.config.update(self.config);self.tmp.cleanup()
+    def test_valid_password_wallet_errors_do_not_lock_out(self):
+        url='/api/trading/account-config';headers={'X-CSRF-Token':'test-token'}
+        data={**CREDS,'current_password':'long password for account','funder':'bad-address'}
+        for _ in range(8):
+            response=self.client.post(url,base_url=self.base,json=data,headers=headers)
+            self.assertEqual(response.status_code,400)
+            self.assertIn('funder',response.get_json()['error'])
+        good=self.client.post(url,base_url=self.base,json={**data,'funder':CREDS['funder']},headers=headers)
+        self.assertEqual(good.status_code,200)
+        self.assertNotIn('trading-config:127.0.0.1',web._login_attempts)
+
+    def test_clob_failure_does_not_lock_out(self):
+        url='/api/trading/account-config';headers={'X-CSRF-Token':'test-token'}
+        data={**CREDS,'auto_api':True,'current_password':'long password for account'}
+        with patch.object(account,'derive_api_credentials',side_effect=account.AccountError('CLOB недоступен')):
+            for _ in range(8):
+                response=self.client.post(url,base_url=self.base,json=data,headers=headers)
+                self.assertEqual(response.status_code,400)
+                self.assertIn('CLOB',response.get_json()['error'])
+        self.assertNotIn('trading-config:127.0.0.1',web._login_attempts)
+
+    def test_incorrect_password_still_rate_limited(self):
+        url='/api/trading/account-config';headers={'X-CSRF-Token':'test-token'}
+        data={**CREDS,'current_password':'wrong'}
+        for _ in range(web.LOGIN_ATTEMPTS):
+            self.assertEqual(self.client.post(url,base_url=self.base,json=data,headers=headers).status_code,400)
+        blocked=self.client.post(url,base_url=self.base,json={**data,'current_password':'long password for account'},headers=headers)
+        self.assertEqual(blocked.status_code,429)
+        self.assertFalse(account.public_config()['configured'])
+
+    def test_successful_password_resets_prior_failures_before_validation(self):
+        url='/api/trading/account-config';headers={'X-CSRF-Token':'test-token'}
+        data={**CREDS,'current_password':'wrong'}
+        for _ in range(web.LOGIN_ATTEMPTS-1):
+            self.assertEqual(self.client.post(url,base_url=self.base,json=data,headers=headers).status_code,400)
+        self.assertEqual(self.client.post(url,base_url=self.base,json={**data,'current_password':'long password for account','funder':'bad'},headers=headers).status_code,400)
+        self.assertEqual(self.client.post(url,base_url=self.base,json=data,headers=headers).status_code,400)
+        self.assertEqual(len(web._login_attempts['trading-config:127.0.0.1']),1)
+
     def test_security_and_secret_redaction(self):
         url='/api/trading/account-config'; data={**CREDS,'current_password':'long password for account'}
         self.assertEqual(self.client.post(url,base_url=self.base,json=data).status_code,403)

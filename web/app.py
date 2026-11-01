@@ -289,6 +289,9 @@ def trading_account_config():
     try: valid = len(data['current_password']) <= 256 and check_password_hash(current_password_hash(), data['current_password'])
     except (ValueError, TypeError): valid = False
     if not valid: return jsonify(error='Неверный пароль терминала.'), 400
+    # Correct reauthentication clears the password-attempt counter immediately.
+    # Invalid wallet fields or CLOB failures must not cause a password lockout.
+    with _login_lock: _login_attempts.pop('trading-config:' + (request.remote_addr or 'unknown'), None)
     try:
         from web import trading_orders
         trading_orders.set_enabled(False)  # credentials are changing; a fresh opt-in is required
@@ -301,7 +304,6 @@ def trading_account_config():
     except Exception:
         app.logger.error('Failed to save trading account credentials')  # never log request body or exceptions
         return jsonify(error='Не удалось безопасно сохранить настройки. Проверьте права папки на сервере.'), 503
-    with _login_lock: _login_attempts.pop('trading-config:' + (request.remote_addr or 'unknown'), None)
     return jsonify(info)
 
 
@@ -329,12 +331,12 @@ def trading_control():
     try: valid=isinstance(password,str) and len(password)<=256 and check_password_hash(current_password_hash(),password)
     except (ValueError,TypeError): valid=False
     if not valid: return jsonify(error='Неверный пароль терминала.'),400
+    with _login_lock: _login_attempts.pop('trade-control:'+(request.remote_addr or 'unknown'),None)
     try:
         if data['enabled'] and not trading_account.load(): return jsonify(error='Сначала настройте аккаунт Polymarket.'),400
         trading_orders.set_enabled(data['enabled'])
     except trading_orders.TradeError as exc: return jsonify(error=str(exc)),400
     except Exception: return jsonify(error='Не удалось изменить настройку торговли.'),503
-    with _login_lock: _login_attempts.pop('trade-control:'+(request.remote_addr or 'unknown'),None)
     return jsonify(enabled=data['enabled'])
 
 

@@ -481,19 +481,27 @@ async function loadSecurityInfo(){
     else $('#account-config-status').textContent='Настройка доступна только через SSH-туннель.';
   }catch(e){$('#password-status').textContent='Не удалось проверить подключение: '+e.message;$('#account-config-status').textContent='Не удалось получить состояние аккаунта.'}
 }
+function updateAccountApiMode(){
+  const manual=$('#account-api-mode').value==='manual';
+  for(const name of ['api_key','api_secret','api_passphrase']){
+    const field=$(`#account-form [name="${name}"]`);field.disabled=!manual;field.required=manual;
+  }
+}
+$('#account-api-mode').addEventListener('change',updateAccountApiMode);
+updateAccountApiMode();
 $('#account-form').onsubmit=async e=>{
   e.preventDefault();const f=e.currentTarget,button=f.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(f));
   data.auto_api=$('#account-api-mode').value==='auto';
   if(!confirm('Сохранить приватный ключ на сервере в незашифрованном файле с ограниченными правами?'))return;
   button.disabled=true;
-  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
+  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#account-delete').onclick=async e=>{
   const f=$('#account-form'),button=e.currentTarget,password=f.elements.current_password.value;
   if(!password){toast('Введите текущий пароль терминала');return}
   if(!confirm('Удалить сохранённые ключи с сервера? Открытые ордера и позиции на бирже не изменятся.'))return;
-  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
+  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountSnapshot=null;accountAutoRefresh=false;renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#trade-control-form').onsubmit=async e=>{
