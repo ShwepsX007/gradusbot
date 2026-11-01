@@ -331,7 +331,8 @@ async function loadMonitorStatus(){
     const result=await api('/api/trading/monitor');if(generation!==accountGeneration)return;
     const labels={ok:'снимок получен',partial:'снимок получен с ошибками',stale:'нет свежего снимка',error:'ошибка',not_running:'не запущено',not_configured:'аккаунт не настроен',account_changed:'аккаунт изменён; нужна новая сверка'};
     const when=result.checked_at?` · ${new Date(result.checked_at*1000).toLocaleTimeString('ru-RU')}`:'';
-    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}. Только чтение, SL/TP не выполняются.`;
+    const interval=Number.isInteger(result.interval_seconds)?` · интервал ${result.interval_seconds} с`:'';
+    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}${interval}. Только чтение, SL/TP не выполняются.`;
     if(!accountSnapshot&&result.snapshot&&['ok','partial'].includes(result.status)){
       accountSnapshot=result.snapshot;accountSnapshotAt=result.checked_at*1000;accountSource='фоновый монитор';renderAccountSnapshot();
     }
@@ -617,9 +618,9 @@ $('#market-first-search').onsubmit=async e=>{e.preventDefault();let target=$('#m
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
 async function loadSecurityInfo(){
   const form=$('#password-form'),button=form.querySelector('button'),accountButton=$('#account-form button[type=submit]'),deleteButton=$('#account-delete'),controlButton=$('#trade-control-form button');button.disabled=true;accountButton.disabled=true;deleteButton.disabled=true;controlButton.disabled=true;
-  try{const s=await api('/api/security-info');button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
-    if(s.tunnel){const c=await api('/api/trading/account-config');$('#account-config-status').textContent=c.configured?`Настроен кошелёк ${c.wallet} · тип подписи ${c.signature_type}. Доступ к бирже ещё нужно проверить.`:'Аккаунт ещё не настроен.'}
-    else $('#account-config-status').textContent='Настройка доступна только через SSH-туннель.';
+  try{const s=await api('/api/security-info');button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;$('#monitor-interval-form button').disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
+    if(s.tunnel){try{const interval=await api('/api/trading/monitor-interval');$('#monitor-interval-form [name=interval_seconds]').value=interval.interval_seconds;$('#monitor-interval-status').textContent='Служба применит изменение при следующей проверке.'}catch(e){$('#monitor-interval-status').textContent='Интервал недоступен: '+e.message}const c=await api('/api/trading/account-config');$('#account-config-status').textContent=c.configured?`Настроен кошелёк ${c.wallet} · тип подписи ${c.signature_type}. Доступ к бирже ещё нужно проверить.`:'Аккаунт ещё не настроен.'}
+    else {$('#account-config-status').textContent='Настройка доступна только через SSH-туннель.';$('#monitor-interval-status').textContent='Требуется SSH-туннель.';}
   }catch(e){$('#password-status').textContent='Не удалось проверить подключение: '+e.message;$('#account-config-status').textContent='Не удалось получить состояние аккаунта.'}
 }
 function updateAccountApiMode(){
@@ -644,6 +645,14 @@ $('#account-delete').onclick=async e=>{
   if(!confirm('Удалить сохранённые ключи с сервера? Открытые ордера и позиции на бирже не изменятся.'))return;
   button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL/TP не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
   catch(err){toast(err.message)}finally{button.disabled=false}
+};
+$('#monitor-interval-form').onsubmit=async e=>{
+  e.preventDefault();const form=e.currentTarget,button=form.querySelector('button'),n=Number(form.elements.interval_seconds.value);
+  if(!Number.isInteger(n)||n<15||n>300){$('#monitor-interval-status').textContent='Укажите целое число секунд от 15 до 300.';return}
+  button.disabled=true;
+  try{const result=await api('/api/trading/monitor-interval',{method:'POST',body:JSON.stringify({interval_seconds:n,confirm:true})});form.elements.interval_seconds.value=result.interval_seconds;$('#monitor-interval-status').textContent='Сохранено. Служба применит изменение при следующей проверке; SL/TP не работают.';await loadMonitorStatus()}
+  catch(err){$('#monitor-interval-status').textContent=err.message}
+  finally{button.disabled=false}
 };
 $('#trade-control-form').onsubmit=async e=>{
   e.preventDefault();const f=e.currentTarget,button=f.querySelector('button'),on=f.elements.enabled.value==='true';

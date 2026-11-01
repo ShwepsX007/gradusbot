@@ -16,13 +16,48 @@ import database as db
 from web import trading_account
 
 INTERVAL_SECONDS = 30
+MIN_INTERVAL = 15
+MAX_INTERVAL = 300
 
 
 def init_db():
     with db.get_db() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS web_account_monitor (
             id INTEGER PRIMARY KEY CHECK(id=1), checked_at REAL NOT NULL,
-            status TEXT NOT NULL, wallet TEXT, fingerprint TEXT, payload TEXT)''')
+            status TEXT NOT NULL, wallet TEXT, fingerprint TEXT, payload TEXT, interval_seconds INTEGER)''')
+        columns={r['name'] for r in conn.execute('PRAGMA table_info(web_account_monitor)')}
+        if 'interval_seconds' not in columns: conn.execute('ALTER TABLE web_account_monitor ADD COLUMN interval_seconds INTEGER')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_monitor_control (
+            id INTEGER PRIMARY KEY CHECK(id=1), interval_seconds INTEGER NOT NULL DEFAULT 30)''')
+        conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
+
+
+def get_interval():
+    try:
+        with db.get_db() as conn:
+            row=conn.execute('SELECT interval_seconds FROM web_monitor_control WHERE id=1').fetchone()
+        value=row['interval_seconds'] if row else None
+        return value if isinstance(value,int) and MIN_INTERVAL<=value<=MAX_INTERVAL else INTERVAL_SECONDS
+    except Exception:
+        return INTERVAL_SECONDS
+
+
+def set_interval(value):
+    if type(value) is not int or not MIN_INTERVAL<=value<=MAX_INTERVAL:
+        raise ValueError('Укажите целое число секунд от 15 до 300.')
+    with db.get_db() as conn:
+        conn.execute('UPDATE web_monitor_control SET interval_seconds=? WHERE id=1',(value,))
+
+
+def wait_until_next(stopped, started):
+    """Reread settings while waiting, and avoid a tight loop after slow requests."""
+    if time.monotonic()-started>=get_interval():
+        stopped.wait(1)
+        return
+    while not stopped.is_set():
+        remaining=get_interval()-(time.monotonic()-started)
+        if remaining<=0: return
+        stopped.wait(min(remaining,5))
 
 
 def _fingerprint(credentials):
@@ -35,11 +70,12 @@ def _fingerprint(credentials):
 def _save(status, wallet=None, payload=None, fingerprint=None):
     serialized=json.dumps(payload,ensure_ascii=True,allow_nan=False) if payload is not None else None
     with db.get_db() as conn:
-        conn.execute('''INSERT INTO web_account_monitor(id,checked_at,status,wallet,payload,fingerprint)
-            VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        conn.execute('''INSERT INTO web_account_monitor(id,checked_at,status,wallet,payload,fingerprint,interval_seconds)
+            VALUES(1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
             checked_at=excluded.checked_at,status=excluded.status,
-            wallet=excluded.wallet,payload=excluded.payload,fingerprint=excluded.fingerprint''',
-            (time.time(),status,wallet,serialized,fingerprint))
+            wallet=excluded.wallet,payload=excluded.payload,fingerprint=excluded.fingerprint,
+            interval_seconds=excluded.interval_seconds''',
+            (time.time(),status,wallet,serialized,fingerprint,get_interval()))
 
 
 def poll_once():
@@ -71,7 +107,7 @@ def read_status(credentials):
     """Return only the matching account's latest advisory snapshot."""
     try:
         with db.get_db() as conn:
-            row=conn.execute('SELECT checked_at,status,wallet,fingerprint,payload FROM web_account_monitor WHERE id=1').fetchone()
+            row=conn.execute('SELECT checked_at,status,wallet,fingerprint,payload,interval_seconds FROM web_account_monitor WHERE id=1').fetchone()
     except Exception:
         return {'status':'not_running','checked_at':None,'snapshot':None}
     if row is None: return {'status':'not_running','checked_at':None,'snapshot':None}
@@ -80,12 +116,13 @@ def read_status(credentials):
         return {'status':'account_changed','checked_at':row['checked_at'],'snapshot':None}
     status=row['status']
     age=time.time()-row['checked_at']
-    if age>90 or age < -10: status='stale'
+    observed_interval=row['interval_seconds'] if type(row['interval_seconds']) is int and MIN_INTERVAL<=row['interval_seconds']<=MAX_INTERVAL else INTERVAL_SECONDS
+    if age>max(90,3*min(observed_interval,get_interval())) or age < -10: status='stale'
     try: snapshot=json.loads(row['payload']) if row['payload'] and status in ('ok','partial') else None
     except (ValueError,TypeError): return {'status':'error','checked_at':row['checked_at'],'snapshot':None}
     if snapshot is not None and (not isinstance(snapshot,dict) or not isinstance(snapshot.get('wallet'),str) or not wallet or snapshot['wallet'].lower()!=wallet.lower()):
         return {'status':'error','checked_at':row['checked_at'],'snapshot':None}
-    return {'status':status,'checked_at':row['checked_at'],'snapshot':snapshot}
+    return {'status':status,'checked_at':row['checked_at'],'snapshot':snapshot,'interval_seconds':get_interval()}
 
 
 def acquire_lock():
@@ -115,9 +152,10 @@ def main():
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
     try:
         while not stopped.is_set():
+            started=time.monotonic()
             try: poll_once()
             except Exception: print('Ошибка обновления монитора; повторим позже.',flush=True)
-            stopped.wait(INTERVAL_SECONDS)
+            wait_until_next(stopped,started)
     finally:
         os.close(lock_fd)
     return 0

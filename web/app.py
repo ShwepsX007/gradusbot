@@ -78,6 +78,9 @@ def init_web_db():
             assessment TEXT NOT NULL DEFAULT 'unverified', checked_at REAL,
             order_status TEXT, size_matched TEXT, confirmed_size TEXT, failed_size TEXT,
             reason TEXT, FOREIGN KEY(nonce) REFERENCES web_order_intents(nonce))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_monitor_control (
+            id INTEGER PRIMARY KEY CHECK(id=1), interval_seconds INTEGER NOT NULL DEFAULT 30)''')
+        conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
 
 
 
@@ -325,6 +328,21 @@ def trading_monitor_status():
     from web import position_monitor, trading_account
     try: return jsonify(position_monitor.read_status(trading_account.load()))
     except Exception: return jsonify(error='Состояние фонового наблюдения недоступно.'),503
+
+
+@app.route('/api/trading/monitor-interval', methods=['GET','POST'])
+def trading_monitor_interval():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import position_monitor
+    if request.method=='GET': return jsonify(interval_seconds=position_monitor.get_interval())
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or data.get('confirm') is not True:
+        return jsonify(error='Требуется подтверждение.'),400
+    try:
+        position_monitor.set_interval(data.get('interval_seconds'))
+    except ValueError as exc: return jsonify(error=str(exc)),400
+    except Exception: return jsonify(error='Не удалось сохранить интервал наблюдения.'),503
+    return jsonify(interval_seconds=position_monitor.get_interval())
 
 
 @app.get('/api/trading/account')
