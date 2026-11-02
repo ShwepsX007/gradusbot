@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
+from web import metar_archive
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -84,6 +85,7 @@ def init_web_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS web_monitor_control (
             id INTEGER PRIMARY KEY CHECK(id=1), interval_seconds INTEGER NOT NULL DEFAULT 30)''')
         conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
+    metar_archive.init_db()
 
 
 
@@ -586,7 +588,11 @@ def remove_station(sid):
         conn.execute('DELETE FROM web_station_solar WHERE station_id=?', (sid,))
         prefix = f'st_{sid}_'
         conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
+        old_code=conn.execute('SELECT UPPER(station_code) AS code FROM stations WHERE id=?',(sid,)).fetchone()['code']
         conn.execute('DELETE FROM stations WHERE id=?', (sid,))
+        if old_code and not conn.execute("SELECT 1 FROM stations WHERE station_type='metar' AND UPPER(station_code)=? LIMIT 1",(old_code,)).fetchone():
+            conn.execute('DELETE FROM web_metar_archive WHERE icao=?',(old_code,))
+            conn.execute('DELETE FROM web_metar_archive_status WHERE icao=?',(old_code,))
     return jsonify(ok=True)
 
 
@@ -607,21 +613,26 @@ def record_web_metar(sid, metar):
         conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 8 * 24 * 3600))
 
 
-def combined_history(sid):
-    points = db.get_station_history(sid, hours=8 * 24)
+def _metar_points(sid, archive, hours):
+    # The locally recorded report wins when the same observation appears in both.
+    cutoff=time.time()-hours*3600
+    reports=archive.get('reports',[]) if isinstance(archive,dict) else []
+    points={r['obs_time']:r['temp'] for r in reports if r.get('temp') is not None and r['obs_time']>=cutoff}
     with db.get_db() as conn:
-        points.extend([[r['obs_time'], r['temp']] for r in conn.execute(
-            'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>?',
-            (sid, time.time() - 8 * 24 * 3600))])
-    return sorted(points, key=lambda p: p[0])
+        for row in conn.execute('SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>=?',(sid,cutoff)):
+            points[row['obs_time']]=row['temp']
+    return [[t,points[t]] for t in sorted(points)]
 
 
-def metar_chart_history(sid):
+def combined_history(sid, archive=None):
+    points=db.get_station_history(sid,hours=8*24)
+    points.extend(_metar_points(sid,archive,8*24))
+    return sorted(points,key=lambda p:p[0])
+
+
+def metar_chart_history(sid, archive=None):
     # Bot history stores poll times, not METAR observation times; do not mix them.
-    with db.get_db() as conn:
-        return [[r['obs_time'], r['temp']] for r in conn.execute(
-            'SELECT obs_time,temp FROM web_metar_history WHERE station_id=? AND obs_time>=? ORDER BY obs_time',
-            (sid, time.time() - 24 * 3600))]
+    return _metar_points(sid,archive,48)
 
 
 def save_solar_days(sid, forecast_data):
@@ -656,15 +667,21 @@ def get_solar_days(sid):
 def weather(sid):
     station = db.get_station(sid)
     if not station: return jsonify(error='Станция не найдена'), 404
-    result = {'station': public_station(station), 'history': combined_history(sid), 'metar_history': metar_chart_history(sid), 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
+    # Historical lookup is independent of the live-poll switch: viewing a
+    # disabled station can retrieve its archive, but never starts live polling.
+    metar_archive.prune()
+    code=str(station.get('station_code') or '').upper()
+    valid=station.get('station_type')=='metar' and re.fullmatch(r'[A-Z0-9]{4}',code)
+    if valid: metar_archive.refresh(code)
+    archive=metar_archive.get(code if valid else None)
+    result = {'station': public_station(station), 'history': combined_history(sid,archive), 'metar_history': metar_chart_history(sid,archive), 'metar_archive':archive, 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
     if not station['enabled']:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
     if station.get('station_type') != 'metar':
         result['message'] = 'В веб-терминале поддерживаются станции METAR'
         return jsonify(result)
-    code = station.get('station_code', '').upper()
-    if not re.fullmatch(r'[A-Z0-9]{4}', code):
+    if not valid:
         result['message'] = 'Некорректный ICAO-код'
         return jsonify(result)
     # Additional cache prevents aggressive polling from multiple browser tabs.
@@ -682,8 +699,8 @@ def weather(sid):
     result['metar'] = metar
     if metar:
         record_web_metar(sid, metar)
-        result['history'] = combined_history(sid)
-        result['metar_history'] = metar_chart_history(sid)
+        result['history'] = combined_history(sid,archive)
+        result['metar_history'] = metar_chart_history(sid,archive)
     info = station_info(code)
     result['info'] = info
     if info and info.get('lat') is not None and info.get('lon') is not None:

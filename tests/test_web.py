@@ -15,6 +15,7 @@ class TerminalTests(unittest.TestCase):
         web.db.DB_FILE = os.path.join(self.tmp.name, 'test.db')
         web.db.init_db()
         web.init_web_db()
+        self.archive_patch=patch.object(web.metar_archive,'refresh',return_value=None);self.archive_patch.start()
         web._cache.clear()
         web.app.config.update(WEB_AUTH_CONFIGURED=True, WEB_USERNAME='testuser', WEB_PASSWORD_HASH='testhash')
         self.client = web.app.test_client()
@@ -25,13 +26,14 @@ class TerminalTests(unittest.TestCase):
         self.client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
 
     def tearDown(self):
+        self.archive_patch.stop()
         web.db.DB_FILE = self.old_db
         self.tmp.cleanup()
 
     def add_station(self):
         return self.client.post('/api/stations', json={'name': 'London', 'code': 'EGLL'}).get_json()
 
-    def test_station_disabled_and_no_upstream_requests(self):
+    def test_station_disabled_has_no_live_metar_request(self):
         s = self.add_station()
         self.assertEqual(s['enabled'], 0)
         with patch.object(web.utils, 'fetch_metar') as fetch:
@@ -274,7 +276,7 @@ class TerminalTests(unittest.TestCase):
         web.record_web_metar(sid, {'temp': 16, 'obs_time': now + 120})
         self.client.patch(f'/api/stations/{sid}', json={'enabled': False})
         result = self.client.get(f'/api/stations/{sid}/weather').get_json()
-        self.assertEqual(result['metar_history'], [[now - 3600, 15.3], [now + 120, 16.0]])
+        self.assertEqual(result['metar_history'], [[now - 25 * 3600, 11.0], [now - 3600, 15.3], [now + 120, 16.0]])
         self.assertIn(77, [p[1] for p in result['history']])
         with web.db.get_db() as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_history WHERE obs_time=?', (now - 3600,)).fetchone()[0], 1)

@@ -136,9 +136,9 @@
     }
     return points.filter(p=>p.day===day).sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
   }
-  // Last 24 elapsed hours, with no extrapolation beyond actual reports.
-  function metarChart(history, unit='C', now=Date.now()) {
-    const start=now-86400000, byTime=new Map();
+  // Last 24 or 48 elapsed hours, with no extrapolation beyond actual reports.
+  function metarChart(history, unit='C', now=Date.now(), hours=24) {
+    const duration=(hours===48?48:24)*3600000, start=now-duration, byTime=new Map();
     if (Array.isArray(history)) for (const row of history) {
       if (!Array.isArray(row) || row[0] == null || row[1] == null || row[0] === '' || row[1] === '') continue;
       const ms=Number(row[0])*1000, c=Number(row[1]);
@@ -151,13 +151,13 @@
     const min=Math.floor(lo)-1, max=Math.ceil(hi)+1, step=1;
     const ticks=[];
     for(let value=min;value<=max;value++)ticks.push({value,y:100-(value-min)/(max-min)*100});
-    for(const p of points){p.x=(p.ms-start)/86400000*100;p.y=100-(p.c-min)/(max-min)*100}
+    for(const p of points){p.x=(p.ms-start)/duration*100;p.y=100-(p.c-min)/(max-min)*100}
     const segments=[];
     for(const p of points){if(!segments.length || p.ms-segments[segments.length-1].at(-1).ms>2*3600000)segments.push([]);segments.at(-1).push(p)}
     return {points,ticks,segments,start,end:now,min,max,step};
   }
   function halfHourTicks(start, end, tz) {
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end<=start || end-start>86400000) return [];
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end<=start || end-start>172800000) return [];
     let formatter;
     try { formatter=new Intl.DateTimeFormat('en-GB',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}); }
     catch { return []; }
