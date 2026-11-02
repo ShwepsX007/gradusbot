@@ -44,7 +44,7 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
    if(deferAccount){deferAccount=false;await new Promise(resolve=>{releaseAccount=resolve})}
  }
  else if(url==='/api/stations')data=[station];
- else if(url==='/api/stations/1/weather')data={station,forecast:{timezone:'UTC',daily:{sunrise:['2026-06-01T06:00'],sunset:['2026-06-01T18:00']}},metar:{temp:15},metar_history:[[fixedNow/1000-30*3600,8],[fixedNow/1000-3600,13]],metar_archive:{status:'ok',last_success:fixedNow/1000,reports:[{obs_time:fixedNow/1000-3600,temp:13,raw:'<img id=bad-metar>',wind_speed:10,wind_dir:'VRB',wind_gust:15,dew_point:7}]},history:[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t])};
+ else if(url==='/api/stations/1/weather')data={station,forecast:{timezone:'UTC',daily:{sunrise:['2026-06-01T06:00'],sunset:['2026-06-01T18:00']}},metar:{temp:15},metar_history:[[fixedNow/1000-6*86400,5],[fixedNow/1000-30*3600,8],[fixedNow/1000-3600,13]],forecast_ensemble:{timezone:'UTC',points:[{time:fixedNow/1000-6*3600,temp:10,sources:{'Open-Meteo':8,'MET Norway':12}},{time:fixedNow/1000+5*3600,temp:20,sources:{'Open-Meteo':20}}]},forecast_status:{reason:'ok',open_meteo:'ok',met_norway:'ok',met_norway_fetched_at:fixedNow/1000},metar_archive:{status:'ok',last_success:fixedNow/1000,reports:[{obs_time:fixedNow/1000-3600,temp:13,raw:'<img id=bad-metar>',wind_speed:10,wind_dir:'VRB',wind_gust:15,dew_point:7}]},history:[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t])};
  else if(url==='/api/stations/1/bindings')data=bindings;
  else if(url.endsWith('/books'))data=url.includes('/second/')?booksSecond:books;
  else if(url.startsWith('/api/market/'))data={market:{title:'Weather',options:url.endsWith('/second')?optsSecond:opts,closed:false},positions:[]};
@@ -60,8 +60,14 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert.equal(w.document.querySelector('#sun-dot').getAttribute('r'),'10');assert.equal(w.document.querySelector('#sun-glow').getAttribute('r'),'13.5');
  assert.deepEqual([...w.document.querySelectorAll('.arc-trend')].map(x=>x.textContent),['↑','↓']);
  assert.equal(w.document.querySelectorAll('.arc-observation').length,4);
- assert.equal(w.document.querySelector('#chart-min-label').textContent,'МИНИМУМ ЗА 48 Ч');
- assert.equal(w.document.querySelectorAll('#chart-labels .chart-point').length,2);
+ assert.equal(w.document.querySelector('#chart-min-label').textContent,'МИНИМУМ ЗА 7 ДНЕЙ');
+ assert.equal(w.document.querySelectorAll('#chart-labels .chart-point').length,3);
+ assert.equal(w.document.querySelector('#forecast-min').textContent,'10°C');assert.equal(w.document.querySelector('#forecast-max').textContent,'20°C');
+ assert(w.document.querySelector('#forecast-source-status').textContent.includes('MET Norway 12°C'));
+ w.renderForecastStatus({forecast_status:{reason:'disabled'}},null);assert(w.document.querySelector('#forecast-source-status').textContent.includes('Включите станцию'));
+ w.renderForecastStatus({forecast_status:{reason:'no_coordinates'}},null);assert(w.document.querySelector('#forecast-source-status').textContent.includes('координаты'));
+ w.renderForecastStatus({forecast_status:{reason:'no_timezone',open_meteo:'unavailable',met_norway:'ok'}},null);assert(w.document.querySelector('#forecast-source-status').textContent.includes('часовой пояс станции неизвестен'));
+
  assert(w.document.querySelector('#metar-archive-status').textContent.includes('Архив получен'));
  assert(w.document.querySelector('#metar-archive-reports').textContent.includes('<img id=bad-metar>'));
  assert(!w.document.querySelector('#bad-metar'));assert(w.document.querySelector('#metar-archive-reports').textContent.includes('10 узл.'));
@@ -69,6 +75,7 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert.equal(w.document.querySelector('#chart-min-label').textContent,'МИНИМУМ ЗА 24 Ч');
  assert.equal(w.document.querySelectorAll('#chart-labels .chart-point').length,1);
  w.document.querySelector('[data-hours="48"]').click();assert.equal(w.document.querySelectorAll('#chart-labels .chart-point').length,2);
+ w.document.querySelector('[data-hours="168"]').click();assert.equal(w.document.querySelectorAll('#chart-labels .chart-point').length,3);
 
  const pick=w.document.querySelector('.quote-pick[data-index="0"][data-token="no"][data-side="ask"]');assert(pick);pick.click();
  assert.equal(w.document.querySelector('#trade-option').value,'0');assert.equal(w.document.querySelector('#trade-token').value,'no');

@@ -29,7 +29,8 @@ function prettyNumber(n){return String(Math.round((n+Number.EPSILON)*10)/10)}
 function tempText(v){let c=tempNumber(v);if(c===null)return '—';let f=prettyNumber(c*9/5+32),cc=prettyNumber(c);return state.units==='F'?`${f}°F`:state.units==='B'?`${cc}°C / ${f}°F`:`${cc}°C`}
 function tempMarker(v,x){let c=tempNumber(v);if(c===null)return '—';if(state.units==='B')return `<tspan x="${x}" dy="-2">${prettyNumber(c)}°C</tspan><tspan x="${x}" dy="6">${prettyNumber(c*9/5+32)}°F</tspan>`;return tempText(c)}
 function timePart(v){return v?String(v).slice(11,16):'—'}
-function renderWeather(){let w=state.weather||{},s=w.station||(state.demo?demoStation:state.stations.find(x=>x.id===state.selected))||{},m=w.metar||{},f=w.forecast||{},d=f.daily||{},h=f.hourly||{};$('#station-code').textContent=s.station_code||'—';$('#station-status').textContent=state.demo?'ДЕМО':s.enabled?'СТАНЦИЯ ВКЛЮЧЕНА':'СТАНЦИЯ ВЫКЛЮЧЕНА';$('#station-name').textContent=s.name||'Выберите станцию';$('#station-location').textContent=(w.info?.name||'Метеостанция')+' · '+(f.timezone||'часовой пояс недоступен');$('#station-toggle').classList.toggle('on',!!s.enabled);$('#weather-pill').innerHTML=state.demo?'ПРИМЕР ДАННЫХ':s.enabled?'<i></i> НАБЛЮДЕНИЕ':'ОПРОС ВЫКЛЮЧЕН';$('#temperature').textContent=tempText(m.temp);$('#temperature').classList.toggle('temperature-dual',state.units==='B');$('#condition').textContent=m.cloud?.description||w.message||'Нет данных';$('#humidity').textContent=fmt(m.humidity,'%');$('#wind').textContent=m.wind_speed!=null?`${m.wind_speed} узл. / ${m.wind_ms!=null?prettyNumber(m.wind_ms)+' м/с':'— м/с'}`:'—';$('#wind-direction').textContent=m.wind_dir==null?'Направление —':String(m.wind_dir).toUpperCase()==='VRB'?'Направление переменное':`Направление ${m.wind_dir}°`;$('#cloud').textContent=m.cloud?.description||'—';$('#cloud-code').textContent=m.cloud?.code?'METAR · '+m.cloud.code:'METAR';renderPrecipitation(m,f);$('#raw-metar').textContent=m.raw_metar||w.message||'Нет данных';$('#sunrise').textContent=timePart(d.sunrise?.[0]);$('#sunset').textContent=timePart(d.sunset?.[0]);let today=localDate(f.timezone), dates=d.time||d.sunrise?.map(x=>x.slice(0,10))||[], idx=dates.indexOf(today);if(!today)idx=0;state.dayIndex=idx;today=idx>=0?dates[idx]:today;$('#sunrise').textContent=timePart(d.sunrise?.[idx]);$('#sunset').textContent=timePart(d.sunset?.[idx]);let extrema=WeatherView.hourlyExtremaForDay(f,today),max=extrema?.max,min=extrema?.min;$('#forecast-max').textContent=tempText(max?.temp??d.temperature_2m_max?.[idx]);$('#forecast-min').textContent=tempText(min?.temp??d.temperature_2m_min?.[idx]);$('#forecast-max-time').textContent=max?'около '+max.time:'—';$('#forecast-min-time').textContent=min?'около '+min.time:'—';drawChart(state.demo?(w.history||[]):(w.metar_history||[]),f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone);renderMetarArchive(w);updateClock()}
+function weatherExtrema(w,day){return w.forecast_ensemble?WeatherView.ensembleExtremaForDay(w.forecast_ensemble,day):w.forecast_status?null:WeatherView.hourlyExtremaForDay(w.forecast||{},day)}
+function renderWeather(){let w=state.weather||{},s=w.station||(state.demo?demoStation:state.stations.find(x=>x.id===state.selected))||{},m=w.metar||{},f=w.forecast||{},d=f.daily||{},h=f.hourly||{};$('#station-code').textContent=s.station_code||'—';$('#station-status').textContent=state.demo?'ДЕМО':s.enabled?'СТАНЦИЯ ВКЛЮЧЕНА':'СТАНЦИЯ ВЫКЛЮЧЕНА';$('#station-name').textContent=s.name||'Выберите станцию';$('#station-location').textContent=(w.info?.name||w.info?.site||'Метеостанция')+' · '+(w.forecast_ensemble?.timezone||f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone||'часовой пояс недоступен');$('#station-toggle').classList.toggle('on',!!s.enabled);$('#weather-pill').innerHTML=state.demo?'ПРИМЕР ДАННЫХ':s.enabled?'<i></i> НАБЛЮДЕНИЕ':'ОПРОС ВЫКЛЮЧЕН';$('#temperature').textContent=tempText(m.temp);$('#temperature').classList.toggle('temperature-dual',state.units==='B');$('#condition').textContent=m.cloud?.description||w.message||'Нет данных';$('#humidity').textContent=fmt(m.humidity,'%');$('#wind').textContent=m.wind_speed!=null?`${m.wind_speed} узл. / ${m.wind_ms!=null?prettyNumber(m.wind_ms)+' м/с':'— м/с'}`:'—';$('#wind-direction').textContent=m.wind_dir==null?'Направление —':String(m.wind_dir).toUpperCase()==='VRB'?'Направление переменное':`Направление ${m.wind_dir}°`;$('#cloud').textContent=m.cloud?.description||'—';$('#cloud-code').textContent=m.cloud?.code?'METAR · '+m.cloud.code:'METAR';renderPrecipitation(m,f);$('#raw-metar').textContent=m.raw_metar||w.message||'Нет данных';$('#sunrise').textContent=timePart(d.sunrise?.[0]);$('#sunset').textContent=timePart(d.sunset?.[0]);let today=localDate(w.forecast_ensemble?.timezone||f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone), dates=d.time||d.sunrise?.map(x=>x.slice(0,10))||[], idx=dates.indexOf(today);if(!today)idx=0;state.dayIndex=idx;today=idx>=0?dates[idx]:today;$('#sunrise').textContent=timePart(d.sunrise?.[idx]);$('#sunset').textContent=timePart(d.sunset?.[idx]);let extrema=weatherExtrema(w,today),max=extrema?.max,min=extrema?.min;$('#forecast-max').textContent=tempText(max?.temp??(!w.forecast_status?d.temperature_2m_max?.[idx]:null));$('#forecast-min').textContent=tempText(min?.temp??(!w.forecast_status?d.temperature_2m_min?.[idx]:null));$('#forecast-max-time').textContent=max?'около '+max.time:'—';$('#forecast-min-time').textContent=min?'около '+min.time:'—';drawChart(state.demo?(w.history||[]):(w.metar_history||[]),w.forecast_ensemble?.timezone||f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone);renderForecastStatus(w,extrema);renderMetarArchive(w);updateClock()}
 function renderPrecipitation(m,f){
   $('#precip-observed').textContent=m.precipitation?.description||'Нет данных';
   let stamp=Number(m.obs_time),obsTime='Последняя сводка станции';
@@ -39,7 +40,7 @@ function renderPrecipitation(m,f){
   el.textContent=p?`${p.probability}%${p.probability>=60?' · высокая':''}`:'Нет данных';el.classList.toggle('risk-high',!!p&&p.probability>=60);
   $('#precip-period').textContent=p?`Интервал ${p.start}–${p.end} · местное время`:'Почасовой прогноз недоступен';
 }
-let chartState={points:[],selected:null,timezone:'UTC',isUTC:true,hours:48};
+let chartState={points:[],selected:null,timezone:'UTC',isUTC:true,hours:168};
 function chartNumber(n){return String(Math.round((n+Number.EPSILON)*100)/100)}
 function chartTemp(c){if(!Number.isFinite(c))return '—';let a=chartNumber(c)+'°C',b=chartNumber(c*9/5+32)+'°F';return state.units==='F'?b:state.units==='B'?a+' / '+b:a}
 function chartTime(ms,detail=false){
@@ -64,8 +65,8 @@ function drawChart(history,tz){
   let previous=chartState.selected;
   try{new Intl.DateTimeFormat('ru-RU',{timeZone:tz||'UTC'});chartState.timezone=tz||'UTC';chartState.isUTC=!tz}catch{chartState.timezone='UTC';chartState.isUTC=true}
   const chart=WeatherView.metarChart(history,state.units,Date.now(),chartState.hours),pts=chart.points;chartState.points=pts;chartState.start=chart.start;chartState.end=chart.end;
-  $('#chart-min-label').textContent=`МИНИМУМ ЗА ${chartState.hours} Ч`;$('#chart-max-label').textContent=`МАКСИМУМ ЗА ${chartState.hours} Ч`;
-  $('.chart-inner').style.width=(chartState.hours===48?5760:2880)+'px';
+  $('#chart-min-label').textContent=`МИНИМУМ ЗА ${chartState.hours===168?'7 ДНЕЙ':chartState.hours+' Ч'}`;$('#chart-max-label').textContent=`МАКСИМУМ ЗА ${chartState.hours===168?'7 ДНЕЙ':chartState.hours+' Ч'}`;
+  $('.chart-inner').style.width=(chartState.hours*120)+'px';
   $$('.chart-range').forEach(b=>{const active=Number(b.dataset.hours)===chartState.hours;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});
   $('#chart-zone').textContent=chartState.isUTC?'Время: UTC (часовой пояс станции недоступен)':'Время станции: '+chartState.timezone;
   // Align ticks to the station's actual wall-clock half-hours, including DST changes.
@@ -86,9 +87,21 @@ function drawChart(history,tz){
   for(const [id,p] of [['last',last],['min',min],['max',max]]){$('#chart-'+id).textContent=chartTemp(p.c);$('#chart-'+id+'-time').textContent=chartTime(p.ms,true)}
   const selected=pts.findIndex(p=>p.ms===previous);if(selected>=0)selectChartPoint(selected);else hideChartSelection();
 }
+function renderForecastStatus(w,extrema){
+  const s=w?.forecast_status,el=$('#forecast-source-status');
+  if(state.demo){el.textContent='Демонстрационный прогноз';return}
+  if(!s){el.textContent=state.weather?'Сведения об источниках недоступны':'Загрузка прогноза…';return}
+  if(s.reason==='disabled'){el.textContent='Включите станцию для загрузки прогноза; архив METAR доступен отдельно.';return}
+  if(s.reason==='no_coordinates'){el.textContent='Не удалось получить координаты станции; прогноз недоступен.';return}
+  if(s.reason==='unsupported'||s.reason==='invalid_code'){el.textContent='Прогноз доступен для станции METAR с корректным ICAO-кодом.';return}
+  const om=s.open_meteo==='ok'?'доступен':'недоступен',mn=s.met_norway==='ok'?'доступен':s.met_norway==='throttled'?'ограничен':s.met_norway==='loading'?'загружается':'недоступен';
+  const sourceText=p=>Object.entries(p?.sources||{}).map(([name,value])=>name+' '+tempText(value)).join(' + ')||'нет данных';
+  const details=extrema?` · минимум: ${sourceText(extrema.min)}; максимум: ${sourceText(extrema.max)}`:' · нет температур за текущую местную дату';
+  el.textContent=`Open-Meteo: ${om} · MET Norway: ${mn}`+(s.met_norway_fetched_at?` (получен ${chartTime(s.met_norway_fetched_at*1000,true)}${s.met_norway_updated_at&&Number.isFinite(Date.parse(s.met_norway_updated_at))?' · модель '+chartTime(Date.parse(s.met_norway_updated_at),true):''})`:'')+(s.reason==='no_timezone'?' · часовой пояс станции неизвестен, минимум и максимум не рассчитаны':details)+'. По доступным часам; источники могут отсутствовать для части суток.';
+}
 function renderMetarArchive(w){
   const archive=w?.metar_archive,reports=Array.isArray(archive?.reports)?archive.reports:[];
-  const messages={ok:'Архив получен',empty:'Источник не вернул сводки',error:'Архив временно недоступен; показаны сохранённые данные',throttled:'Архив временно отложен из-за ограничений источника',loading:'Архив загружается',not_loaded:'Архив ещё не загружен',unsupported:'Архив доступен только для METAR-станций с ICAO'};
+  const messages={ok:'Архив получен',partial:'Архив загружен частично; повторная попытка позже',empty:'Источник не вернул сводки',error:'Архив временно недоступен; показаны сохранённые данные',throttled:'Архив временно отложен из-за ограничений источника',loading:'Архив загружается',not_loaded:'Архив ещё не загружен',unsupported:'Архив доступен только для METAR-станций с ICAO'};
   const updated=archive?.last_success?` · обновлён ${chartTime(Number(archive.last_success)*1000,true)}`:'';
   $('#metar-archive-status').textContent=(state.demo?'Демонстрационные данные':!state.weather?'Загрузка погоды и архива':messages[archive?.status]||'Архив ещё не загружен')+updated+'. Доступность и полнота архива не гарантируются; возможны пропуски.';
   $('#metar-archive-count').textContent=reports.length?`· ${reports.length}`:'';
@@ -101,7 +114,7 @@ function renderMetarArchive(w){
   }).join(''):'Нет загруженных архивных сводок.';
 }
 $$('.chart-range').forEach(button=>button.onclick=()=>{
-  const hours=Number(button.dataset.hours);if(![24,48].includes(hours)||hours===chartState.hours)return;
+  const hours=Number(button.dataset.hours);if(![24,48,168].includes(hours)||hours===chartState.hours)return;
   chartState.hours=hours;chartState.drawn=false;renderWeather();
 });
 const chartPlot=$('#chart-plot');
@@ -156,12 +169,12 @@ function renderArcExtrema(extrema,sunrise,sunset,current){
   const marks=[['min','МИН',extrema.min],['max','МАКС',extrema.max]].map(([kind,label,p])=>({kind,label,forecast:p,point:curvePoint(p.seconds,sunrise,sunset)})).filter(x=>x.point);
   group.innerHTML=marks.map(({kind,label,forecast:p,point})=>{
     const x=point.x,y=point.y,labelX=Math.max(70,Math.min(730,x)),labelY=kind==='min'?Math.min(213,y+29):Math.max(14,y-29);
-    return `<g class="arc-extreme ${kind}" tabindex="0" aria-label="${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)}"><title>${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)} · Open-Meteo, почасовая модель</title><line x1="${x}" y1="${y}" x2="${labelX}" y2="${kind==='min'?labelY-8:labelY+5}"/><circle cx="${x}" cy="${y}" r="${kind==='min'?5.5:3.7}"/><text x="${labelX}" y="${labelY}" text-anchor="middle">${label}</text></g>`;
+    return `<g class="arc-extreme ${kind}" tabindex="0" aria-label="${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)}"><title>${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)} · ${esc(Object.keys(p.sources||{}).join(' + ')||'Open-Meteo')}${p.interpolated?' (интерполяция)':''}, почасовая модель</title><line x1="${x}" y1="${y}" x2="${labelX}" y2="${kind==='min'?labelY-8:labelY+5}"/><circle cx="${x}" cy="${y}" r="${kind==='min'?5.5:3.7}"/><text x="${labelX}" y="${labelY}" text-anchor="middle">${label}</text></g>`;
   }).join('');
   return marks;
 }
 function updateClock(){
-  const w=state.weather||{},f=w.forecast||{},now=Date.now(),tz=f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone;
+  const w=state.weather||{},f=w.forecast||{},now=Date.now(),tz=w.forecast_ensemble?.timezone||f.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone;
   const local=localClock(now,tz), day=local?shiftDay(local.day,state.arcOffset):null, solar=day?displayedSolarDay(w,day):null,current=state.arcOffset===0;
   $('#arc-prev').disabled=!local||state.arcOffset<=-6;$('#arc-next').disabled=!local||state.arcOffset>=0;
   $('#arc-day-counter').textContent=`${1-state.arcOffset} / 7`;
@@ -170,7 +183,7 @@ function updateClock(){
   $('#local-time-label').textContent=current?'МЕСТНОЕ ВРЕМЯ':'ВЫБРАННАЯ ДАТА';
   $('#local-time').textContent=current?(local?.time||'—'):(day?day.split('-').reverse().join('.'):'—');
   const sunrise=solarSeconds(solar?.sunrise), sunset=solarSeconds(solar?.sunset), path=dailyPath(sunrise,sunset);
-  const extrema=WeatherView.hourlyExtremaForDay(f,day),marks=renderArcExtrema(extrema,sunrise,sunset,current);
+  const extrema=weatherExtrema(w,day),marks=renderArcExtrema(extrema,sunrise,sunset,current);
   const todaySolar=local?displayedSolarDay(w,local.day):null,todayRise=solarSeconds(todaySolar?.sunrise),todaySet=solarSeconds(todaySolar?.sunset);
   const isDay=local&&todayRise!==null&&todaySet!==null&&todayRise<todaySet?local.seconds>=todayRise&&local.seconds<todaySet:null;
   renderArcWeather(w,current,isDay,tz);
@@ -200,7 +213,7 @@ function updateClock(){
     const arrow=direction?`<text class="arc-trend ${item.trend}" x="${p.x}" y="${arrowY}" text-anchor="middle" aria-hidden="true">${direction}</text>`:'';
     return `<g class="arc-observation"><title>${esc(item.time)} · ${esc(tempText(item.temp)+trendNote)}</title><circle cx="${p.x}" cy="${p.y}" r="2.4"/>${arrow}${label}</g>`;
   }).join('');
-  const modelNote=extrema?`Цветные точки — ${current?'прогноз':'данные модели за дату'} Open-Meteo по доступным часам (${extrema.count})`:'Почасовые данные модели недоступны';
+  const modelNote=extrema?`Цветные точки — ${current?'средний прогноз по доступным источникам':'данные модели за дату'} по доступным часам (${extrema.count})`:'Почасовые данные модели недоступны';
   $('#arc-note').textContent=`Сохранено наблюдений: ${observations.length}. Стрелки показывают изменение относительно предыдущего сохранённого наблюдения, в том числе за прошлый день. ${modelNote}${current?'; на светиле — последний METAR':''}. Не гарантия результата рынка.`;
 }
 

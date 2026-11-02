@@ -36,7 +36,7 @@ class MetarArchiveTests(unittest.TestCase):
     def test_parse_validates_station_time_temperature_and_duplicates(self):
         now=int(time.time());t=now-60
         data=[report('EGLL',t,11,dewp=6,wspd=10,wdir='VRB',wgst=15),report('EGLL',t,99),
-              report('EGLL',now-49*3600,2),report('EGLL',now+60,3),report('KJFK',now-30,20),
+              report('EGLL',now-169*3600,2),report('EGLL',now+60,3),report('KJFK',now-30,20),
               report('EGLL',now-120,None),report('EGLL',True,9),report('EGLL',now-180,float('nan'),rawOb='')]
         rows=archive.parse_reports(data,'EGLL',now)
         self.assertEqual(len(rows),2);self.assertEqual(rows[0][2],11);self.assertEqual(rows[0][6],'VRB')
@@ -51,7 +51,7 @@ class MetarArchiveTests(unittest.TestCase):
             first=self.client.get(f'/api/stations/{self.sid}/weather').get_json()
             second=self.client.get(f'/api/stations/{other}/weather').get_json()
             live.assert_not_called();self.assertEqual(request.call_count,1)
-            self.assertEqual(request.call_args.kwargs['params'],{'ids':'EGLL','format':'json','hours':48})
+            self.assertEqual(request.call_args.kwargs['params'],{'ids':'EGLL','format':'json','hours':168})
         self.assertEqual(first['station']['enabled'],0);self.assertIn('выключен',first['message'])
         self.assertEqual(first['metar_archive']['status'],'ok')
         self.assertEqual(first['metar_history'],[[old,9.4],[recent,18.3]])
@@ -67,14 +67,14 @@ class MetarArchiveTests(unittest.TestCase):
         with patch.object(archive.utils.SESSION,'get',return_value=response([report('EGLL',last,16),report('EGLL',now-30*3600,8)])), \
              patch.object(web.utils,'fetch_metar',return_value=None),patch.object(web,'station_info',return_value=None):
             result=self.client.get(f'/api/stations/{self.sid}/weather').get_json()
-        self.assertEqual(result['metar_history'],[[now-30*3600,8.0],[last,17.0]])
+        self.assertEqual(result['metar_history'],[[old,3.0],[now-30*3600,8.0],[last,17.0]])
         self.assertIn([old,3.0],result['history']);self.assertEqual(result['history'].count([last,17.0]),1)
         self.assertEqual(result['metar_archive']['reports'][0]['temp'],16.0)
     def test_cache_expiry_global_pruning_and_station_deletion(self):
         now=int(time.time());other=web.db.add_station('other','','','KJFK','metar')
         with web.db.get_db() as conn:
             conn.executemany('INSERT INTO web_metar_archive(icao,obs_time,temp) VALUES(?,?,?)',[
-                ('EGLL',now-49*3600,1),('EGLL',now-3600,2),('KJFK',now-49*3600,3),('KJFK',now-3600,4)])
+                ('EGLL',now-169*3600,1),('EGLL',now-3600,2),('KJFK',now-169*3600,3),('KJFK',now-3600,4)])
         archive.prune()
         with web.db.get_db() as conn:
             records=conn.execute('SELECT icao,temp FROM web_metar_archive ORDER BY icao').fetchall()
@@ -124,6 +124,36 @@ class MetarArchiveTests(unittest.TestCase):
         with web.db.get_db() as conn:conn.execute('INSERT INTO web_metar_archive(icao,obs_time,temp) VALUES(?,?,?)',('EGLL',now-archive.WINDOW-1,10))
         archive.init_db()
         with web.db.get_db() as conn:self.assertEqual(conn.execute('SELECT COUNT(*) FROM web_metar_archive').fetchone()[0],2)
+    def test_pages_backwards_when_provider_hits_400_and_keeps_7_days(self):
+        now=int(time.time()//60*60)-60
+        newest=[report('EGLL',now-i*900,i,lat=51.47,lon=-0.45) for i in range(400)]
+        # Use realistic temperatures, including an overlap at the page boundary.
+        for row in newest:row['temp']=10
+        oldest=newest[-1]['obsTime']
+        older=[report('EGLL',oldest-i*900,9,lat=51.47,lon=-0.45) for i in range(0,260)]
+        with patch.object(archive.utils.SESSION,'get',side_effect=[response(newest),response(older)]) as request:
+            archive.refresh('EGLL');self.assertEqual(request.call_count,2)
+            self.assertIn('date',request.call_args_list[1].kwargs['params'])
+        result=archive.get('EGLL');self.assertEqual(result['status'],'ok')
+        self.assertEqual(len(result['reports']),659);self.assertEqual(result['location'],{'lat':51.47,'lon':-0.45})
+        self.assertLess(result['reports'][-1]['obs_time'],now-6*86400)
+    def test_partial_page_failure_preserves_usable_data_and_shows_partial(self):
+        now=int(time.time()//60*60)-60
+        first=[report('EGLL',now-i*900,10) for i in range(400)]
+        with patch.object(archive.utils.SESSION,'get',side_effect=[response(first),TimeoutError('offline')]):archive.refresh('EGLL')
+        result=archive.get('EGLL');self.assertEqual(result['status'],'partial');self.assertEqual(len(result['reports']),400)
+        with patch.object(archive.utils.SESSION,'get') as request:archive.refresh('EGLL');request.assert_not_called()
+    def test_migrates_48_hour_cache_and_refreshes_7_days_immediately(self):
+        now=time.time()
+        with web.db.get_db() as c:
+            c.execute('DROP TABLE web_metar_archive_status')
+            c.execute("CREATE TABLE web_metar_archive_status (icao TEXT PRIMARY KEY,last_attempt REAL NOT NULL,last_success REAL,status TEXT NOT NULL)")
+            c.execute("INSERT INTO web_metar_archive_status VALUES(?,?,?,'ok')",('EGLL',now,now))
+        archive.init_db()
+        with web.db.get_db() as c:self.assertEqual(c.execute('SELECT range_hours FROM web_metar_archive_status').fetchone()[0],48)
+        with patch.object(archive.utils.SESSION,'get',return_value=response([report('EGLL',int(now)-5*86400,4)])) as request:
+            archive.refresh('EGLL');self.assertEqual(request.call_count,1)
+        self.assertEqual(archive.get('EGLL')['reports'][0]['temp'],4)
     def test_database_lease_prevents_concurrent_duplicate_and_respects_deletion(self):
         entered=threading.Event();release=threading.Event();now=int(time.time())
         def slow(*_args,**_kwargs):entered.set();self.assertTrue(release.wait(5));return response([report('EGLL',now-60)])

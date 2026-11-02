@@ -16,6 +16,7 @@ class TerminalTests(unittest.TestCase):
         web.db.init_db()
         web.init_web_db()
         self.archive_patch=patch.object(web.metar_archive,'refresh',return_value=None);self.archive_patch.start()
+        self.metno_patch=patch.object(web.forecast_ensemble,'get_metno',return_value={'status':'error','data':None});self.metno_patch.start()
         web._cache.clear()
         web.app.config.update(WEB_AUTH_CONFIGURED=True, WEB_USERNAME='testuser', WEB_PASSWORD_HASH='testhash')
         self.client = web.app.test_client()
@@ -26,6 +27,7 @@ class TerminalTests(unittest.TestCase):
         self.client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
 
     def tearDown(self):
+        self.metno_patch.stop()
         self.archive_patch.stop()
         web.db.DB_FILE = self.old_db
         self.tmp.cleanup()

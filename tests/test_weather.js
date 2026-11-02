@@ -124,7 +124,7 @@ assert.equal(chart48.points.length,2);assert.equal(chart48.start,now-48*3600000)
 assert.equal(chart48.points[0].x,37.5);assert.equal(chart48.points.at(-1).x,100);
 assert.equal(metarChart([[older/1000,7],[now/1000,10]],'C',now,24).points.length,1);
 assert.equal(halfHourTicks(now-48*3600000,now,'UTC').length,97);
-assert.deepEqual(halfHourTicks(now-49*3600000,now,'UTC'),[]);
+assert.deepEqual(halfHourTicks(now-169*3600000,now,'UTC'),[]);
 console.log('48-hour METAR period and half-hour ticks: OK');
 const fallEnd=Date.parse('2026-11-02T08:00:00Z');
 const fall48=halfHourTicks(fallEnd-48*3600000,fallEnd,'America/New_York');
@@ -134,3 +134,19 @@ const springEnd=Date.parse('2026-03-09T08:00:00Z');
 const spring48=halfHourTicks(springEnd-48*3600000,springEnd,'America/New_York');
 assert.equal(spring48.length,97);
 assert.equal(spring48.filter(t=>t.ms>=Date.parse('2026-03-08T05:00:00Z')&&t.ms<Date.parse('2026-03-08T08:00:00Z')&&t.time==='02:30').length,0);
+
+const chart7=metarChart([[ (now-6*86400000)/1000,2],[now/1000,10]],'C',now,168);
+assert.equal(chart7.points.length,2);assert.equal(chart7.start,now-7*86400000);
+assert.equal(halfHourTicks(now-7*86400000,now,'UTC').length,337);
+const {ensembleExtremaForDay}=require('../web/static/weather.js');
+const e={timezone:'America/New_York',points:[
+ {time:Date.parse('2026-11-01T05:30:00Z')/1000,temp:10,sources:{'Open-Meteo':8,'MET Norway':12}},
+ {time:Date.parse('2026-11-01T06:30:00Z')/1000,temp:20,sources:{'Open-Meteo':20}},
+ {time:Date.parse('2026-11-02T06:30:00Z')/1000,temp:-50,sources:{'Open-Meteo':-50}}]};
+const extreme=ensembleExtremaForDay(e,'2026-11-01');assert.equal(extreme.min.temp,10);assert.equal(extreme.max.temp,20);
+assert.equal(extreme.min.time,'01:30');assert.equal(extreme.max.time,'01:30');assert.equal(extreme.count,2);
+assert.equal(ensembleExtremaForDay({...e,timezone:null},'2026-11-01'),null);
+console.log('Seven-day chart and DST-aware ensemble extrema: OK');
+
+const repeatedEnd={timezone:'America/New_York',hourly:{time:['2026-11-01T01:00','2026-11-01T01:00','2026-11-01T02:00'],epoch:[Date.parse('2026-11-01T05:00:00Z')/1000,Date.parse('2026-11-01T06:00:00Z')/1000,Date.parse('2026-11-01T07:00:00Z')/1000],precipitation_probability:[10,70,30]}};
+assert.equal(precipitationForecast(repeatedEnd,Date.parse('2026-11-01T05:30:00Z')).probability,70);

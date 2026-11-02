@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive
+from web import metar_archive, forecast_ensemble
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -86,6 +86,7 @@ def init_web_db():
             id INTEGER PRIMARY KEY CHECK(id=1), interval_seconds INTEGER NOT NULL DEFAULT 30)''')
         conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
     metar_archive.init_db()
+    forecast_ensemble.init_db()
 
 
 
@@ -133,10 +134,10 @@ def station_info(code):
 
 
 def forecast(lat, lon):
-    return cached(('forecast', lat, lon), 900, lambda: upstream('https://api.open-meteo.com/v1/forecast', {
+    return cached(('forecast', lat, lon), 900, lambda: forecast_ensemble.normalize_open_meteo(upstream('https://api.open-meteo.com/v1/forecast', {
         'latitude': lat, 'longitude': lon, 'timezone': 'auto', 'past_days': 6, 'forecast_days': 2,
         'hourly': 'temperature_2m,relative_humidity_2m,cloud_cover,wind_speed_10m,wind_direction_10m,precipitation_probability',
-        'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset'}))
+        'daily': 'temperature_2m_max,temperature_2m_min,sunrise,sunset', 'timeformat':'unixtime'})))
 
 
 def humidity(temp, dew):
@@ -593,6 +594,7 @@ def remove_station(sid):
         if old_code and not conn.execute("SELECT 1 FROM stations WHERE station_type='metar' AND UPPER(station_code)=? LIMIT 1",(old_code,)).fetchone():
             conn.execute('DELETE FROM web_metar_archive WHERE icao=?',(old_code,))
             conn.execute('DELETE FROM web_metar_archive_status WHERE icao=?',(old_code,))
+            conn.execute('DELETE FROM web_metar_archive_station WHERE icao=?',(old_code,))
     return jsonify(ok=True)
 
 
@@ -632,14 +634,14 @@ def combined_history(sid, archive=None):
 
 def metar_chart_history(sid, archive=None):
     # Bot history stores poll times, not METAR observation times; do not mix them.
-    return _metar_points(sid,archive,48)
+    return _metar_points(sid,archive,168)
 
 
 def save_solar_days(sid, forecast_data):
     if not isinstance(forecast_data, dict): return
     tz = forecast_data.get('timezone')
     daily = forecast_data.get('daily') or {}
-    if not isinstance(tz, str) or not tz or not isinstance(daily, dict): return
+    if not forecast_ensemble.valid_timezone(tz) or not isinstance(daily, dict): return
     dates, rises, sets = daily.get('time'), daily.get('sunrise'), daily.get('sunset')
     if not all(isinstance(x, list) for x in (dates, rises, sets)): return
     rows = []
@@ -674,14 +676,16 @@ def weather(sid):
     valid=station.get('station_type')=='metar' and re.fullmatch(r'[A-Z0-9]{4}',code)
     if valid: metar_archive.refresh(code)
     archive=metar_archive.get(code if valid else None)
-    result = {'station': public_station(station), 'history': combined_history(sid,archive), 'metar_history': metar_chart_history(sid,archive), 'metar_archive':archive, 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'info': None}
+    result = {'station': public_station(station), 'history': combined_history(sid,archive), 'metar_history': metar_chart_history(sid,archive), 'metar_archive':archive, 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'forecast_ensemble': None, 'forecast_status': {'reason':'disabled' if not station['enabled'] else 'pending'}, 'info': None}
     if not station['enabled']:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
     if station.get('station_type') != 'metar':
+        result['forecast_status']={'reason':'unsupported'}
         result['message'] = 'В веб-терминале поддерживаются станции METAR'
         return jsonify(result)
     if not valid:
+        result['forecast_status']={'reason':'invalid_code'}
         result['message'] = 'Некорректный ICAO-код'
         return jsonify(result)
     # Additional cache prevents aggressive polling from multiple browser tabs.
@@ -702,11 +706,27 @@ def weather(sid):
         result['history'] = combined_history(sid,archive)
         result['metar_history'] = metar_chart_history(sid,archive)
     info = station_info(code)
+    coord_source='stationinfo'
+    if not isinstance(info,dict) or not forecast_ensemble.coordinates(info.get('lat'),info.get('lon')):
+        info=archive.get('location');coord_source='metar_archive'
     result['info'] = info
-    if info and info.get('lat') is not None and info.get('lon') is not None:
-        result['forecast'] = forecast(info['lat'], info['lon'])
-        save_solar_days(sid, result['forecast'])
+    coords=forecast_ensemble.coordinates(info.get('lat'),info.get('lon')) if isinstance(info,dict) else None
+    if coords:
+        opened=forecast(*coords)
+        result['forecast']=opened
+        save_solar_days(sid, opened)
         result['solar_days'] = get_solar_days(sid)
+        metno=forecast_ensemble.get_metno(*coords)
+        tz_candidates=[opened.get('timezone') if isinstance(opened,dict) else None]+[s.get('timezone') for s in result['solar_days']]
+        tz=next((name for name in tz_candidates if forecast_ensemble.valid_timezone(name)),None)
+        result['forecast_ensemble']=forecast_ensemble.ensemble(opened,metno.get('data'),tz)
+        has_open=any('Open-Meteo' in p['sources'] for p in result['forecast_ensemble']['points'])
+        result['forecast_status']={'reason': 'ok' if tz else 'no_timezone', 'coordinate_source':coord_source,
+            'open_meteo': 'ok' if has_open else 'unavailable',
+            'met_norway':metno.get('status'), 'met_norway_updated_at':(metno.get('data') or {}).get('updated_at'),
+            'met_norway_fetched_at':metno.get('fetched_at')}
+    else:
+        result['forecast_status']={'reason':'no_coordinates'}
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
 

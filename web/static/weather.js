@@ -23,7 +23,8 @@
     if (!forecast?.timezone || !Array.isArray(forecast.hourly?.time)) return null;
     let best = null;
     forecast.hourly.time.forEach((time, index) => {
-      const end = zonedEpoch(time, forecast.timezone);
+      const exact=forecast.hourly.epoch?.[index];
+      const end = typeof exact==='number' && Number.isFinite(exact) ? exact*1000 : zonedEpoch(time, forecast.timezone);
       // An hourly accumulation/probability refers to the preceding hour.
       // Never use another, more distant hour as a substitute for missing data.
       if (end !== null && end > now && end <= now + 3600000 && (!best || end < best.end)) best = {end, index};
@@ -98,6 +99,21 @@
     points.sort((a,b)=>a.seconds-b.seconds);
     return {min:points.reduce((a,b)=>b.temp<a.temp?b:a),max:points.reduce((a,b)=>b.temp>a.temp?b:a),count:points.length};
   }
+  function ensembleExtremaForDay(ensemble, day) {
+    if (!ensemble?.timezone || !/^\d{4}-\d{2}-\d{2}$/.test(day||'') || !Array.isArray(ensemble.points)) return null;
+    let formatter;
+    try { formatter=new Intl.DateTimeFormat('en-GB',{timeZone:ensemble.timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}); }
+    catch { return null; }
+    const points=[];
+    for(const p of ensemble.points){
+      if(!p || typeof p.temp!=='number' || !Number.isFinite(p.temp) || typeof p.time!=='number' || !Number.isFinite(p.time))continue;
+      const local=localClock(p.time*1000,ensemble.timezone,formatter);
+      if(local?.day===day)points.push({time:local.time,seconds:local.seconds,temp:p.temp,ms:p.time*1000,sources:p.sources||{},interpolated:!!p.interpolated});
+    }
+    if(!points.length)return null;
+    points.sort((a,b)=>a.ms-b.ms);
+    return {min:points.reduce((a,b)=>b.temp<a.temp?b:a),max:points.reduce((a,b)=>b.temp>a.temp?b:a),count:points.length};
+  }
   function metarIcon(metar, isDay=true) {
     if(!metar || typeof metar!=='object')return {kind:'unknown',label:'Нет данных METAR'};
     const precip=Array.isArray(metar.precipitation?.codes)?metar.precipitation.codes:[];
@@ -136,9 +152,9 @@
     }
     return points.filter(p=>p.day===day).sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
   }
-  // Last 24 or 48 elapsed hours, with no extrapolation beyond actual reports.
+  // Last 24, 48, or 168 elapsed hours, with no extrapolation beyond actual reports.
   function metarChart(history, unit='C', now=Date.now(), hours=24) {
-    const duration=(hours===48?48:24)*3600000, start=now-duration, byTime=new Map();
+    const duration=([24,48,168].includes(hours)?hours:24)*3600000, start=now-duration, byTime=new Map();
     if (Array.isArray(history)) for (const row of history) {
       if (!Array.isArray(row) || row[0] == null || row[1] == null || row[0] === '' || row[1] === '') continue;
       const ms=Number(row[0])*1000, c=Number(row[1]);
@@ -157,7 +173,7 @@
     return {points,ticks,segments,start,end:now,min,max,step};
   }
   function halfHourTicks(start, end, tz) {
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end<=start || end-start>172800000) return [];
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end<=start || end-start>604800000) return [];
     let formatter;
     try { formatter=new Intl.DateTimeFormat('en-GB',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}); }
     catch { return []; }
@@ -192,7 +208,7 @@
     return (Array.isArray(events)?events:[]).map(event=>({event,time:scanTimeInfo(event,deviceTz,now)}))
       .sort((a,b)=>a.time.rank-b.time.rank||a.time.seconds-b.time.seconds||(a.event.date||'').localeCompare(b.event.date||'')||String(a.event.title).localeCompare(String(b.event.title)));
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, ensembleExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
