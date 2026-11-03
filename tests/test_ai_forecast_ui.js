@@ -35,6 +35,13 @@ w.eval(fs.readFileSync('web/static/weather.js','utf8'));w.eval(fs.readFileSync('
 const tick=()=>new Promise(r=>setTimeout(r,30));
 (async()=>{
  await tick();await tick();
+ // The overview follows the same order visually and in DOM/keyboard navigation.
+ const section=w.document.querySelector('.station-section'),card=section.querySelector('.weather-card'),lower=section.querySelector('.weather-lower'),aiPanel=section.querySelector('.ai-forecast-panel');
+ assert.deepEqual([...card.children].map(x=>x.className),['weather-main','sun-panel']);
+ assert.equal(card.querySelector('#raw-metar').closest('.weather-main'),card.children[0]);
+ assert.equal(card.querySelector('#sun-dot').closest('.sun-panel'),card.children[1]);
+ assert(lower.querySelector('.chart-panel'));assert(lower.querySelector('.forecast-panel'));
+ assert.equal(card.nextElementSibling,lower);assert.equal(lower.nextElementSibling,aiPanel);
  assert(!requests.some(([u,o])=>u.endsWith('/ai-forecast')&&o.method==='POST'),'No automatic Gemini requests');
  const button=w.document.querySelector('#ai-generate');assert(!button.disabled);
  // An old GET must not replace a newer generated result.

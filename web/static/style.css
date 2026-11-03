@@ -3,10 +3,10 @@
 .unlink{background:none;border:0;padding:0;color:#a7cbb0;font-size:10px}.unlink:hover{text-decoration:underline}
 #sun-dot,#sun-glow{transition:cx 1s ease,cy 1s ease,fill 1s ease}.arc-progress{transition:stroke-dashoffset 1s ease}
 .manage-actions{display:flex;align-items:center;gap:8px}.danger{background:#302322;color:#e2b8b1;border:1px solid #59403c}.danger:hover{border-color:#d7a49a}@media(max-width:500px){.manage-actions{flex-direction:column;align-items:stretch}.manage-actions .button{padding:8px}}
-/* Wide, shallow day/night arc above the station details. */
+/* Wide, shallow day/night arc below the station details. */
 .weather-card{display:flex;flex-direction:column}
-.sun-panel{border-left:0;border-top:0;background:radial-gradient(ellipse at 50% 100%,#24372c 0%,#19232a 70%);padding:23px 28px 18px}
-.weather-main{border-top:1px solid var(--line)}
+.sun-panel{border-left:0;border-top:1px solid var(--line);background:radial-gradient(ellipse at 50% 100%,#24372c 0%,#19232a 70%);padding:23px 28px 18px}
+.weather-main{border-top:0}
 .sun-graphic{max-width:900px;width:100%;height:auto;aspect-ratio:800 / 185;margin:4px auto 0}
 .sun-graphic svg{display:block;width:100%;height:auto}
 .arc-progress{stroke-dasharray:100;stroke-dashoffset:100}
