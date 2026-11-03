@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble
+from web import metar_archive, forecast_ensemble, ai_forecast
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -87,6 +87,7 @@ def init_web_db():
         conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
     metar_archive.init_db()
     forecast_ensemble.init_db()
+    ai_forecast.init_db()
 
 
 
@@ -587,6 +588,7 @@ def remove_station(sid):
         conn.execute('DELETE FROM station_history WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM web_metar_history WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM web_station_solar WHERE station_id=?', (sid,))
+        conn.execute('DELETE FROM web_ai_forecasts WHERE station_id=?', (sid,))
         prefix = f'st_{sid}_'
         conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
         old_code=conn.execute('SELECT UPPER(station_code) AS code FROM stations WHERE id=?',(sid,)).fetchone()['code']
@@ -729,6 +731,55 @@ def weather(sid):
         result['forecast_status']={'reason':'no_coordinates'}
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
+
+
+@app.route('/api/ai/config', methods=['GET','POST'])
+def ai_config():
+    if not trusted_ssh_tunnel():return jsonify(error='Настройки Gemini доступны только через SSH-туннель.'),403
+    if request.method=='GET':
+        try:return jsonify(ai_forecast.public_config())
+        except ai_forecast.AIError as exc:return jsonify(error=str(exc)),exc.status
+        except Exception:return jsonify(error='Не удалось прочитать защищённые настройки Gemini.'),503
+    name='ai-config:'+(request.remote_addr or 'unknown')
+    if not login_allowed(name):return jsonify(error='Слишком много попыток. Повторите через 15 минут.'),429
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or not isinstance(data.get('current_password'),str):return jsonify(error='Введите текущий пароль терминала.'),400
+    try:valid=len(data['current_password'])<=256 and check_password_hash(current_password_hash(),data['current_password'])
+    except (ValueError,TypeError):valid=False
+    if not valid:return jsonify(error='Неверный пароль терминала.'),400
+    with _login_lock:_login_attempts.pop(name,None)
+    try:return jsonify(ai_forecast.config_update(data))
+    except ai_forecast.AIError as exc:return jsonify(error=str(exc)),exc.status
+    except Exception:
+        app.logger.error('Failed to save Gemini settings')
+        return jsonify(error='Не удалось безопасно сохранить настройки Gemini.'),503
+
+
+@app.route('/api/stations/<int:sid>/ai-forecast',methods=['GET','POST'])
+def station_ai_forecast(sid):
+    if not trusted_ssh_tunnel():return jsonify(error='ИИ-прогноз доступен только через SSH-туннель.'),403
+    if not db.get_station(sid):return jsonify(error='Станция не найдена.'),404
+    if request.method=='GET':
+        return jsonify(forecast=ai_forecast.latest(sid))
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or data.get('confirm') is not True:return jsonify(error='Подтвердите отправку данных и возможную плату за запрос.'),400
+    token=None
+    try:
+        token=ai_forecast._claim()
+        if not ai_forecast.public_config()['keys']:raise ai_forecast.AIError('Добавьте ключ Gemini в настройках.',409)
+        # Build a server-owned snapshot; never accept weather or private account
+        # data from the browser. Disabled stations only get their cached archive.
+        response=weather(sid)
+        if isinstance(response,tuple):return jsonify(error='Станция недоступна.'),404
+        snapshot=response.get_json()
+        if not isinstance(snapshot,dict):return jsonify(error='Нет данных станции.'),503
+        return jsonify(forecast=ai_forecast.generate(sid,snapshot,lease=token))
+    except ai_forecast.AIError as exc:return jsonify(error=str(exc)),exc.status
+    except Exception:
+        app.logger.error('Gemini weather request failed without logging data')
+        return jsonify(error='Ошибка ИИ-прогноза. Автоматического повтора нет; проверьте расходы перед новым запросом.'),503
+    finally:
+        if token is not None:ai_forecast._release(token)
 
 
 @app.get('/api/stations/<int:sid>/bindings')
