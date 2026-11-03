@@ -13,7 +13,7 @@ w.fetch=async(url,o={})=>{requests.push([url,o]);let data;
  else if(url==='/api/trading/account-config')data={configured:false};
  else if(url==='/api/trading/monitor-interval')data={interval_seconds:30};
  else if(url==='/api/stations')data=stations;
- else if(/^\/api\/stations\/\d+\/weather$/.test(url)){const id=Number(url.split('/')[3]);data={station:stations[id-1],metar:{temp:13},metar_history:[],metar_archive:{status:'ok',reports:[]},forecast_status:{reason:'no_coordinates'},forecast_ensemble:null,forecast:null,history:[]}}
+ else if(/^\/api\/stations\/\d+\/weather\?view=1$/.test(url)){const id=Number(url.split('/')[3]);data={station:stations[id-1],metar:{temp:13},metar_history:[],metar_archive:{status:'ok',reports:[]},forecast_status:{reason:'no_coordinates'},forecast_ensemble:null,forecast:null,history:[]}}
  else if(url.endsWith('/bindings'))data=[];
  else if(url==='/api/ai/config'){
   if(o.method==='POST'){

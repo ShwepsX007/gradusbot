@@ -44,6 +44,45 @@ class TerminalTests(unittest.TestCase):
         self.assertIsNone(result['metar'])
         self.assertIn('выключен', result['message'])
 
+    def test_view_temporarily_polls_disabled_station_without_changing_bot_setting(self):
+        s=self.add_station();sid=s['id'];now=int(time.time())
+        metar={'temp':20,'dew_point':10,'obs_time':now}
+        day=datetime.now(timezone.utc).date().isoformat()
+        forecast={'timezone':'Europe/London','daily':{'time':[day],'sunrise':[day+'T07:00'],'sunset':[day+'T17:00']}}
+        with patch.object(web.utils,'fetch_metar',return_value=metar) as fetch, \
+             patch.object(web,'station_info',return_value={'lat':51.47,'lon':-0.45}), \
+             patch.object(web,'forecast',return_value=forecast):
+            result=self.client.get(f'/api/stations/{sid}/weather?view=1').get_json()
+            # A second viewer shares the web process cache and never toggles bot state.
+            other=web.app.test_client()
+            with other.session_transaction() as sess:
+                sess.update(auth_user='testuser',auth_version=web.auth_version(),csrf='other-csrf')
+            second=other.get(f'/api/stations/{sid}/weather?view=1').get_json()
+            self.assertEqual(fetch.call_count,1)
+        self.assertEqual(result['metar']['temp'],20);self.assertTrue(result['view_active'])
+        self.assertEqual(result['station']['enabled'],0);self.assertEqual(web.db.get_station(sid)['enabled'],0)
+        self.assertEqual(second['station']['enabled'],0)
+        self.assertIn([now,20.0],result['metar_history'])
+        self.assertEqual(len(result['solar_days']),1)
+        with patch.object(web.utils,'fetch_metar') as fetch:
+            inactive=self.client.get(f'/api/stations/{sid}/weather').get_json()
+            fetch.assert_not_called()
+        self.assertFalse(inactive['view_active']);self.assertIsNone(inactive['metar'])
+    def test_view_preserves_existing_enabled_bot_station(self):
+        s=self.add_station();sid=s['id'];web.db.update_station(sid,enabled=1)
+        with patch.object(web.utils,'fetch_metar',return_value={'temp':12}),patch.object(web,'station_info',return_value=None):
+            self.client.get(f'/api/stations/{sid}/weather?view=1')
+        self.assertEqual(web.db.get_station(sid)['enabled'],1)
+    def test_view_persistence_cannot_resurrect_deleted_station(self):
+        sid=self.add_station()['id'];web.db.update_station(sid,enabled=0)
+        self.assertEqual(self.client.delete(f'/api/stations/{sid}',json={}).status_code,200)
+        web.record_web_metar(sid,{'temp':10,'obs_time':int(time.time())},view_active=True)
+        day=datetime.now(timezone.utc).date().isoformat()
+        web.save_solar_days(sid,{'timezone':'Europe/London','daily':{'time':[day],'sunrise':[day+'T07:00'],'sunset':[day+'T17:00']}},view_active=True)
+        with web.db.get_db() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM web_metar_history WHERE station_id=?',(sid,)).fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM web_station_solar WHERE station_id=?',(sid,)).fetchone()[0],0)
+
     def test_weather_uses_bot_metar_and_forecast(self):
         s = self.add_station()
         self.client.patch(f"/api/stations/{s['id']}", json={'enabled': True})

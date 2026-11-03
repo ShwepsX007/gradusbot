@@ -600,7 +600,7 @@ def remove_station(sid):
     return jsonify(ok=True)
 
 
-def record_web_metar(sid, metar):
+def record_web_metar(sid, metar, view_active=False):
     try:
         obs_time = int(metar.get('obs_time'))
         temp = float(metar.get('temp'))
@@ -612,8 +612,8 @@ def record_web_metar(sid, metar):
     with db.get_db() as conn:
         # Deduplicate repeated polls, but retain a corrected report for the same observation time.
         conn.execute('''INSERT INTO web_metar_history (station_id,obs_time,temp)
-            SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)
-            ON CONFLICT(station_id,obs_time) DO UPDATE SET temp=excluded.temp''', (sid, obs_time, temp, sid))
+            SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND (enabled=1 OR ?=1))
+            ON CONFLICT(station_id,obs_time) DO UPDATE SET temp=excluded.temp''', (sid, obs_time, temp, sid, int(view_active)))
         conn.execute('DELETE FROM web_metar_history WHERE station_id=? AND obs_time<?', (sid, now - 8 * 24 * 3600))
 
 
@@ -639,7 +639,7 @@ def metar_chart_history(sid, archive=None):
     return _metar_points(sid,archive,168)
 
 
-def save_solar_days(sid, forecast_data):
+def save_solar_days(sid, forecast_data, view_active=False):
     if not isinstance(forecast_data, dict): return
     tz = forecast_data.get('timezone')
     daily = forecast_data.get('daily') or {}
@@ -652,12 +652,12 @@ def save_solar_days(sid, forecast_data):
         # Preserve dates even when polar conditions have no sunrise or sunset.
         if rise is not None and (not isinstance(rise, str) or not rise.startswith(day + 'T')): continue
         if sunset is not None and (not isinstance(sunset, str) or not sunset.startswith(day + 'T')): continue
-        rows.append((sid, day, rise, sunset, tz, sid))
+        rows.append((sid, day, rise, sunset, tz, sid, int(view_active)))
     cutoff = (datetime.now(timezone.utc) - timedelta(days=9)).date().isoformat()
     with db.get_db() as conn:
         for row in rows:
             conn.execute("""INSERT OR REPLACE INTO web_station_solar (station_id,day,sunrise,sunset,timezone)
-                SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND enabled=1)""", row)
+                SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM stations WHERE id=? AND (enabled=1 OR ?=1))""", row)
         conn.execute('DELETE FROM web_station_solar WHERE station_id=? AND day<?', (sid, cutoff))
 
 
@@ -668,18 +668,20 @@ def get_solar_days(sid):
 
 
 @app.get('/api/stations/<int:sid>/weather')
-def weather(sid):
+def weather(sid, active_view=False):
     station = db.get_station(sid)
     if not station: return jsonify(error='Станция не найдена'), 404
-    # Historical lookup is independent of the live-poll switch: viewing a
-    # disabled station can retrieve its archive, but never starts live polling.
+    # A visible web overview requests a temporary snapshot without changing the
+    # bot's persistent enabled flag. No background web poller is started.
+    active_view=active_view or request.args.get('view')=='1'
+    live=bool(station['enabled']) or active_view
     metar_archive.prune()
     code=str(station.get('station_code') or '').upper()
     valid=station.get('station_type')=='metar' and re.fullmatch(r'[A-Z0-9]{4}',code)
     if valid: metar_archive.refresh(code)
     archive=metar_archive.get(code if valid else None)
-    result = {'station': public_station(station), 'history': combined_history(sid,archive), 'metar_history': metar_chart_history(sid,archive), 'metar_archive':archive, 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'forecast_ensemble': None, 'forecast_status': {'reason':'disabled' if not station['enabled'] else 'pending'}, 'info': None}
-    if not station['enabled']:
+    result = {'station': public_station(station), 'history': combined_history(sid,archive), 'metar_history': metar_chart_history(sid,archive), 'metar_archive':archive, 'solar_days': get_solar_days(sid), 'metar': None, 'forecast': None, 'forecast_ensemble': None, 'forecast_status': {'reason':'disabled' if not live else 'pending'}, 'info': None, 'view_active':bool(active_view)}
+    if not live:
         result['message'] = 'Опрос станции выключен'
         return jsonify(result)
     if station.get('station_type') != 'metar':
@@ -704,7 +706,7 @@ def weather(sid):
             metar['wind_ms'] = None
     result['metar'] = metar
     if metar:
-        record_web_metar(sid, metar)
+        record_web_metar(sid, metar, view_active=active_view)
         result['history'] = combined_history(sid,archive)
         result['metar_history'] = metar_chart_history(sid,archive)
     info = station_info(code)
@@ -716,7 +718,7 @@ def weather(sid):
     if coords:
         opened=forecast(*coords)
         result['forecast']=opened
-        save_solar_days(sid, opened)
+        save_solar_days(sid, opened, view_active=active_view)
         result['solar_days'] = get_solar_days(sid)
         metno=forecast_ensemble.get_metno(*coords)
         tz_candidates=[opened.get('timezone') if isinstance(opened,dict) else None]+[s.get('timezone') for s in result['solar_days']]
@@ -768,8 +770,8 @@ def station_ai_forecast(sid):
         token=ai_forecast._claim()
         if not ai_forecast.public_config()['keys']:raise ai_forecast.AIError('Добавьте ключ Gemini в настройках.',409)
         # Build a server-owned snapshot; never accept weather or private account
-        # data from the browser. Disabled stations only get their cached archive.
-        response=weather(sid)
+        # data from the browser. The manual request takes a fresh station snapshot.
+        response=weather(sid, active_view=True)
         if isinstance(response,tuple):return jsonify(error='Станция недоступна.'),404
         snapshot=response.get_json()
         if not isinstance(snapshot,dict):return jsonify(error='Нет данных станции.'),503

@@ -44,7 +44,7 @@ w.fetch=async (url,o={})=>{requests.push([url,o]);let data;
    if(deferAccount){deferAccount=false;await new Promise(resolve=>{releaseAccount=resolve})}
  }
  else if(url==='/api/stations')data=[station];
- else if(url==='/api/stations/1/weather')data={station,forecast:{timezone:'UTC',daily:{sunrise:['2026-06-01T06:00'],sunset:['2026-06-01T18:00']}},metar:{temp:15},metar_history:[[fixedNow/1000-6*86400,5],[fixedNow/1000-30*3600,8],[fixedNow/1000-3600,13]],forecast_ensemble:{timezone:'UTC',points:[{time:fixedNow/1000-6*3600,temp:10,sources:{'Open-Meteo':8,'MET Norway':12}},{time:fixedNow/1000+5*3600,temp:20,sources:{'Open-Meteo':20}}]},forecast_status:{reason:'ok',open_meteo:'ok',met_norway:'ok',met_norway_fetched_at:fixedNow/1000},metar_archive:{status:'ok',last_success:fixedNow/1000,reports:[{obs_time:fixedNow/1000-3600,temp:13,raw:'<img id=bad-metar>',wind_speed:10,wind_dir:'VRB',wind_gust:15,dew_point:7}]},history:[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t])};
+ else if(url==='/api/stations/1/weather?view=1')data={station,forecast:{timezone:'UTC',daily:{sunrise:['2026-06-01T06:00'],sunset:['2026-06-01T18:00']}},metar:{temp:15},metar_history:[[fixedNow/1000-6*86400,5],[fixedNow/1000-30*3600,8],[fixedNow/1000-3600,13]],forecast_ensemble:{timezone:'UTC',points:[{time:fixedNow/1000-6*3600,temp:10,sources:{'Open-Meteo':8,'MET Norway':12}},{time:fixedNow/1000+5*3600,temp:20,sources:{'Open-Meteo':20}}]},forecast_status:{reason:'ok',open_meteo:'ok',met_norway:'ok',met_norway_fetched_at:fixedNow/1000},metar_archive:{status:'ok',last_success:fixedNow/1000,reports:[{obs_time:fixedNow/1000-3600,temp:13,raw:'<img id=bad-metar>',wind_speed:10,wind_dir:'VRB',wind_gust:15,dew_point:7}]},history:[[8,10],[9,12],[10,12],[11,11]].map(([h,t])=>[Date.parse(`2026-06-01T${String(h).padStart(2,'0')}:00:00Z`)/1000,t])};
  else if(url==='/api/stations/1/bindings')data=bindings;
  else if(url.endsWith('/books'))data=url.includes('/second/')?booksSecond:books;
  else if(url.startsWith('/api/market/'))data={market:{title:'Weather',options:url.endsWith('/second')?optsSecond:opts,closed:false},positions:[]};
@@ -216,6 +216,7 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert(w.document.querySelector('#tp-draft-note').classList.contains('hidden'));
  assert(w.document.querySelector('#trade-send-status').textContent.includes('Режим тейка отключён'));
  w.confirm=()=>true;
+ const draftPrice=w.document.querySelector('#trade-price');draftPrice.value='42';draftPrice.dispatchEvent(new w.Event('input',{bubbles:true}));
  const tradePostsBeforeCopy=requests.filter(([url,o])=>url==='/api/trading/orders'&&o.method==='POST').length;
  w.document.querySelector('[data-page="copy"]').click();await tick();
  assert(w.document.querySelector('#copy-page').textContent.includes('Реальные заявки не отправляются'));
@@ -238,5 +239,6 @@ const tick=()=>new Promise(r=>setTimeout(r,40));
  assert(requests.some(([url,o])=>url==='/api/copy-observer/1'&&o.method==='PATCH'));
  w.document.querySelector('[data-copy-delete]').click();await tick();
  assert(requests.some(([url,o])=>url==='/api/copy-observer/1'&&o.method==='DELETE'));
+ w.document.querySelector('[data-page="weather"]').click();await tick();await tick();assert.equal(draftPrice.value,'42');
  console.log('Trade preview UI: OK');w.close();
 })().catch(e=>{console.error(e);w.close();process.exitCode=1});

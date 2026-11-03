@@ -148,9 +148,10 @@ class GeminiTests(unittest.TestCase):
             bad=client.post('/api/ai/config',json={**data,'current_password':'wrong'});self.assertEqual(bad.status_code,400)
             ok=client.post('/api/ai/config',json=data);self.assertEqual(ok.status_code,200);self.assertNotIn(K1,ok.get_data(as_text=True))
             self.assertEqual(client.post(f'/api/stations/{self.sid}/ai-forecast',json={}).status_code,400)
-            with patch.object(web,'weather',side_effect=lambda sid:web.jsonify(self.weather)),patch.object(ai.requests,'post',return_value=answer()) as post:
+            with patch.object(web,'weather',side_effect=lambda sid,active_view=False:web.jsonify(self.weather)) as weather,patch.object(ai.requests,'post',return_value=answer()) as post:
                 res=client.post(f'/api/stations/{self.sid}/ai-forecast',json={'confirm':True,'private_key':'LEAK'})
             self.assertEqual(res.status_code,200,res.get_data(as_text=True));self.assertNotIn('LEAK',json.dumps(post.call_args.kwargs['json']))
+            weather.assert_called_once_with(self.sid,active_view=True)
             self.assertEqual(client.get(f'/api/stations/{self.sid}/ai-forecast').get_json()['forecast']['station_id'],self.sid)
             client.environ_base['HTTP_X_CSRF_TOKEN']='bad'
             self.assertEqual(client.post('/api/ai/config',json=data).status_code,403)

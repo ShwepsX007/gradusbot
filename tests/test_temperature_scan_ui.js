@@ -27,7 +27,7 @@ w.fetch=async (url,options={})=>{
     data={station:stations[0],slug:item.slug,created_station:true,already_bound:false};
   }
   else if(url==='/api/stations/1/bindings')data=bindings;
-  else if(url==='/api/stations/1/weather')data={station:stations[0],forecast:{},metar:{}};
+  else if(url==='/api/stations/1/weather?view=1')data={station:stations[0],forecast:{},metar:{}};
   else if(url.endsWith('/books'))data={books:{},requested_at:Date.now()/1000};
   else if(url.startsWith('/api/market/'))data={market:{title:'Manila',options:[]},positions:[]};
   else throw Error('Unexpected URL '+url);
