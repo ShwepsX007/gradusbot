@@ -1,6 +1,10 @@
 """Read-only Polymarket portfolio. No trading operations live in this module."""
 from web import trading_account as account
 import requests
+from importlib.metadata import version
+from py_clob_client_v2.constants import INITIAL_CURSOR, END_CURSOR
+from py_clob_client_v2.endpoints import ORDERS
+from web import trading_orders
 
 BASE = 'https://data-api.polymarket.com/v2/'
 PAGE_LIMIT = 5  # Limit latency; the response explicitly reports truncation.
@@ -35,6 +39,34 @@ def _pages(path, wallet, extra=None):
     return items, True
 
 
+def _open_orders(credentials):
+    # SDK 1.2.1 flattens all pages without a cap. Walk its documented cursor
+    # endpoint explicitly so a broken upstream cannot loop indefinitely.
+    if version('py-clob-client-v2') != '1.2.1':
+        raise account.AccountError('Неподдерживаемая версия CLOB SDK.')
+    client=account.build_client(credentials)
+    headers=client._l2_headers('GET', ORDERS)
+    cursor=INITIAL_CURSOR
+    seen=set()
+    rows=[]
+    for _ in range(PAGE_LIMIT):
+        if cursor in seen: raise account.AccountError('Повторный курсор CLOB.')
+        seen.add(cursor)
+        response=client._get(f'{client.host}{ORDERS}',headers=headers,params={'next_cursor':cursor})
+        if not isinstance(response,dict) or not isinstance(response.get('data'),list) or any(not isinstance(x,dict) for x in response['data']):
+            raise account.AccountError('Неверный ответ CLOB.')
+        cursor=response.get('next_cursor')
+        if not isinstance(cursor,str) or not cursor or len(cursor)>2048: raise account.AccountError('Неверный курсор CLOB.')
+        rows.extend(response['data'])
+        if cursor==END_CURSOR: break
+        if cursor in seen: raise account.AccountError('Повторный курсор CLOB.')
+    result=[{'id':account._string(o.get('id'),120), 'asset_id':account._string(o.get('asset_id'),100),
+             'side':account._string(o.get('side'),10), 'price':account._number(o.get('price')),
+             'original_size':account._number(o.get('original_size')), 'size_matched':account._number(o.get('size_matched')),
+             'status':account._string(o.get('status'),40)} for o in rows]
+    return result,cursor!=END_CURSOR
+
+
 def snapshot():
     credentials = account.load()
     if not credentials:
@@ -42,13 +74,13 @@ def snapshot():
     wallet = credentials['funder'] or credentials['signer']
     result = {'wallet': wallet, 'balance': None, 'orders': None, 'positions': None,
               'activity': None, 'pnl': None, 'value': None, 'errors': [],
-              'orders_first_page': True, 'positions_partial': False, 'activity_partial': False}
+              'orders_partial': False, 'positions_partial': False, 'activity_partial': False, 'intents': None}
     try:
         result['balance'] = account._balance(credentials)
     except Exception:
         result['errors'].append('Баланс CLOB недоступен.')
     try:
-        result['orders'] = account._orders(credentials)
+        result['orders'], result['orders_partial'] = _open_orders(credentials)
     except Exception:
         result['errors'].append('Открытые ордера CLOB недоступны.')
     try:
@@ -84,6 +116,10 @@ def snapshot():
                           'value': account._number(p.get('position_pnl'))} for p in data['points'] if isinstance(p, dict)]
     except Exception:
         result['errors'].append('График PnL Data API недоступен.')
+    try:
+        result['intents'] = trading_orders.list_intents(wallet)
+    except Exception:
+        result['errors'].append('Локальный журнал отправок недоступен.')
     # Do not return a snapshot for a different account if credentials changed during reads.
     if account.load() != credentials:
         raise account.AccountError('Аккаунт изменился во время загрузки. Обновите портфель.')

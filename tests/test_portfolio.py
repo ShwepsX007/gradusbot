@@ -35,16 +35,28 @@ class PortfolioTests(unittest.TestCase):
             if path=='activity':return {'data':[], 'pagination':{'has_more':False,'next_cursor':None}}
             if path=='user-pnl':return {'data':{'points':[{'timestamp':100,'position_pnl':None},{'timestamp':200,'position_pnl':1.5}]}}
             raise RuntimeError('secret-test')
-        with patch.object(portfolio,'_get',side_effect=get),patch.object(account,'_orders',return_value=[]),patch.object(account,'_balance',return_value='2.000000'):
+        with patch.object(portfolio,'_get',side_effect=get),patch.object(portfolio,'_open_orders',return_value=([],False)),patch.object(account,'_balance',return_value='2.000000'):
             snapshot=portfolio.snapshot()
         self.assertIsNone(snapshot['value']);self.assertIsNone(snapshot['positions'][0]['value'])
         self.assertIsNone(snapshot['pnl'][0]['value']);self.assertEqual(snapshot['pnl'][1]['value'],1.5)
         self.assertIn('Стоимость портфеля Data API недоступна.',snapshot['errors'])
-        self.assertNotIn('secret',str(snapshot));self.assertTrue(snapshot['orders_first_page'])
+        self.assertNotIn('secret',str(snapshot));self.assertFalse(snapshot['orders_partial'])
     def test_account_changed_while_reading(self):
         c=account.load()
-        with patch.object(account,'load',side_effect=[c,{**c,'funder':'0x'+'3'*40}]),patch.object(portfolio,'_get',side_effect=RuntimeError()),patch.object(account,'_orders',side_effect=RuntimeError()),patch.object(account,'_balance',side_effect=RuntimeError()):
+        with patch.object(account,'load',side_effect=[c,{**c,'funder':'0x'+'3'*40}]),patch.object(portfolio,'_get',side_effect=RuntimeError()),patch.object(portfolio,'_open_orders',side_effect=RuntimeError()),patch.object(account,'_balance',side_effect=RuntimeError()):
             with self.assertRaises(account.AccountError):portfolio.snapshot()
+    def test_clob_order_pagination_and_cycle(self):
+        client=__import__('unittest.mock',fromlist=['Mock']).Mock();client.host=account.HOST
+        client._get.side_effect=[{'data':[{'id':'a','size_matched':'2'}],'next_cursor':'next'},
+                                 {'data':[{'id':'b'}],'next_cursor':'LTE='}]
+        with patch.object(account,'build_client',return_value=client):
+            rows,partial=portfolio._open_orders(account.load())
+        self.assertEqual([x['id'] for x in rows],['a','b']);self.assertFalse(partial)
+        self.assertEqual(client._get.call_args_list[1].kwargs['params']['next_cursor'],'next')
+        client._get.side_effect=None;client._get.return_value={'data':[],'next_cursor':'MA=='}
+        with patch.object(account,'build_client',return_value=client):
+            with self.assertRaises(account.AccountError):portfolio._open_orders(account.load())
+
     def test_portfolio_requires_ssh_tunnel(self):
         with patch.object(web,'trusted_ssh_tunnel',return_value=False):
             config=dict(web.app.config)

@@ -70,6 +70,9 @@ def init_web_db():
         if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
         migration=conn.execute('INSERT OR IGNORE INTO web_trading_migrations(name) VALUES(?)',('reconciliation-opt-in-v1',))
         if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
+        # The market-order units and unknown-outcome policy changed; require a fresh opt-in.
+        migration=conn.execute('INSERT OR IGNORE INTO web_trading_migrations(name) VALUES(?)',('market-orders-opt-in-v1',))
+        if migration.rowcount: conn.execute('UPDATE web_trading_control SET enabled=0 WHERE id=1')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_order_intents (
             nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, slug TEXT NOT NULL, asset TEXT NOT NULL,
             side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL, order_type TEXT NOT NULL,
@@ -77,6 +80,11 @@ def init_web_db():
         intent_columns={r['name'] for r in conn.execute('PRAGMA table_info(web_order_intents)')}
         if 'purpose' not in intent_columns:
             conn.execute("ALTER TABLE web_order_intents ADD COLUMN purpose TEXT NOT NULL DEFAULT 'manual'")
+        for name, declaration in (('execution_mode', "TEXT NOT NULL DEFAULT 'limit'"),
+                                  ('signed_size', 'TEXT'), ('signed_price', 'TEXT'),
+                                  ('acknowledged_unknown', 'TEXT')):
+            if name not in intent_columns:
+                conn.execute(f'ALTER TABLE web_order_intents ADD COLUMN {name} {declaration}')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_order_reconciliation (
             nonce TEXT PRIMARY KEY, expected_id TEXT, credential_fingerprint TEXT,
             assessment TEXT NOT NULL DEFAULT 'unverified', checked_at REAL,
@@ -459,6 +467,7 @@ def trading_submit_order():
     event=event_for_station(data['slug'],fresh=True)
     if not event: return jsonify(error='Не удалось проверить событие. Ордер не отправлен.'),503
     try: return jsonify(trading_orders.submit(data,event))
+    except trading_orders.UnknownOrders as exc: return jsonify(error=str(exc),code='unknown_orders',nonces=exc.nonces),409
     except trading_orders.TradeError as exc: return jsonify(error=str(exc)),400
     except Exception:
         app.logger.error('Order request failed; do not retry without reconciliation')

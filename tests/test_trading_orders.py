@@ -28,6 +28,12 @@ class OrderTests(unittest.TestCase):
         web.init_web_db();self.assertFalse(orders.enabled())
         orders.set_enabled(True);web.init_web_db();self.assertTrue(orders.enabled())
 
+    def test_market_upgrade_requires_new_opt_in_once(self):
+        orders.set_enabled(True)
+        with web.db.get_db() as conn:conn.execute("DELETE FROM web_trading_migrations WHERE name='market-orders-opt-in-v1'")
+        web.init_web_db();self.assertFalse(orders.enabled())
+        orders.set_enabled(True);web.init_web_db();self.assertTrue(orders.enabled())
+
     def test_switch_fails_closed_and_persists(self):
         self.assertFalse(orders.enabled())
         orders.set_enabled(True);self.assertTrue(orders.enabled())
@@ -48,52 +54,42 @@ class OrderTests(unittest.TestCase):
         for changed in ({**EVENT,'closed':True},{**EVENT,'active':False}, {**EVENT,'markets':[{**EVENT['markets'][0],'acceptingOrders':False}]}):
             with self.assertRaises(orders.TradeError): orders.submit(BASE,changed)
 
-    def test_take_profit_is_explicit_single_gtc_sell_for_held_tokens(self):
+    def test_independent_orders_and_unknown_acknowledgement(self):
         orders.set_enabled(True)
-        self.client.get_balance_allowance.return_value={'balance':'10000000'}
-        body={**BASE,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
-        result=orders.submit(body,EVENT)
-        self.assertEqual(result['state'],'accepted');self.assertEqual(self.client.post_order.call_count,1)
-        params=self.client.get_balance_allowance.call_args.args[0]
-        self.assertEqual(params.asset_type,'CONDITIONAL');self.assertEqual(params.token_id,'1');self.assertEqual(params.signature_type,0)
-        self.assertEqual(self.client.update_balance_allowance.call_args.args[0],params)
-        row=orders.list_intents(account.load()['signer'])[0]
-        self.assertEqual(row['purpose'],'take_profit');self.assertEqual(row['side'],'SELL');self.assertEqual(row['order_type'],'GTC')
-        self.assertEqual(str(row['price']),'0.25');self.assertEqual(str(row['size']),'10')
-        self.assertEqual(orders.submit(body,EVENT)['state'],'accepted');self.assertEqual(self.client.post_order.call_count,1)
-        with self.assertRaises(orders.TradeError):orders.submit({**body,'nonce':'b'*32},EVENT)
-        self.assertEqual(self.client.post_order.call_count,1)
-
-    def test_take_profit_refuses_invalid_quantity_market_and_balance(self):
-        orders.set_enabled(True);self.client.get_balance_allowance.return_value={'balance':'10000000'}
-        body={**BASE,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
-        for changes in ({'confirm_take_profit':False},{'side':'BUY'},{'order_type':'FAK'},{'size':'4.99'},
-                        {'purpose':'other'},{'price':'0.251'},{'confirm':False}):
-            with self.subTest(changes=changes):
-                with self.assertRaises(orders.TradeError):orders.submit({**body,**changes},EVENT)
-        with self.assertRaises(orders.TradeError):orders.submit(body,{**EVENT,'closed':True})
-        for balance in [None,{}, {'balance':None},{'balance':True},{'balance':'9.0'},{'balance':'NaN'},{'balance':'9999999'}]:
-            self.client.get_balance_allowance.return_value=balance
-            with self.subTest(balance=balance):
-                with self.assertRaises(orders.TradeError):orders.submit(body,EVENT)
-        self.client.get_balance_allowance.side_effect=TimeoutError('private')
-        with self.assertRaises(orders.TradeError) as error:orders.submit(body,EVENT)
-        self.assertNotIn('private',str(error.exception))
-        self.client.create_order.assert_not_called();self.client.post_order.assert_not_called()
-        self.assertEqual(orders.list_intents(account.load()['signer']),[])
-
-    def test_take_profit_unknown_never_reposts_and_buy_reservation_blocks(self):
-        orders.set_enabled(True);self.client.get_balance_allowance.return_value={'balance':'20000000'}
-        orders.submit(BASE,EVENT)
-        tp={**BASE,'nonce':'b'*32,'side':'SELL','purpose':'take_profit','confirm_take_profit':True}
-        with self.assertRaises(orders.TradeError):orders.submit(tp,EVENT)
-        self.assertEqual(self.client.post_order.call_count,1)
-        with web.db.get_db() as conn:conn.execute("UPDATE web_order_reconciliation SET assessment='terminal' WHERE nonce=?",(BASE['nonce'],))
+        self.assertEqual(orders.submit(BASE,EVENT)['state'],'accepted')
+        # Accepted and not yet reconciled orders do not block independent orders.
+        second={**BASE,'nonce':'b'*32,'side':'SELL'}
+        self.assertEqual(orders.submit(second,EVENT)['state'],'accepted')
         self.client.post_order.side_effect=TimeoutError()
-        self.assertEqual(orders.submit(tp,EVENT)['state'],'unknown')
-        self.assertEqual(orders.submit(tp,EVENT)['state'],'unknown')
-        with self.assertRaises(orders.TradeError):orders.submit({**tp,'nonce':'c'*32},EVENT)
+        third={**BASE,'nonce':'c'*32}
+        self.assertEqual(orders.submit(third,EVENT)['state'],'unknown')
+        self.assertEqual(orders.submit(third,EVENT)['state'],'unknown')
+        fourth={**BASE,'nonce':'d'*32}
+        with self.assertRaises(orders.UnknownOrders) as warning:orders.submit(fourth,EVENT)
+        self.assertEqual(warning.exception.nonces,['c'*32]);self.assertEqual(self.client.post_order.call_count,3)
+        self.client.post_order.side_effect=None
+        self.assertEqual(orders.submit({**fourth,'acknowledged_unknown':['c'*32]},EVENT)['state'],'accepted')
+        self.assertEqual(self.client.post_order.call_count,4)
+        self.assertEqual(orders.submit({**fourth,'acknowledged_unknown':['c'*32]},EVENT)['state'],'accepted')
+        self.assertEqual(self.client.post_order.call_count,4)
+        with web.db.get_db() as conn:
+            row=conn.execute('SELECT acknowledged_unknown FROM web_order_intents WHERE nonce=?',('d'*32,)).fetchone()
+            self.assertIn('c'*32,row['acknowledged_unknown'])
+
+    def test_stale_unknown_ack_does_not_cover_another_unknown(self):
+        orders.set_enabled(True);self.client.post_order.side_effect=TimeoutError()
+        orders.submit(BASE,EVENT)
+        orders.submit({**BASE,'nonce':'b'*32,'acknowledged_unknown':['a'*32]},EVENT)
+        with self.assertRaises(orders.UnknownOrders) as warning:
+            orders.submit({**BASE,'nonce':'c'*32,'acknowledged_unknown':['a'*32]},EVENT)
+        self.assertEqual(warning.exception.nonces,['a'*32,'b'*32])
         self.assertEqual(self.client.post_order.call_count,2)
+
+    def test_old_take_profit_request_is_rejected(self):
+        orders.set_enabled(True)
+        with self.assertRaises(orders.TradeError):
+            orders.submit({**BASE,'side':'SELL','purpose':'take_profit','confirm_take_profit':True},EVENT)
+        self.client.post_order.assert_not_called()
 
     def test_intent_purpose_migration_preserves_existing_rows(self):
         orders.set_enabled(True);orders.submit(BASE,EVENT);web.init_web_db();web.init_web_db()
@@ -193,6 +189,23 @@ class OrderEndpointTests(unittest.TestCase):
     def tearDown(self):
         self.p.stop();web.db.DB_FILE=self.old_db;web.app.config.clear();web.app.config.update(self.config);self.tmp.cleanup()
     def post(self,path,data,**kw):return self.client.post(path,base_url=self.base,json=data,**kw)
+    def test_unknown_confirmation_route_is_separate_and_idempotent(self):
+        orders.set_enabled(True)
+        fake=Mock();fake.retry_on_error=False;fake.get_order_book.return_value=BOOK;fake.create_order.return_value='signed'
+        fake.post_order.side_effect=TimeoutError()
+        headers={'X-CSRF-Token':'token'}
+        with patch.object(web,'event_for_station',return_value=EVENT),patch.object(account,'build_client',return_value=fake),patch.object(orders.reconciliation,'order_hash',return_value='0x'+'1'*64):
+            self.assertEqual(self.post('/api/trading/orders',BASE,headers=headers).get_json()['state'],'unknown')
+            new={**BASE,'nonce':'b'*32}
+            warning=self.post('/api/trading/orders',new,headers=headers)
+            self.assertEqual(warning.status_code,409);self.assertEqual(warning.get_json()['code'],'unknown_orders')
+            self.assertEqual(warning.get_json()['nonces'],['a'*32]);self.assertEqual(fake.post_order.call_count,1)
+            fake.post_order.side_effect=None;fake.post_order.return_value={'success':True,'orderID':'0x'+'1'*64}
+            accepted=self.post('/api/trading/orders',{**new,'acknowledged_unknown':warning.get_json()['nonces']},headers=headers)
+            self.assertEqual(accepted.get_json()['state'],'accepted');self.assertEqual(fake.post_order.call_count,2)
+            replay=self.post('/api/trading/orders',new,headers=headers)
+            self.assertEqual(replay.get_json()['state'],'accepted');self.assertEqual(fake.post_order.call_count,2)
+
     def test_control_auth_and_fail_closed(self):
         self.assertEqual(self.post('/api/trading/orders',BASE,headers={'X-CSRF-Token':'token'}).status_code,403)
         payload={'enabled':True,'confirm':True,'current_password':'password long enough'}

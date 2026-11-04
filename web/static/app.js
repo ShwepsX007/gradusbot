@@ -14,7 +14,7 @@ function overviewActive(){return !document.hidden&&!$('#weather-page').classList
 function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherController.abort();weatherController=null;weatherLoadingSid=null}
 function resumeOverview(){return loadStation(state.weather?.station?.id===state.selected)}
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
-async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok)throw Error(data.error||'Ошибка запроса');return data}
+async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok){const e=Error(data.error||'Ошибка запроса');e.code=data.code;e.nonces=data.nonces;throw e}return data}
 function page(name,refreshOnEnter=true){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver();if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
 $$('.nav').forEach(x=>x.onclick=()=>page(x.dataset.page));
 function showDialog(id){$(`#${id}`).showModal()}
@@ -272,7 +272,6 @@ function priceCents(value){const n=Number(value);return Number.isFinite(n)?new I
 function shares(value){if(value===null||value===undefined||value==='')return '—';const n=Number(value);return Number.isFinite(n)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(n):'—'}
 let accountSnapshot=null,accountSnapshotAt=0,accountInFlight=null,accountAutoRefresh=false,tradeEnabled=false,tradeSending=false,accountGeneration=0,accountSource='';
 const cancelingOrders=new Set();
-let tpOrderIds=new Set();
 let renderedSnapshotStale=false;
 function confirmedMarketTokens(){
   const opts=marketData?.market?.options||[],pairs=bookData?.pairs||[],candidates=[];
@@ -303,8 +302,7 @@ function cancelButton(order){
 }
 function orderDescription(order){
   const remaining=orderRemaining(order),price=order.price==null?'—':priceCents(order.price);
-  const isTp=typeof order.id==='string'&&tpOrderIds.has(order.id.toLowerCase());
-  return `${isTp?'Тейк · ':''}${orderSide(order)} · ${price} · всего ${shares(order.original_size)} / сопоставлено ${shares(order.size_matched)} / не сопоставлено ${remaining===null?'—':shares(remaining)} шт. · ${order.status||'статус неизвестен'}`;
+  return `${orderSide(order)} · ${price} · всего ${shares(order.original_size)} / сопоставлено ${shares(order.size_matched)} / не сопоставлено ${remaining===null?'—':shares(remaining)} шт. · ${order.status||'статус неизвестен'}`;
 }
 function renderTradeOrders(){
   const target=$('#trade-live-orders'),tokens=confirmedMarketTokens(),orders=currentMarketOrders(tokens);
@@ -330,10 +328,10 @@ function renderTradeAccount(){
   if(!ps.length){positions.textContent=data.positions_maybe_partial?'В полученной странице позиция не найдена; снимок неполный.':'В полученном снимке нет позиций по этому событию.';return}
   positions.innerHTML=ps.map((p,i)=>{
     const t=tokens.get(p.asset),bid=t?.book?.bids?.[0],title=t?`${t.label} · ${t.side}`:`${p.title||'Позиция'} · ${p.outcome||'исход'}`;
-    const action=confirmed.has(p.asset)&&Number.isFinite(Number(p.size))&&Number(p.size)>0?`<button type="button" class="button secondary trade-prepare-tp" data-index="${i}">Подготовить тейк</button>`:'';
+    const action=confirmed.has(p.asset)&&Number.isFinite(Number(p.size))&&Number(p.size)>0?`<button type="button" class="button secondary trade-sell-shares" data-index="${i}">Продать доли</button>`:'';
     return `<div class="trade-live-position"><b>${esc(title)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price==null?'—':esc(priceCents(p.avg_price))} · цена Data API ${p.current_price==null?'—':esc(priceCents(p.current_price))} · BID ${bid?esc(priceCents(bid.price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(shares(p.cash_pnl))+' USDC'}</span>${action}</div>`;
   }).join('')+(data.positions_maybe_partial?'<small>Список позиций неполный.</small>':'');
-  positions.querySelectorAll('.trade-prepare-tp').forEach(button=>button.onclick=()=>prepareTakeProfit(ps[Number(button.dataset.index)]));
+  positions.querySelectorAll('.trade-sell-shares').forEach(button=>button.onclick=()=>preparePositionSale(ps[Number(button.dataset.index)]));
 }
 function renderAccountSnapshot(refreshBook=true){
   const status=$('#account-status'),positions=$('#account-positions'),orders=$('#account-orders');
@@ -348,13 +346,7 @@ function renderAccountSnapshot(refreshBook=true){
   positions.innerHTML=ps?'<div class="account-list-title">ПОЗИЦИИ DATA API · ВЫБРАННОЕ СОБЫТИЕ</div>'+(ps.length?ps.map((p,i)=>`<div class="account-item"><b>${esc(p.title||p.outcome||'Позиция')} · ${esc(p.outcome)}</b><span>${esc(shares(p.size))} контрактов · вход ${p.avg_price!=null?esc(priceCents(p.avg_price)):'—'} · текущая ${p.current_price!=null?esc(priceCents(p.current_price)):'—'} · PnL ${p.cash_pnl==null?'—':esc(p.cash_pnl)+' USDC'}${p.redeemable?' · доступно погашение':''}</span>${tokens.has(p.asset)&&p.size>0?`<button type="button" class="button secondary account-close-draft" data-index="${i}">Подготовить продажу</button>`:''}</div>`).join(''):'<div class="account-empty">Нет позиций по выбранному событию в полученном снимке.</div>'):'<div class="account-empty">Позиции недоступны; это не означает, что их нет.</div>';
   orders.innerHTML=os?'<div class="account-list-title">ОТКРЫТЫЕ ОРДЕРА CLOB · ВЫБРАННОЕ СОБЫТИЕ</div>'+(os.length?os.map(o=>`<div class="account-item"><b>${esc(tokens.get(o.asset_id))} · ${esc(o.side)}</b><span>${o.price!=null?esc(priceCents(o.price)):'—'} · всего ${esc(shares(o.original_size))} / сопоставлено ${esc(shares(o.size_matched))} · ${esc(o.status||'статус неизвестен')}<br>ID ${esc(o.id)}</span>${cancelButton(o)}</div>`).join(''):`<div class="account-empty">${pairs.length?'Нет открытых ордеров по выбранному событию на первой странице.':'Ордера появятся после получения идентификаторов стакана; отсутствие данных не означает отсутствие ордеров.'}</div>`):'<div class="account-empty">Ордера недоступны; это не означает, что их нет.</div>';
   if(refreshBook)renderMarketOptions();
-  $$('.account-close-draft').forEach(button=>button.onclick=()=>{
-    const p=ps[Number(button.dataset.index)];if(!p)return;
-    const index=opts.findIndex(o=>{let pair=pairs.find(x=>x.yes===o.token_yes&&x.no===o.token_no);return pair&&(pair.yes===p.asset||pair.no===p.asset)});
-    if(index<0)return;const option=opts[index],token=option.token_yes===p.asset?'yes':'no',book=bookFor(option,token),bid=book?.bids?.[0];
-    const d=getDraft();clearTakeProfit(d);d.index=String(index);d.token=token;d.action='SELL';d.size=String(Math.floor(Number(p.size)*100)/100);d.price=bid?String(Math.round(Number(bid.price)*1000000)/10000):'';
-    draftOptionsKey='';renderTradeDraft(marketData.market);$('#trade-send-status').textContent='Черновик продажи: проверьте количество, цену и свежесть позиции. До подтверждения ордер не отправляется.';$('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});
-  });
+  $$('.account-close-draft').forEach(button=>button.onclick=()=>preparePositionSale(ps[Number(button.dataset.index)]));
 
 }
 function loadAccountSnapshot(forceAfterCurrent=false){
@@ -391,11 +383,11 @@ async function loadMonitorStatus(){
     const labels={ok:'снимок получен',partial:'снимок получен с ошибками',stale:'нет свежего снимка',error:'ошибка',not_running:'не запущено',not_configured:'аккаунт не настроен',account_changed:'аккаунт изменён; нужна новая сверка'};
     const when=result.checked_at?` · ${new Date(result.checked_at*1000).toLocaleTimeString('ru-RU')}`:'';
     const interval=Number.isInteger(result.interval_seconds)?` · интервал ${result.interval_seconds} с`:'';
-    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}${interval}. Только чтение. SL и авто-тейк на BUY не работают; выставленный SELL GTC исполняет биржа.`;
+    $('#trade-monitor-status').textContent=`Фоновое наблюдение: ${labels[result.status]||'недоступно'}${when}${interval}. Только чтение. Выставленные ордера исполняет биржа.`;
     if(!accountSnapshot&&result.snapshot&&['ok','partial'].includes(result.status)){
       accountSnapshot=result.snapshot;accountSnapshotAt=result.checked_at*1000;accountSource='фоновый монитор';renderAccountSnapshot();
     }
-  }catch(e){if(generation===accountGeneration)$('#trade-monitor-status').textContent='Фоновое наблюдение недоступно. SL и авто-тейк на BUY не работают; выставленный SELL GTC остаётся на бирже.'}
+  }catch(e){if(generation===accountGeneration)$('#trade-monitor-status').textContent='Фоновое наблюдение недоступно. Выставленные ордера остаются на бирже.'}
 }
 
 
@@ -404,21 +396,16 @@ async function loadTradeJournal(){
     const slug=state.market;if(!slug){$('#trade-journal').innerHTML='';return}
     const data=await api('/api/trading/intents?slug='+encodeURIComponent(slug));if(state.market!==slug)return;
     const rows=(data.intents||[]).filter(x=>x.slug===slug);
-    tpOrderIds=new Set(rows.filter(x=>x.purpose==='take_profit'&&typeof x.order_id==='string'&&/^0x[0-9a-fA-F]{64}$/.test(x.order_id)).map(x=>x.order_id.toLowerCase()));renderTradeOrders();
     $('#trade-journal').innerHTML=rows.length?'<div class="account-list-title">ЖУРНАЛ ОТПРАВОК И СВЕРКА СДЕЛОК</div>'+rows.map(x=>{
       const state=x.state==='accepted'?'Подтверждён ордер CLOB':x.state==='not_sent'?'Не отправлен':'РЕЗУЛЬТАТ НЕИЗВЕСТЕН — не повторяйте';
-      const r=x.reconciliation;let tpStatus='';
-      if(x.purpose==='take_profit'){
-        const confirmed=r?.confirmed_size==null?null:Number(r.confirmed_size),failed=r?.failed_size==null?null:Number(r.failed_size),total=Number(x.size);
-        tpStatus=r?.assessment==='terminal'&&Number.isFinite(confirmed)&&confirmed===total&&failed===0?'ТЕЙК: ПОЛНОСТЬЮ ИСПОЛНЕН И ПОДТВЕРЖДЁН':confirmed>0&&confirmed<total?'Тейк: частичное исполнение подтверждено':confirmed===total&&total>0?'Тейк: объём подтверждён, окончательный статус ордера проверяется':'Тейк: исполнение не подтверждено';
-      }
+      const r=x.reconciliation;
       const ex=x.exchange?.available?` · CLOB: ${x.exchange.status}, сопоставлено ${x.exchange.size_matched} из ${x.exchange.original_size} шт. (не равно окончательному исполнению)`:x.exchange?' · Статус CLOB не получен':'';
       const info=r?.size_matched!=null?` Сверка: ${r.order_status}, сопоставлено ${r.size_matched}; подтверждено ${r.confirmed_size}, ошибка ${r.failed_size} шт.`:'';
       const reason=r?.reason?` ${r.reason}`:'';
       const id=x.order_id?` ID ${x.order_id}`:r?.expected_id?` Расчётный ID ${r.expected_id} (не доказательство отправки)`:` Запись ${x.nonce}`;
-      return `<div class="account-item"><b>${x.purpose==='take_profit'?'ТЕЙК · ':''}${esc(x.side)} · ${esc(x.price)} pUSD · ${esc(x.size)} шт. · ${esc(x.order_type)}</b><span>${esc((tpStatus?tpStatus+' · ':'')+state+ex+info+reason+id)}</span></div>`;
+      return `<div class="account-item"><b>${esc(x.side)} · ${esc(x.price)} pUSD · ${esc(x.size)} ${x.execution_mode==='market'&&x.side==='BUY'?'pUSD':'долей'} · ${esc(x.order_type)}</b><span>${esc(state+ex+info+reason+id)}</span></div>`;
     }).join(''):'';
-  }catch(e){tpOrderIds=new Set();renderTradeOrders();$('#trade-journal').textContent='Журнал отправок недоступен.'}
+  }catch(e){renderTradeOrders();$('#trade-journal').textContent='Журнал отправок недоступен.'}
 }
 function newTradeNonce(){const a=new Uint8Array(16);crypto.getRandomValues(a);return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')}
 $('#trade-submit').onclick=async()=>{
@@ -426,63 +413,75 @@ $('#trade-submit').onclick=async()=>{
   if(d.index===''||!o||!bookFor(o,d.token)){toast('Выберите подтверждённый исход с доступным стаканом.');return}
   const price=Number(d.price),size=Number(d.size),asset=d.token==='yes'?o.token_yes:o.token_no;
   if(!Number.isFinite(price)||price<=0||price>=100||!Number.isFinite(size)||size<=0){toast('Укажите допустимую цену и количество.');return}
-  const takeProfit=d.purpose==='take_profit';
-  if(takeProfit&&(d.action!=='SELL'||d.type!=='GTC'||d.tpAsset!==asset)){toast('Параметры тейка изменены; подготовьте его из позиции заново.');return}
-  if(takeProfit&&(!accountSnapshot||Date.now()-accountSnapshotAt>65000)){toast('Снимок позиции устарел. Обновите счёт и проверьте количество.');return}
-  const message=takeProfit?`РЕАЛЬНЫЙ ТЕЙК: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · SELL GTC · минимум ${d.price}¢ · ${d.size} долей. Может исполниться сразу; комиссия может уменьшить прибыль. Ордер останется на бирже при закрытии страницы и выключении торговли. Отправить?`:`РЕАЛЬНЫЙ ОРДЕР: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · ${d.action} · ${d.type} · ${d.price}¢ · ${d.size} контрактов. SL и авто-тейк на BUY не активны. Отправить?`;
+  const isMarket=d.type==='FAK',unit=isMarket&&d.action==='BUY'?'pUSD':'долей';
+  const estimate=$('#trade-estimate').textContent;
+  const message=`РЕАЛЬНЫЙ ОРДЕР: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · ${d.action} · ${isMarket?'РЫНОЧНЫЙ FAK':'ЛИМИТНЫЙ GTC'} · ${isMarket?(d.action==='BUY'?'максимум':'минимум')+' ':''}${d.price}¢ · ${d.size} ${unit}. ${estimate} Комиссии могут изменить итоговую сумму. ${isMarket?'Неисполненный остаток отменяется.':'Ордер останется на бирже до исполнения или отмены.'} Отправить?`;
   if(!confirm(message))return;
-  const body={slug:state.market,asset,selection:d.token,side:d.action,order_type:d.type,price:(price/100).toFixed(6),size:d.size,nonce:newTradeNonce(),confirm:true,...(takeProfit?{purpose:'take_profit',confirm_take_profit:true}:{})};
+  const body={slug:state.market,asset,selection:d.token,side:d.action,order_type:d.type,execution_mode:isMarket?'market':'limit',price:(price/100).toFixed(6),size:d.size,nonce:newTradeNonce(),confirm:true};
   tradeSending=true;updateTradingControls();$('#trade-send-status').textContent='Отправляем заявку. Не закрывайте страницу и не повторяйте запрос.';
-  try{const result=await api('/api/trading/orders',{method:'POST',body:JSON.stringify(body)});
-    if(takeProfit){clearTakeProfit(d);d.price='';d.size='';draftOptionsKey='';renderTradeDraft(marketData.market)}
+  try{
+    let result;
+    while(true){
+      try{result=await api('/api/trading/orders',{method:'POST',body:JSON.stringify(body)});break}
+      catch(err){
+        if(err.code!=='unknown_orders'||!Array.isArray(err.nonces)||!err.nonces.every(x=>/^[0-9a-f]{32}$/.test(x)))throw err;
+        if(!confirm(`ВНИМАНИЕ: по этому исходу есть ${err.nonces.length} заявок с неизвестным результатом или незавершённой отправкой. Они могли уже исполниться. Новая заявка может привести к повторной покупке или продаже. Проверьте Polymarket и журнал. Всё равно отправить НОВУЮ заявку?`)){$('#trade-send-status').textContent='Новая заявка не отправлена. Проверьте предыдущие заявки.';return}
+        body.acknowledged_unknown=err.nonces;
+      }
+    }
     $('#trade-send-status').textContent=result.state==='accepted'?`Ордер принят CLOB: ${result.order_id}. Это не подтверждение исполнения; проверьте заявки и сделки.`:'Результат неизвестен. Не повторяйте заявку — проверьте Polymarket и журнал.';
     await loadAccountSnapshot();await loadTradeJournal();
-  }catch(err){if(takeProfit){clearTakeProfit(d);d.price='';d.size='';draftOptionsKey='';renderTradeDraft(marketData?.market)}$('#trade-send-status').textContent=err.message+' Если результат запроса неизвестен, не повторяйте: проверьте Polymarket и журнал.';await loadTradeJournal()}
+  }catch(err){$('#trade-send-status').textContent=err.message+' Если результат запроса неизвестен, не повторяйте: проверьте Polymarket и журнал.';await loadTradeJournal()}
   finally{tradeSending=false;updateTradingControls()}
 };
 
 setInterval(()=>{if(accountAutoRefresh&&!document.hidden&&!$('#weather-page').classList.contains('hidden'))loadAccountSnapshot()},30000);
 setInterval(()=>{if(accountSnapshot&&(Date.now()-accountSnapshotAt>65000)!==renderedSnapshotStale)renderAccountSnapshot()},15000);
 let draftMarket=null,draftOptionsKey='',tradeDrafts=new Map(),draftMarketOptions=new Map();
-function getDraft(){if(!tradeDrafts.has(state.market))tradeDrafts.set(state.market,{index:'',token:'yes',action:'BUY',type:'GTC',price:'',size:'',sl:'',tp:''});return tradeDrafts.get(state.market)}
-function clearTakeProfit(d){if(d.purpose==='take_profit')$('#trade-send-status').textContent='Режим тейка снят. При необходимости подготовьте его из позиции заново.';d.purpose='manual';d.tpAsset=null}
-function renderTakeProfitMode(){
-  const active=getDraft().purpose==='take_profit',note=$('#tp-draft-note');note.classList.toggle('hidden',!active);
-  note.textContent=active?'ТЕЙК ДЛЯ КУПЛЕННЫХ ДОЛЕЙ: введите минимальную цену продажи в поле «Цена». Будет выставлен реальный SELL GTC; он может исполниться сразу или частично. Комиссии могут уменьшить прибыль. Не добавляет защиту к незавершённому BUY.':'';
-}
-function prepareTakeProfit(position){
-  if(!position||!accountSnapshot||Date.now()-accountSnapshotAt>65000){toast('Обновите снимок аккаунта перед подготовкой тейка.');return}
+function getDraft(){if(!tradeDrafts.has(state.market))tradeDrafts.set(state.market,{index:'',token:'yes',action:'BUY',type:'GTC',price:'',size:''});return tradeDrafts.get(state.market)}
+function preparePositionSale(position){
+  if(!position||!accountSnapshot||Date.now()-accountSnapshotAt>65000){toast('Обновите снимок аккаунта перед продажей.');return}
   const match=confirmedMarketTokens().get(position.asset),qty=Number(position.size);
   if(!match||!Number.isFinite(qty)||qty<=0){toast('Не удалось подтвердить исход и количество позиции.');return}
   const amount=Math.floor(qty*100)/100;if(amount<=0){toast('Количество позиции меньше доступной точности заявки.');return}
   const opts=marketData?.market?.options||[],index=opts.indexOf(match.option);if(index<0)return;
-  const d=getDraft();d.index=String(index);d.token=match.token;d.action='SELL';d.type='GTC';d.size=String(amount);d.price='';d.purpose='take_profit';d.tpAsset=position.asset;
-  draftOptionsKey='';renderTradeDraft(marketData.market);renderTakeProfitMode();$('#trade-send-status').textContent='Черновик тейка: укажите цену продажи и проверьте количество. До подтверждения ордер не отправляется.';
+  const d=getDraft();d.index=String(index);d.token=match.token;d.action='SELL';d.type='GTC';d.size=String(amount);
+  const bid=bookFor(match.option,match.token)?.bids?.[0];d.price=bid?String(Math.round(Number(bid.price)*1000000)/10000):'';
+  draftOptionsKey='';renderTradeDraft(marketData.market);$('#trade-send-status').textContent='Черновик продажи: выберите лимитный или рыночный тип, проверьте цену и количество. Ордер ещё не отправлен.';
   $('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});$('#trade-price').focus();
 }
 function draftEstimate(){
-  const d=getDraft(),price=Number(d.price),size=Number(d.size);
-  $('#trade-estimate').textContent=d.price!==''&&d.size!==''&&price>0&&price<100&&size>0?`Оценка: ${(price*size/100).toLocaleString('ru-RU',{maximumFractionDigits:4})} USDC без комиссий · не ордер`:'Укажите цену и количество для оценки суммы.';
+  const d=getDraft(),price=Number(d.price),amount=Number(d.size),market=d.type==='FAK';
+  $('#trade-price-label').textContent=market?(d.action==='BUY'?'Защитная цена: максимум, ¢':'Защитная цена: минимум, ¢'):'Цена, ¢';
+  $('#trade-size-label').textContent=market&&d.action==='BUY'?'Сумма покупки, pUSD':'Количество долей';
+  if(d.price===''||d.size===''||!Number.isFinite(price)||price<=0||price>=100||!Number.isFinite(amount)||amount<=0){$('#trade-estimate').textContent='Укажите цену и сумму или количество для оценки.';return}
+  if(!market){$('#trade-estimate').textContent=`Оценка: ${(price*amount/100).toLocaleString('ru-RU',{maximumFractionDigits:4})} pUSD без комиссий · не ордер`;return}
+  const option=marketData?.market?.options?.[Number(d.index)],book=option&&bookFor(option,d.token),cap=price/100;
+  const levels=(d.action==='BUY'?book?.asks:book?.bids)||[];
+  const valid=levels.map(x=>({price:Number(x.price),size:Number(x.size)})).filter(x=>Number.isFinite(x.price)&&x.price>0&&x.price<1&&Number.isFinite(x.size)&&x.size>0&&(d.action==='BUY'?x.price<=cap:x.price>=cap)).sort((a,b)=>d.action==='BUY'?a.price-b.price:b.price-a.price);
+  let left=amount,cash=0,qty=0;for(const x of valid){const q=d.action==='BUY'?Math.min(x.size,left/x.price):Math.min(x.size,left);qty+=q;cash+=q*x.price;left-=d.action==='BUY'?q*x.price:q;if(left<=1e-9)break}
+  const n=x=>x.toLocaleString('ru-RU',{maximumFractionDigits:4});
+  $('#trade-estimate').textContent=`Оценка по показанным уровням: ${n(qty)} долей / ${n(cash)} pUSD без комиссий${left>1e-8?' · объём показанных уровней недостаточен':''}. Стакан может измениться; остаток FAK отменяется, защитная цена может быть строже из-за округления.`;
 }
 function renderTradeDraft(m){
   let opts=m?.options||[],key=JSON.stringify(opts.map(o=>[o.label,o.token_yes,o.token_no]));
-  if(draftMarket===state.market&&draftOptionsKey===key)return;
+  if(draftMarket===state.market&&draftOptionsKey===key){draftEstimate();return}
   draftMarket=state.market;draftOptionsKey=key;
   let d=getDraft(),previousKey=draftMarketOptions.get(state.market);
   if(m&&previousKey&&previousKey!==key){d.index='';d.price='';}
   if(m)draftMarketOptions.set(state.market,key);
   $('#trade-option').innerHTML='<option value="">Выберите исход</option>'+opts.map((o,i)=>`<option value="${i}">${esc(o.label)}</option>`).join('');
   if(m&&(!opts[Number(d.index)]||d.index===''))d.index='';
-  for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']])$('#trade-'+id).value=d[key];
-  draftEstimate();renderTakeProfitMode();
+  for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size']])$('#trade-'+id).value=d[key];
+  draftEstimate();
 }
-for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size'],['sl','sl'],['tp','tp']]){
-  $('#trade-'+id).addEventListener('input',e=>{const d=getDraft();d[key]=e.currentTarget.value;if(['option','token','action','type'].includes(id)&&d.purpose==='take_profit'){clearTakeProfit(d);$('#trade-send-status').textContent='Режим тейка отключён из-за изменения исхода, стороны или типа заявки. Подготовьте тейк заново.'}draftEstimate();renderTakeProfitMode()});
+for(const [id,key] of [['option','index'],['token','token'],['action','action'],['type','type'],['price','price'],['size','size']]){
+  $('#trade-'+id).addEventListener('input',e=>{const d=getDraft(),wasUsd=d.type==='FAK'&&d.action==='BUY';d[key]=e.currentTarget.value;const isUsd=d.type==='FAK'&&d.action==='BUY';if(wasUsd!==isUsd){d.size='';$('#trade-size').value='';$('#trade-send-status').textContent='Единица объёма изменилась. Введите сумму или количество заново.'}draftEstimate()});
 }
 function pickBookPrice(index,token,side,price){
   if(state.demo||!marketData?.market?.options?.[index]||!bookFor(marketData.market.options[index],token))return;
   const n=Number(price);if(!Number.isFinite(n)||n<=0||n>=1)return;
-  const d=getDraft();clearTakeProfit(d);d.index=String(index);d.token=token;d.action=side==='ask'?'BUY':'SELL';d.price=String(Math.round(n*1000000)/10000);
+  const d=getDraft(),wasUsd=d.type==='FAK'&&d.action==='BUY';d.index=String(index);d.token=token;d.action=side==='ask'?'BUY':'SELL';if(wasUsd!==(d.type==='FAK'&&d.action==='BUY')){d.size='';$('#trade-send-status').textContent='Единица объёма изменилась. Введите сумму или количество заново.'}d.price=String(Math.round(n*1000000)/10000);
   draftOptionsKey='';renderTradeDraft(marketData.market);
   $('#trade-preview').scrollIntoView?.({behavior:'smooth',block:'nearest'});
 }
@@ -767,27 +766,27 @@ $('#account-form').onsubmit=async e=>{
   data.auto_api=$('#account-api-mode').value==='auto';
   if(!confirm('Сохранить приватный ключ на сервере в незашифрованном файле с ограниченными правами?'))return;
   button.disabled=true;
-  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL и авто-тейк на BUY не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
+  try{const result=await api('/api/trading/account-config',{method:'POST',body:JSON.stringify(data)});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт изменён; повторите сверку с биржей.';$('#account-config-status').textContent=`Сохранён кошелёк ${result.wallet}. Работоспособность ещё не проверена.`;toast('Настройки сохранены; проверьте соединение с биржей')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#account-delete').onclick=async e=>{
   const f=$('#account-form'),button=e.currentTarget,password=f.elements.current_password.value;
   if(!password){toast('Введите текущий пароль терминала');return}
   if(!confirm('Удалить сохранённые ключи с сервера? Открытые ордера и позиции на бирже не изменятся.'))return;
-  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено. SL и авто-тейк на BUY не работают.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
+  button.disabled=true;try{await api('/api/trading/account-config',{method:'DELETE',body:JSON.stringify({current_password:password})});f.reset();updateAccountApiMode();tradeEnabled=false;updateTradingControls();accountGeneration++;accountSnapshot=null;accountSource='';accountAutoRefresh=false;$('#trade-cancel-status').textContent='';$('#trade-monitor-status').textContent='Аккаунт изменён; состояние фонового наблюдения не проверено.';renderAccountSnapshot();$('#account-status').textContent='Аккаунт отключён; ордера на бирже не отменялись.';$('#account-config-status').textContent='Аккаунт не настроен.';toast('Сохранённые ключи удалены')}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
 $('#monitor-interval-form').onsubmit=async e=>{
   e.preventDefault();const form=e.currentTarget,button=form.querySelector('button'),n=Number(form.elements.interval_seconds.value);
   if(!Number.isInteger(n)||n<15||n>300){$('#monitor-interval-status').textContent='Укажите целое число секунд от 15 до 300.';return}
   button.disabled=true;
-  try{const result=await api('/api/trading/monitor-interval',{method:'POST',body:JSON.stringify({interval_seconds:n,confirm:true})});form.elements.interval_seconds.value=result.interval_seconds;$('#monitor-interval-status').textContent='Сохранено. Служба применит изменение при следующей проверке; SL и авто-тейк на BUY не работают.';await loadMonitorStatus()}
+  try{const result=await api('/api/trading/monitor-interval',{method:'POST',body:JSON.stringify({interval_seconds:n,confirm:true})});form.elements.interval_seconds.value=result.interval_seconds;$('#monitor-interval-status').textContent='Сохранено. Служба применит изменение при следующей проверке;';await loadMonitorStatus()}
   catch(err){$('#monitor-interval-status').textContent=err.message}
   finally{button.disabled=false}
 };
 $('#trade-control-form').onsubmit=async e=>{
   e.preventDefault();const f=e.currentTarget,button=f.querySelector('button'),on=f.elements.enabled.value==='true';
-  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? SL и авто-тейк на BUY не работают; лимитный тейк — реальный SELL GTC.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
+  if(!confirm(on?'Включить отправку РЕАЛЬНЫХ ордеров? Автоматической защиты позиции нет.':'Выключить торговлю? Уже отправленные заявки на бирже не отменятся.'))return;
   button.disabled=true;try{const result=await api('/api/trading/control',{method:'POST',body:JSON.stringify({enabled:on,confirm:true,current_password:f.elements.current_password.value})});f.elements.current_password.value='';tradeEnabled=result.enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';renderAccountSnapshot()}
   catch(err){toast(err.message)}finally{button.disabled=false}
 };
@@ -881,19 +880,20 @@ async function portfolioOpen(slug){
   }catch(e){toast('Не удалось проверить привязки: '+e.message)}
 }
 async function loadPortfolio(){
-  const seq=++portfolioGeneration;$('#portfolio-refresh').disabled=true;$('#portfolio-status').textContent='Загружаем снимок…';for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-activity'])$('#'+id).textContent='';
+  const seq=++portfolioGeneration;$('#portfolio-refresh').disabled=true;$('#portfolio-status').textContent='Загружаем снимок…';for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity'])$('#'+id).textContent='';
   try{
     const data=await api('/api/trading/portfolio');if(seq!==portfolioGeneration)return;
-    $('#portfolio-status').textContent=[`Кошелёк ${data.wallet}.`,...(data.errors||[]),data.positions_partial?'Показаны первые 500 позиций.':'',data.activity_partial?'Показаны первые 500 действий.':''].filter(Boolean).join(' ');
+    $('#portfolio-status').textContent=[`Кошелёк ${data.wallet}.`,...(data.errors||[]),data.orders_partial?'Список ордеров CLOB усечён.':'',data.positions_partial?'Показаны первые 500 позиций.':'',data.activity_partial?'Показаны первые 500 действий.':''].filter(Boolean).join(' ');
     const total=data.balance!==null&&data.value!==null?Number(data.balance)+Number(data.value):null;
     $('#portfolio-balances').innerHTML=`<div class="portfolio-values">Баланс CLOB: ${esc(portfolioNum(data.balance))} pUSD · Оценка позиций: ${esc(portfolioNum(data.value))} pUSD · Всего: ${esc(portfolioNum(total))} pUSD</div>`;
     $('#portfolio-pnl').innerHTML=portfolioLine(data.pnl);$('#portfolio-allocation').innerHTML=portfolioDistribution(data.positions,data.positions_partial);
     const row=(title,detail,slug)=>`<div class="portfolio-row"><div><b>${esc(title||'Рынок не определён')}</b><small>${esc(detail)}</small></div><button class="button secondary portfolio-open" data-slug="${esc(slug||'')}">Открыть ↗</button></div>`;
     $('#portfolio-positions').innerHTML=Array.isArray(data.positions)?(data.positions.map(p=>row(p.title||p.event_slug,`${p.outcome||'Исход неизвестен'} · ${portfolioNum(p.size)} долей · оценка ${portfolioNum(p.value)} pUSD · PnL ${portfolioNum(p.pnl)}${p.redeemable?' · доступно погашение':''}`,p.event_slug)).join('')||'<p>Позиций нет.</p>'):'<p>Позиции недоступны.</p>';
-    const slugByAsset=new Map();for(const p of [...(data.positions||[]),...(data.activity||[])])if(p.asset&&p.event_slug){let slugs=slugByAsset.get(p.asset)||new Set();slugs.add(p.event_slug);slugByAsset.set(p.asset,slugs)}
-    $('#portfolio-orders').innerHTML=Array.isArray(data.orders)?(data.orders.map(o=>{let slugs=slugByAsset.get(o.asset_id),slug=slugs?.size===1?[...slugs][0]:'';return row(slug||`Ордер ${o.id}`,`${o.side} · цена ${portfolioNum(o.price,4)} pUSD · сопоставлено ${portfolioNum(o.size_matched)} из ${portfolioNum(o.original_size)} долей · ${o.status}`,slug)}).join('')||'<p>Открытых ордеров на первой странице нет.</p>'):'<p>Ордера недоступны.</p>';
+    const slugByAsset=new Map();for(const p of [...(data.positions||[]),...(data.activity||[]),...(data.intents||[]).map(i=>({asset:i.asset,event_slug:i.slug}))])if(p.asset&&p.event_slug){let slugs=slugByAsset.get(p.asset)||new Set();slugs.add(p.event_slug);slugByAsset.set(p.asset,slugs)}
+    $('#portfolio-orders').innerHTML=Array.isArray(data.orders)?(data.orders.map(o=>{let slugs=slugByAsset.get(o.asset_id),slug=slugs?.size===1?[...slugs][0]:'';return row(slug||`Ордер ${o.id}`,`${o.side} · цена ${portfolioNum(o.price,4)} pUSD · сопоставлено ${portfolioNum(o.size_matched)} из ${portfolioNum(o.original_size)} долей · ${o.status}`,slug)}).join('')||'<p>Открытых ордеров в полученном снимке нет.</p>'):'<p>Ордера недоступны.</p>';
+    $('#portfolio-intents').innerHTML=Array.isArray(data.intents)?(data.intents.map(x=>{let r=x.reconciliation,detail=`${x.side} · ${x.execution_mode==='market'?'FAK':'GTC'} · ${x.size} ${x.execution_mode==='market'&&x.side==='BUY'?'pUSD':'долей'} · ${x.state==='accepted'?'принят CLOB, исполнение не подтверждено':x.state==='not_sent'?'не отправлен':'результат неизвестен'}`;if(r?.size_matched!=null)detail+=` · сопоставлено ${r.size_matched}, подтверждено ${r.confirmed_size}, ошибка ${r.failed_size}`;return row(x.slug,detail,x.slug)}).join('')||'<p>Записей терминала нет.</p>'):'<p>Журнал терминала недоступен.</p>';
     $('#portfolio-activity').innerHTML=Array.isArray(data.activity)?(data.activity.map(p=>row(p.title||p.event_slug,`${p.type||'Действие'} ${p.side||''} · ${p.outcome||''} · ${portfolioNum(p.size)} долей · ${portfolioNum(p.value)} pUSD · ${p.timestamp?new Date(p.timestamp*1000).toLocaleString('ru-RU'):'время недоступно'}`,p.event_slug)).join('')||'<p>Активность отсутствует.</p>'):'<p>История недоступна.</p>';
-  }catch(e){if(seq===portfolioGeneration){$('#portfolio-status').textContent=e.message;for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-activity'])$('#'+id).textContent=''}}
+  }catch(e){if(seq===portfolioGeneration){$('#portfolio-status').textContent=e.message;for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity'])$('#'+id).textContent=''}}
   finally{if(seq===portfolioGeneration)$('#portfolio-refresh').disabled=false}
 }
 $('#portfolio-refresh').onclick=loadPortfolio;

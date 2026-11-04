@@ -7,11 +7,17 @@ from decimal import Decimal, InvalidOperation
 
 import database as db
 from web import trading_account, order_reconciliation as reconciliation
-from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions, OrderPayload, OrderType, AssetType, BalanceAllowanceParams
+from py_clob_client_v2.clob_types import OrderArgsV2, MarketOrderArgsV2, PartialCreateOrderOptions, OrderPayload, OrderType
 
 
 class TradeError(Exception):
     pass
+
+
+class UnknownOrders(TradeError):
+    def __init__(self, nonces):
+        self.nonces = nonces
+        super().__init__('По этому исходу есть заявки с неизвестным результатом или ещё выполняется отправка. Проверьте Polymarket: новая заявка может создать повторную сделку.')
 
 
 def enabled():
@@ -69,16 +75,18 @@ def _reserve(data, wallet):
         existing=conn.execute('SELECT * FROM web_order_intents WHERE nonce=?',(data['nonce'],)).fetchone()
         if existing:
             # Replays return the recorded status and can never submit a second order.
+            if existing['wallet'].lower()!=wallet.lower(): raise TradeError('Идентификатор заявки уже использован другим аккаунтом.')
             return dict(existing),False
         control=conn.execute('SELECT enabled FROM web_trading_control WHERE id=1').fetchone()
         if not control or not control['enabled']: raise TradeError('Торговля выключена в настройках.')
-        blocked=conn.execute("""SELECT 1 FROM web_order_intents i LEFT JOIN web_order_reconciliation r ON r.nonce=i.nonce
-            WHERE lower(i.wallet)=lower(?) AND i.asset=? AND
-            (i.state IN ('pending','unknown') OR (i.state='accepted' AND (r.assessment IS NULL OR r.assessment!='terminal'))) LIMIT 1""",(wallet,data['asset'])).fetchone()
-        if blocked: raise TradeError('По этому исходу есть незавершённая или несверенная заявка. Новая отправка заблокирована; проверьте журнал и Polymarket.')
-        conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated,purpose)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
-                     (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now,data['purpose']))
+        unknown=[r['nonce'] for r in conn.execute("""SELECT nonce FROM web_order_intents
+            WHERE lower(wallet)=lower(?) AND asset=? AND state IN ('pending','unknown') ORDER BY nonce""",(wallet,data['asset'])).fetchall()]
+        acknowledged=data.get('acknowledged_unknown',[])
+        if unknown and not set(unknown).issubset(set(acknowledged)):
+            raise UnknownOrders(unknown)
+        conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated,purpose,execution_mode,acknowledged_unknown)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                     (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now,data['purpose'],data['execution_mode'],json.dumps(unknown)))
     return None,True
 
 
@@ -89,7 +97,7 @@ def _finish(nonce,state,order_id=None):
 
 
 def public_intent(row):
-    return {k:row[k] for k in ('nonce','slug','asset','side','price','size','order_type','state','order_id','created','updated','purpose')}
+    return {k:row[k] for k in ('nonce','slug','asset','side','price','size','order_type','state','order_id','created','updated','purpose','execution_mode','signed_size','signed_price')}
 
 
 def find_intent(wallet, nonce):
@@ -143,22 +151,6 @@ def annotate_order_statuses(intents, credentials, limit=3):
     return intents
 
 
-def _check_take_profit_balance(client, credentials, asset, size):
-    """Refresh and check the conditional-token balance. This is not an atomic reservation."""
-    params=BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL,token_id=asset,signature_type=credentials['signature_type'])
-    try:
-        client.update_balance_allowance(params)
-        result=client.get_balance_allowance(params)
-        value=result.get('balance') if isinstance(result,dict) else None
-        if isinstance(value,bool) or not isinstance(value,(str,int)) or not re.fullmatch(r'[0-9]{1,40}',str(value)):
-            raise ValueError('invalid balance')
-        balance=Decimal(value)/Decimal(1000000)
-    except Exception:
-        raise TradeError('Не удалось проверить баланс долей в CLOB. Тейк не отправлен.') from None
-    if size>balance:
-        raise TradeError('Запрошено больше долей, чем показывает баланс CLOB. Тейк не отправлен.')
-
-
 def submit(body, event):
     if not isinstance(body,dict) or body.get('confirm') is not True: raise TradeError('Подтвердите отправку ордера.')
     nonce,slug,asset,selection=body.get('nonce'),body.get('slug'),body.get('asset'),body.get('selection')
@@ -168,19 +160,21 @@ def submit(body, event):
         raise TradeError('Неверный исход.')
     side,kind=body.get('side'),body.get('order_type')
     if side not in ('BUY','SELL') or kind not in ('GTC','FAK'): raise TradeError('Неверный тип ордера.')
-    purpose=body.get('purpose','manual')
-    if purpose not in ('manual','take_profit'): raise TradeError('Неверное назначение заявки.')
-    if purpose=='take_profit' and (side!='SELL' or kind!='GTC' or body.get('confirm_take_profit') is not True):
-        raise TradeError('Тейк для позиции — только подтверждённый лимитный SELL GTC.')
-    if body.get('sl') or body.get('tp'): raise TradeError('SL и автоматическая привязка тейка к BUY не реализованы. Ордер не отправлен.')
+    if kind=='FAK' and body.get('execution_mode')!='market': raise TradeError('Обновите страницу: рыночный FAK требует нового формата заявки.')
+    if kind=='GTC' and body.get('execution_mode','limit')!='limit': raise TradeError('Неверный режим заявки.')
+    if body.get('purpose','manual')!='manual' or body.get('sl') or body.get('tp'):
+        raise TradeError('Дополнительные автоматические заявки не поддерживаются.')
+    acknowledged=body.get('acknowledged_unknown',[])
+    if not isinstance(acknowledged,list) or len(acknowledged)>1000 or any(not isinstance(x,str) or not re.fullmatch(r'[0-9a-f]{32}',x) for x in acknowledged):
+        raise TradeError('Неверное подтверждение неизвестных заявок.')
     price,size=parse_decimal(body.get('price')),parse_decimal(body.get('size'))
     if not 0<price<1 or not 0<size<=1000000 or size != size.quantize(Decimal('.01')):
-        raise TradeError('Цена должна быть от 0 до 1, объём — положительным с точностью до 0,01 контракта.')
+        raise TradeError('Цена должна быть от 0 до 1, сумма или количество — положительным с точностью до 0,01.')
     market_asset(event,asset,selection)
     c=trading_account.load()
     if not c: raise TradeError('Сначала настройте аккаунт Polymarket.')
     wallet=c['funder'] or c['signer']
-    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind,'purpose':purpose}
+    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind,'purpose':'manual','execution_mode':'market' if kind=='FAK' else 'limit','acknowledged_unknown':acknowledged}
     client=trading_account.build_client(c)
     try:
         book=client.get_order_book(asset)
@@ -189,11 +183,10 @@ def submit(body, event):
         if tick not in (Decimal('.1'),Decimal('.01'),Decimal('.005'),Decimal('.0025'),Decimal('.001'),Decimal('.0001')) or minimum<=0:
             raise ValueError()
         if price%tick or price<tick or price>1-tick: raise TradeError('Цена не соответствует шагу рынка.')
-        if size<minimum: raise TradeError('Количество меньше минимума рынка; оно не увеличивается автоматически.')
+        if kind=='GTC' and size<minimum: raise TradeError('Количество меньше минимума рынка; оно не увеличивается автоматически.')
         if not isinstance(book.get('neg_risk'),bool): raise ValueError()
     except TradeError: raise
     except Exception: raise TradeError('Не удалось проверить параметры стакана. Ордер не отправлен.') from None
-    if purpose=='take_profit': _check_take_profit_balance(client,c,asset,size)
     try:
         lock_fd=reconciliation.acquire_order_lock(nonce)
     except (OSError,ValueError):
@@ -213,9 +206,25 @@ def _submit_locked(data,wallet,client,c,book,tick):
     try:
         if getattr(client,'retry_on_error',None) is not False:
             raise ValueError('SDK retry must be disabled')
-        order=client.create_order(OrderArgsV2(token_id=asset,side=side,price=float(price),size=float(size)),
-              PartialCreateOrderOptions(tick_size=format(tick.normalize(),'f'),neg_risk=book['neg_risk'],version=2))
-        expected_id=reconciliation.order_hash(order,c,client.signer,neg_risk=book['neg_risk'],asset=asset,side=side,price=price,size=size)
+        options=PartialCreateOrderOptions(tick_size=format(tick.normalize(),'f'),neg_risk=book['neg_risk'],version=2)
+        if data['execution_mode']=='market':
+            # SDK rounds the derived amounts. If that rounding crosses the user's
+            # protective bound, sign a one-tick stricter order, then verify again.
+            sign_price=price
+            order=client.create_market_order(MarketOrderArgsV2(token_id=asset,side=side,price=float(sign_price),amount=float(size),order_type=OrderType.FAK),options)
+            if not reconciliation.market_price_safe(order,side,price):
+                sign_price=price-tick if side=='BUY' else price+tick
+                if sign_price<tick or sign_price>1-tick: raise ValueError('cannot preserve protective price')
+                order=client.create_market_order(MarketOrderArgsV2(token_id=asset,side=side,price=float(sign_price),amount=float(size),order_type=OrderType.FAK),options)
+            expected_id=reconciliation.order_hash(order,c,client.signer,neg_risk=book['neg_risk'],asset=asset,side=side,price=price,size=size,market=True)
+            maker,taker=Decimal(order.makerAmount),Decimal(order.takerAmount)
+            shares=(taker if side=='BUY' else maker)/Decimal(1000000)
+            signed_price=(maker/taker if side=='BUY' else taker/maker)
+            with db.get_db() as conn:
+                conn.execute("UPDATE web_order_intents SET signed_size=?,signed_price=? WHERE nonce=? AND state='pending'",(str(shares),str(signed_price),nonce))
+        else:
+            order=client.create_order(OrderArgsV2(token_id=asset,side=side,price=float(price),size=float(size)),options)
+            expected_id=reconciliation.order_hash(order,c,client.signer,neg_risk=book['neg_risk'],asset=asset,side=side,price=price,size=size)
         reconciliation.record_hash(nonce,expected_id,c)
         if trading_account.load()!=c: raise ValueError('account changed')
     except Exception:

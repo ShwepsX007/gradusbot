@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-from py_clob_client_v2.clob_types import OrderArgsV2, CreateOrderOptions
+from py_clob_client_v2.clob_types import OrderArgsV2, MarketOrderArgsV2, CreateOrderOptions
 from py_clob_client_v2.config import get_contract_config
 from py_clob_client_v2.order_builder.builder import OrderBuilder
 from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2
@@ -21,7 +21,7 @@ from web import app as web, trading_account as account, trading_orders as orders
 KEY={'private_key':'0x'+'0'*63+'1','api_key':'api-key','api_secret':'secret','api_passphrase':'pass','signature_type':'0','funder':''}
 ID='0x'+'1'*64
 EVENT={'active':True,'closed':False,'markets':[{'active':True,'closed':False,'acceptingOrders':True,'outcomes':['Yes','No'],'clobTokenIds':['1','2']}]}
-BASE={'slug':'test','nonce':'a'*32,'asset':'1','selection':'yes','side':'SELL','order_type':'FAK','price':'0.25','size':'10','confirm':True}
+BASE={'slug':'test','nonce':'a'*32,'asset':'1','selection':'yes','side':'SELL','order_type':'FAK','execution_mode':'market','price':'0.25','size':'10','confirm':True}
 BOOK={'asset_id':'1','tick_size':'0.01','min_order_size':'1','neg_risk':False}
 
 class OrderHashTests(unittest.TestCase):
@@ -65,7 +65,7 @@ class ReconciliationTests(unittest.TestCase):
         web.db.DB_FILE=os.path.join(self.tmp.name,'db');web.db.init_db();web.init_web_db()
         self.ap=patch.object(account.config,'BASE_DIR',self.tmp.name);self.ap.start();account.save(KEY)
         self.c=account.load();self.wallet=self.c['signer'];orders.set_enabled(True)
-        self.client=Mock();self.client.retry_on_error=False;self.client.get_order_book.return_value=BOOK;self.client.create_order.return_value='signed';self.client.post_order.return_value={'success':True,'orderID':ID}
+        self.client=Mock();self.client.retry_on_error=False;self.client.get_order_book.return_value=BOOK;self.client.create_order.return_value='signed';self.client.create_market_order.return_value=OrderBuilder(Signer(KEY['private_key'],137)).build_market_order(MarketOrderArgsV2(token_id='1',side='SELL',price=.25,amount=10),CreateOrderOptions(tick_size='0.01',neg_risk=False),version=2);self.client.post_order.return_value={'success':True,'orderID':ID}
         self.cp=patch.object(account,'build_client',return_value=self.client);self.cp.start()
         self.hp=patch.object(recon,'order_hash',return_value=ID);self.hp.start()
 
@@ -88,7 +88,9 @@ class ReconciliationTests(unittest.TestCase):
         return {'id':id,'taker_order_id':'0x'+'2'*64,'asset_id':'2','side':'BUY','owner':'other', 'size':'99','status':state,
                 'maker_orders':[{'order_id':ID,'asset_id':'1','side':'SELL','owner':self.c['api_key'], 'maker_address':self.wallet,'matched_amount':amount}]}
     def no_second_order(self):
-        with self.assertRaises(orders.TradeError):orders.submit({**BASE,'nonce':'b'*32},EVENT)
+        # Reconciliation itself never submits. Unknown/pending require separate acknowledgement.
+        if self.row()['state'] in ('pending','unknown'):
+            with self.assertRaises(orders.UnknownOrders):orders.submit({**BASE,'nonce':'b'*32},EVENT)
         self.assertEqual(self.client.post_order.call_count,1)
     def set_trades(self,trades):
         self.client.get_trades.side_effect=lambda params,only_first_page: [trades[params.id]]
@@ -117,7 +119,7 @@ class ReconciliationTests(unittest.TestCase):
             recon.reconcile_wallet(self.c);self.assertEqual(self.evidence()['assessment'],'active');self.no_second_order()
 
     def test_open_cancelled_and_gtc_partial(self):
-        orders.submit({**BASE,'order_type':'GTC'},EVENT)
+        orders.submit({**BASE,'order_type':'GTC','execution_mode':'limit'},EVENT)
         self.client.get_order.return_value=self.raw('MATCHED','3')
         self.set_trades({'trade-1':self.taker('trade-1','2','CONFIRMED'),'trade-2':self.maker('trade-2','1','CONFIRMED')})
         recon.reconcile_wallet(self.c);self.assertEqual(self.evidence()['assessment'],'active');self.no_second_order()
@@ -193,11 +195,11 @@ class ReconciliationTests(unittest.TestCase):
         builder=OrderBuilder(signer)
         def create(args,options):
             self.assertEqual(options.version,2)
-            return builder.build_order(args,CreateOrderOptions(tick_size=options.tick_size,neg_risk=options.neg_risk),version=options.version)
-        self.client.create_order.side_effect=create
+            return builder.build_market_order(args,CreateOrderOptions(tick_size=options.tick_size,neg_risk=options.neg_risk),version=options.version)
+        self.client.create_market_order.side_effect=create
         def post(order,kind):
             stored=self.evidence()
-            self.assertEqual(stored['expected_id'],recon.order_hash(order,self.c,signer,neg_risk=False,asset='1',side='SELL',price=Decimal('.25'),size=Decimal('10')))
+            self.assertEqual(stored['expected_id'],recon.order_hash(order,self.c,signer,neg_risk=False,asset='1',side='SELL',price=Decimal('.25'),size=Decimal('10'),market=True))
             return {'success':True,'orderID':stored['expected_id']}
         self.client.post_order.side_effect=post
         self.assertEqual(orders.submit(BASE,EVENT)['state'],'accepted')

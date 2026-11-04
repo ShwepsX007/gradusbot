@@ -46,7 +46,19 @@ def acquire_order_lock(nonce):
         raise
 
 
-def order_hash(order, credentials, signer, *, neg_risk, asset, side, price, size):
+def market_price_safe(order, side, price):
+    """Check the exact ratio of the signed integer amounts, not SDK floats."""
+    try:
+        if not re.fullmatch(r'[0-9]{1,80}',str(order.makerAmount)) or not re.fullmatch(r'[0-9]{1,80}',str(order.takerAmount)): return False
+        maker, taker = Decimal(order.makerAmount), Decimal(order.takerAmount)
+        if maker <= 0 or taker <= 0: return False
+        # Cross-multiply to avoid rounding of division at extreme prices.
+        return maker <= taker * price if side == 'BUY' else taker >= maker * price if side == 'SELL' else False
+    except Exception:
+        return False
+
+
+def order_hash(order, credentials, signer, *, neg_risk, asset, side, price, size, market=False):
     """Hash the exact signed CTF order locally and validate requested amounts.
 
     Fail closed for unsupported SDK order types. Only the hash, never the signed
@@ -57,15 +69,20 @@ def order_hash(order, credentials, signer, *, neg_risk, asset, side, price, size
     try:
         expected_signer=credentials['funder'] if credentials['signature_type']==3 else credentials['signer']
         wallet=credentials['funder'] or credentials['signer']
-        tokens=Decimal(size)*Decimal(1000000)
-        funds=Decimal(size)*Decimal(price)*Decimal(1000000)
-        maker,taker=(tokens,funds) if side=='SELL' else (funds,tokens)
+        if market:
+            maker=Decimal(size)*Decimal(1000000)
+            amounts_match=Decimal(order.makerAmount)==maker and market_price_safe(order,side,price)
+        else:
+            tokens=Decimal(size)*Decimal(1000000)
+            funds=Decimal(size)*Decimal(price)*Decimal(1000000)
+            maker,taker=(tokens,funds) if side=='SELL' else (funds,tokens)
+            amounts_match=Decimal(order.makerAmount)==maker and Decimal(order.takerAmount)==taker
         if (str(order.tokenId)!=asset or str(order.maker).lower()!=wallet.lower()
             or str(order.signer).lower()!=expected_signer.lower()
             or int(order.signatureType)!=credentials['signature_type']
             or int(order.side)!=(1 if side=='SELL' else 0)
-            or int(order.expiration)!=0 or Decimal(order.makerAmount)!=maker
-            or Decimal(order.takerAmount)!=taker):
+            or int(order.expiration)!=0 or not amounts_match
+            or str(order.metadata).lower()!='0x'+'0'*64 or str(order.builder).lower()!='0x'+'0'*64):
             raise ValueError('signed order parameters do not match')
         cfg=get_contract_config(POLYGON)
         # This route supports only V2 Exchange signatures over CTF token IDs.
@@ -88,7 +105,7 @@ def record_hash(nonce, expected_id, credentials):
 def _amount(v):
     if isinstance(v,bool) or not isinstance(v,(str,int,float)) or len(str(v))>40: raise ValueError('amount')
     n=Decimal(str(v))
-    if not n.is_finite() or n<0 or n>Decimal('1000000'): raise ValueError('amount')
+    if not n.is_finite() or n<0 or n>Decimal('10000000000'): raise ValueError('amount')
     return n
 
 
@@ -107,7 +124,11 @@ def inspect_order(client, row, credentials, order_id):
     if str(raw.get('asset_id',''))!=row['asset'] or str(raw.get('side','')).upper()!=row['side']: raise ValueError('asset/side')
     if not _same(raw.get('maker_address'),row['wallet']) or not _same(raw.get('owner'),credentials['api_key']): raise ValueError('owner')
     orig,matched=_amount(raw.get('original_size')),_amount(raw.get('size_matched'))
-    if orig!=_amount(row['size']) or matched>orig or _amount(raw.get('price'))!=_amount(row['price']): raise ValueError('quantity/price')
+    if row.get('execution_mode')=='market':
+        if not row.get('signed_size') or not row.get('signed_price'): raise ValueError('missing signed amounts')
+        expected_price=_amount(row['signed_price'])
+        if orig!=_amount(row['signed_size']) or abs(_amount(raw.get('price'))-expected_price)>Decimal('0.000001') or matched>orig: raise ValueError('quantity/price')
+    elif orig!=_amount(row['size']) or matched>orig or _amount(raw.get('price'))!=_amount(row['price']): raise ValueError('quantity/price')
     status=str(raw.get('status','')).upper()
     if status not in ('LIVE','DELAYED','UNMATCHED','MATCHED','CANCELED','CANCELLED') or (status=='MATCHED' and matched==0): raise ValueError('status')
     ids=raw.get('associate_trades')
@@ -165,7 +186,7 @@ def reconcile_one(row, credentials, client=None):
         try:
             evidence=inspect_order(client or trading_account.build_client(credentials),row,credentials,expected)
         except Exception:
-            evidence={'assessment':'unverified','reason':'Нет достоверного ответа об ордере и сделках; повторная отправка заблокирована.'}
+            evidence={'assessment':'unverified','reason':'Нет достоверного ответа об ордере и сделках; проверьте Polymarket перед новой заявкой.'}
     with db.get_db() as conn:
         conn.execute('BEGIN IMMEDIATE')
         current=conn.execute('SELECT state,order_id,created FROM web_order_intents WHERE nonce=?',(row['nonce'],)).fetchone()
