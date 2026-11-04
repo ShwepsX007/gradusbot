@@ -389,6 +389,15 @@ def trading_account_snapshot():
         return jsonify(error='Аккаунт временно недоступен.'), 503
 
 
+@app.get('/api/trading/portfolio')
+def trading_portfolio():
+    if not trusted_ssh_tunnel(): return jsonify(error='Портфель доступен только через SSH-туннель.'), 403
+    from web import portfolio, trading_account
+    try: return jsonify(portfolio.snapshot())
+    except trading_account.AccountError as exc: return jsonify(error=str(exc)), 400
+    except Exception: return jsonify(error='Портфель временно недоступен.'), 503
+
+
 @app.post('/api/trading/control')
 def trading_control():
     if not trusted_ssh_tunnel(): return jsonify(error='Торговля доступна только через SSH-туннель.'), 403

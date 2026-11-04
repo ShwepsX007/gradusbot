@@ -15,7 +15,7 @@ function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherContr
 function resumeOverview(){return loadStation(state.weather?.station?.id===state.selected)}
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok)throw Error(data.error||'Ошибка запроса');return data}
-function page(name,refreshOnEnter=true){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='copy')loadCopyObserver();if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
+function page(name,refreshOnEnter=true){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver();if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
 $$('.nav').forEach(x=>x.onclick=()=>page(x.dataset.page));
 function showDialog(id){$(`#${id}`).showModal()}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
@@ -850,3 +850,51 @@ $('#copy-form').onsubmit=async e=>{e.preventDefault();if(copyBusy)return;const f
 };
 setInterval(()=>{if(!document.hidden&&!$('#copy-page').classList.contains('hidden'))loadCopyObserver()},15000);
 $('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+
+// Portfolio is read-only. Never infer a station from a title or market name.
+let portfolioGeneration=0;
+const portfolioColors=['#168a64','#8bc9ad','#d8ae63','#687cb9','#c96b66','#7a948b','#b6a9cf','#88a4bc'];
+function portfolioNum(n,digits=2){return n===null||n===undefined||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('ru-RU',{maximumFractionDigits:digits})}
+function portfolioLine(points){
+  if(!Array.isArray(points)||points.filter(p=>p.value!==null&&p.timestamp!==null).length<2)return '<p>Недостаточно данных PnL.</p>';
+  const valid=points.filter(p=>p.value!==null&&p.timestamp!==null&&Number.isFinite(Number(p.value))&&Number.isFinite(Number(p.timestamp)));
+  if(valid.length<2)return '<p>Недостаточно данных PnL.</p>';
+  let min=Math.min(...valid.map(p=>Number(p.value))),max=Math.max(...valid.map(p=>Number(p.value))),start=Number(valid[0].timestamp),end=Number(valid.at(-1).timestamp),dx=end-start||1,dy=max-min||1;
+  let segments=[],current=[];for(const p of points){if(p.value===null||p.timestamp===null||!Number.isFinite(Number(p.value))||!Number.isFinite(Number(p.timestamp))){if(current.length)segments.push(current);current=[];continue}current.push(`${20+360*(Number(p.timestamp)-start)/dx},${160-135*(Number(p.value)-min)/dy}`)}if(current.length)segments.push(current);
+  return `<svg viewBox="0 0 400 190" role="img" aria-label="График PnL позиций за месяц"><line x1="20" y1="160" x2="380" y2="160" stroke="#cbd8d1"/>${segments.map(a=>`<polyline points="${a.join(' ')}" fill="none" stroke="#168a64" stroke-width="2"/>`).join('')}<text x="20" y="15" class="portfolio-chart-label">${esc(portfolioNum(max))} pUSD</text><text x="20" y="185" class="portfolio-chart-label">${esc(portfolioNum(min))} pUSD</text></svg><small>${esc(new Date(start*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date(end*1000).toLocaleDateString('ru-RU'))}</small>`;
+}
+function portfolioDistribution(positions,partial){
+  if(!Array.isArray(positions))return '<p>Данные недоступны.</p>';
+  let valid=positions.filter(p=>p.value!==null&&Number.isFinite(Number(p.value))&&Number(p.value)>0),sum=valid.reduce((a,p)=>a+Number(p.value),0),missing=positions.some(p=>p.value===null);
+  if(!sum)return '<p>Нет доступных положительных оценок позиций.</p>';
+  let offset=0;const circles=valid.map((p,i)=>{let fraction=Number(p.value)/sum,entry=`<circle cx="100" cy="100" r="70" fill="none" stroke="${portfolioColors[i%portfolioColors.length]}" stroke-width="28" pathLength="100" stroke-dasharray="${fraction*100} ${100-fraction*100}" stroke-dashoffset="${-offset}" transform="rotate(-90 100 100)"/>`;offset+=fraction*100;return entry}).join('');
+  return `<svg viewBox="0 0 200 200" role="img" aria-label="Распределение стоимости имеющихся позиций">${circles}</svg>${valid.map((p,i)=>`<div class="portfolio-key"><span class="portfolio-swatch" style="background:${portfolioColors[i%portfolioColors.length]}"></span>${esc(p.title||p.event_slug||p.asset)} · ${esc(p.outcome)} · ${esc(portfolioNum(p.value))} pUSD</div>`).join('')}${missing||partial?'<p>Некоторые позиции или их оценки отсутствуют; доли относятся только к показанным данным.</p>':''}`;
+}
+async function portfolioOpen(slug){
+  if(!slug||!/^[-a-z0-9]{1,200}$/.test(slug)){toast('Не удалось определить событие. Откройте его на Polymarket или привяжите рынок вручную.');return}
+  try{
+    const all=await Promise.all(state.stations.map(async station=>({station,bindings:await api(`/api/stations/${station.id}/bindings`)})));
+    const matches=all.filter(x=>x.bindings.some(b=>b.market_slug===slug));
+    if(!matches.length){if(confirm('Событие не привязано к станции. Перейти к поиску рынка и предложению привязки? Для непогодного рынка станцию выбирать нельзя.')){page('markets');openMarketFirst(slug,true)}return}
+    let match=matches[0];if(matches.length>1){const choices=matches.map((x,i)=>`${i+1}. ${x.station.name} (${x.station.station_code})`).join('\n');const selected=prompt(`Рынок привязан к нескольким станциям. Выберите номер:\n${choices}`);if(selected===null)return;const index=Number(selected)-1;if(!Number.isInteger(index)||!matches[index])return;match=matches[index]}
+    state.selected=match.station.id;page('weather',false);renderStationTabs();await loadStation();if(!state.bindings.some(b=>b.market_slug===slug)){toast('Привязка изменилась. Обновите портфель.');return}state.market=slug;renderMarketTabs();await loadMarket();
+  }catch(e){toast('Не удалось проверить привязки: '+e.message)}
+}
+async function loadPortfolio(){
+  const seq=++portfolioGeneration;$('#portfolio-refresh').disabled=true;$('#portfolio-status').textContent='Загружаем снимок…';for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-activity'])$('#'+id).textContent='';
+  try{
+    const data=await api('/api/trading/portfolio');if(seq!==portfolioGeneration)return;
+    $('#portfolio-status').textContent=[`Кошелёк ${data.wallet}.`,...(data.errors||[]),data.positions_partial?'Показаны первые 500 позиций.':'',data.activity_partial?'Показаны первые 500 действий.':''].filter(Boolean).join(' ');
+    const total=data.balance!==null&&data.value!==null?Number(data.balance)+Number(data.value):null;
+    $('#portfolio-balances').innerHTML=`<div class="portfolio-values">Баланс CLOB: ${esc(portfolioNum(data.balance))} pUSD · Оценка позиций: ${esc(portfolioNum(data.value))} pUSD · Всего: ${esc(portfolioNum(total))} pUSD</div>`;
+    $('#portfolio-pnl').innerHTML=portfolioLine(data.pnl);$('#portfolio-allocation').innerHTML=portfolioDistribution(data.positions,data.positions_partial);
+    const row=(title,detail,slug)=>`<div class="portfolio-row"><div><b>${esc(title||'Рынок не определён')}</b><small>${esc(detail)}</small></div><button class="button secondary portfolio-open" data-slug="${esc(slug||'')}">Открыть ↗</button></div>`;
+    $('#portfolio-positions').innerHTML=Array.isArray(data.positions)?(data.positions.map(p=>row(p.title||p.event_slug,`${p.outcome||'Исход неизвестен'} · ${portfolioNum(p.size)} долей · оценка ${portfolioNum(p.value)} pUSD · PnL ${portfolioNum(p.pnl)}${p.redeemable?' · доступно погашение':''}`,p.event_slug)).join('')||'<p>Позиций нет.</p>'):'<p>Позиции недоступны.</p>';
+    const slugByAsset=new Map();for(const p of [...(data.positions||[]),...(data.activity||[])])if(p.asset&&p.event_slug){let slugs=slugByAsset.get(p.asset)||new Set();slugs.add(p.event_slug);slugByAsset.set(p.asset,slugs)}
+    $('#portfolio-orders').innerHTML=Array.isArray(data.orders)?(data.orders.map(o=>{let slugs=slugByAsset.get(o.asset_id),slug=slugs?.size===1?[...slugs][0]:'';return row(slug||`Ордер ${o.id}`,`${o.side} · цена ${portfolioNum(o.price,4)} pUSD · сопоставлено ${portfolioNum(o.size_matched)} из ${portfolioNum(o.original_size)} долей · ${o.status}`,slug)}).join('')||'<p>Открытых ордеров на первой странице нет.</p>'):'<p>Ордера недоступны.</p>';
+    $('#portfolio-activity').innerHTML=Array.isArray(data.activity)?(data.activity.map(p=>row(p.title||p.event_slug,`${p.type||'Действие'} ${p.side||''} · ${p.outcome||''} · ${portfolioNum(p.size)} долей · ${portfolioNum(p.value)} pUSD · ${p.timestamp?new Date(p.timestamp*1000).toLocaleString('ru-RU'):'время недоступно'}`,p.event_slug)).join('')||'<p>Активность отсутствует.</p>'):'<p>История недоступна.</p>';
+  }catch(e){if(seq===portfolioGeneration){$('#portfolio-status').textContent=e.message;for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-activity'])$('#'+id).textContent=''}}
+  finally{if(seq===portfolioGeneration)$('#portfolio-refresh').disabled=false}
+}
+$('#portfolio-refresh').onclick=loadPortfolio;
+$('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.portfolio-open');if(b)portfolioOpen(b.dataset.slug)});
