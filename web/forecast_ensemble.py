@@ -172,9 +172,9 @@ def normalize_open_meteo(data):
     return result
 
 
-def ensemble(open_data, met_data, tz):
-    """Average model temperatures at the same instant. Only interpolate across one-hour MET Norway gaps."""
-    open_values={};met_values={}
+def ensemble(open_data, met_data, tz, openweather_data=None):
+    """Average forecasts at the same instant; never interpolate over gaps > 1 hour."""
+    open_values={};met_values={};ow_values={}
     h=(open_data or {}).get('hourly',{}) if isinstance(open_data,dict) else {}
     epochs=h.get('epoch',[]) if isinstance(h,dict) else []
     temps=h.get('temperature_2m',[]) if isinstance(h,dict) else []
@@ -186,11 +186,16 @@ def ensemble(open_data, met_data, tz):
         if not isinstance(pair,list) or len(pair)!=2:continue
         t=_num(pair[0],0,4102444800);v=_num(pair[1],-150,150)
         if t is not None and v is not None:met_values[int(t)]=v
+    for point in (openweather_data or {}).get('points',[]):
+        if not isinstance(point,dict):continue
+        t=_num(point.get('time'),0,4102444800);v=_num(point.get('temp'),-150,150)
+        if t is not None and v is not None:ow_values[int(t)]=v
+    ow_times=sorted(ow_values)
     met_times=sorted(met_values)
     if open_values:
         lo,hi=min(open_values),max(open_values)
-        instants=sorted(set(open_values) | {t for t in met_times if t<lo or t>hi})
-    else:instants=met_times
+        instants=sorted(set(open_values) | {t for t in met_times+ow_times if t<lo or t>hi})
+    else:instants=sorted(set(met_times)|set(ow_times))
     points=[]
     for t in instants:
         src={};interpolated=False
@@ -202,6 +207,14 @@ def ensemble(open_data, met_data, tz):
                 a,b=met_times[idx-1],met_times[idx]
                 if b-a<=3600:
                     src['MET Norway']=met_values[a]+(met_values[b]-met_values[a])*(t-a)/(b-a)
+                    interpolated=True
+        if t in ow_values:src['OpenWeather']=ow_values[t]
+        else:
+            idx=bisect.bisect_left(ow_times,t)
+            if 0<idx<len(ow_times):
+                a,b=ow_times[idx-1],ow_times[idx]
+                if b-a<=3600:
+                    src['OpenWeather']=ow_values[a]+(ow_values[b]-ow_values[a])*(t-a)/(b-a)
                     interpolated=True
         if src:points.append({'time':t,'temp':sum(src.values())/len(src),'sources':src,'interpolated':interpolated})
     return {'timezone':tz,'points':points}

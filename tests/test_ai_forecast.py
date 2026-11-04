@@ -10,7 +10,7 @@ from unittest.mock import patch
 import requests
 from werkzeug.security import generate_password_hash
 from web import app as web
-from web import ai_forecast as ai
+from web import ai_forecast as ai, openweather as ow
 
 K1='AIza'+'a'*30
 K2='AIza'+'b'*30
@@ -47,6 +47,16 @@ class GeminiTests(unittest.TestCase):
     def add(self,p,k):return ai.config_update({'action':'add_key','project':p,'key':k})
     def enable_switch(self,enable=True):
         return ai.config_update({'action':'save','model':ai.DEFAULT_MODEL,'prompt':ai.DEFAULT_PROMPT,'switch_authorized':enable})
+    def test_openweather_values_reach_gemini_without_credentials(self):
+        secret='openweather0123456789abcdef';ow.save_key(secret);self.add('project-alpha',K1)
+        t=self.now+3600
+        self.weather['forecast_openweather']={'points':[{'time':t,'temp':19,'humidity':60,'pop':.2,'appid':secret}]}
+        self.weather['forecast_ensemble']['points'][0]['sources']['OpenWeather']=19
+        self.weather['forecast_status']['openweather']='ok'
+        with patch.object(ai.requests,'post',return_value=answer()) as post:result=ai.generate(self.sid,self.weather)
+        sent=json.dumps(post.call_args.kwargs['json']);self.assertNotIn(secret,sent)
+        self.assertIn('hourly_openweather',sent);self.assertIn('OpenWeather',sent)
+        self.assertEqual(result['input_summary']['sources']['OpenWeather'],1);self.assertNotIn(secret,json.dumps(result))
     def test_storage_permissions_and_no_key_in_public_or_results(self):
         public=self.add('project-alpha',K1)
         self.assertNotIn(K1,json.dumps(public));self.assertEqual(public['keys'][0]['project'],'project-alpha')

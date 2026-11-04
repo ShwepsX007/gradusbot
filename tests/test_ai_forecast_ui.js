@@ -4,7 +4,7 @@ const vc=new VirtualConsole();vc.on('jsdomError',e=>{throw e});
 const dom=new JSDOM(fs.readFileSync('web/static/index.html','utf8'),{url:'http://127.0.0.1:8108',runScripts:'outside-only',pretendToBeVisual:true,virtualConsole:vc});
 const w=dom.window;w.confirm=()=>true;w.prompt=()=> 'terminal-password';let requests=[],releaseGenerate,releaseOld,oldPending=false;
 const stations=[{id:1,name:'London',station_code:'EGLL',station_type:'metar',enabled:1},{id:2,name:'Paris',station_code:'LFPG',station_type:'metar',enabled:1}];
-const now=Date.now()/1000, forecast={station_id:1,text:'<img id="unsafe">\nОтвет',model:'gemini-3.5-flash-lite',project:'project-alpha',created_at:now,total_count:42,truncated:0,input_summary:{metar_points:2,archive_status:'partial',archive_truncated:true,sources:{'Open-Meteo':1,'MET Norway':0},timezone:'Europe/London'}};
+const now=Date.now()/1000, forecast={station_id:1,text:'<img id="unsafe">\nОтвет',model:'gemini-3.5-flash-lite',project:'project-alpha',created_at:now,total_count:42,truncated:0,input_summary:{metar_points:2,archive_status:'partial',archive_truncated:true,sources:{'Open-Meteo':1,'MET Norway':0,'OpenWeather':2},timezone:'Europe/London'}};
 let cfg={model:'gemini-3.5-flash-lite',prompt:'Промпт',switch_authorized:false,keys:[]};
 w.fetch=async(url,o={})=>{requests.push([url,o]);let data;
  if(url==='/api/session')data={csrf:'test'};
@@ -15,6 +15,7 @@ w.fetch=async(url,o={})=>{requests.push([url,o]);let data;
  else if(url==='/api/stations')data=stations;
  else if(/^\/api\/stations\/\d+\/weather\?view=1$/.test(url)){const id=Number(url.split('/')[3]);data={station:stations[id-1],metar:{temp:13},metar_history:[],metar_archive:{status:'ok',reports:[]},forecast_status:{reason:'no_coordinates'},forecast_ensemble:null,forecast:null,history:[]}}
  else if(url.endsWith('/bindings'))data=[];
+ else if(url==='/api/openweather/config'){data={configured:o.method!=='DELETE'};}
  else if(url==='/api/ai/config'){
   if(o.method==='POST'){
    const body=JSON.parse(o.body);
@@ -51,6 +52,7 @@ const tick=()=>new Promise(r=>setTimeout(r,30));
  assert.equal(w.document.querySelector('#ai-forecast-output').textContent,forecast.text);
  assert(!w.document.querySelector('#unsafe'),'AI output must be text');
  assert(w.document.querySelector('#ai-forecast-status').textContent.includes('неполные данные'));
+ assert(w.document.querySelector('#ai-forecast-status').textContent.includes('OpenWeather: 2'));
  assert(!button.disabled);
  w.document.querySelector('.station-tab[data-id="2"]').click();await tick();assert(w.document.querySelector('#ai-forecast-output').textContent.includes('ещё не'));
  w.document.querySelector('[data-page="settings"]').click();await tick();await tick();
@@ -61,6 +63,12 @@ const tick=()=>new Promise(r=>setTimeout(r,30));
  const keyForm=w.document.querySelector('#ai-key-form');keyForm.elements.project.value='project-alpha';keyForm.elements.key.value='AIza'+'x'.repeat(30);keyForm.elements.current_password.value='terminal-password';keyForm.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
  assert.equal(keyForm.elements.key.value,'');assert(w.document.querySelector('#ai-key-list').textContent.includes('project-alpha'));assert(!w.document.querySelector('#ai-key-list').textContent.includes('AIza'));
  w.document.querySelector('.ai-key-delete').click();await tick();assert(w.document.querySelector('#ai-key-list').textContent.includes('не добавлены'));
- w.setAiAccess(false);assert(button.disabled);assert(w.document.querySelector('#ai-config-status').textContent.includes('SSH'));
+ const ow=w.document.querySelector('#openweather-form');assert(!ow.querySelector('button').disabled);
+ ow.elements.key.value='TESTKEY';ow.elements.current_password.value='terminal-password';ow.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
+ assert.equal(ow.elements.key.value,'');assert.equal(ow.elements.current_password.value,'');assert(!w.document.querySelector('#openweather-config-status').textContent.includes('TESTKEY'));
+ ow.elements.current_password.value='terminal-password';w.document.querySelector('#openweather-delete').click();await tick();assert(requests.some(([u,o])=>u==='/api/openweather/config'&&o.method==='DELETE'));assert.equal(ow.elements.current_password.value,'');
+ w.renderOpenWeatherHourly({forecast_openweather:{points:[{time:Date.now()/1000+3600,temp:17}]}});assert(!w.document.querySelector('#openweather-hourly').hidden);assert(w.document.querySelector('#openweather-hourly-list').textContent.includes('17°C'));
+ w.renderOpenWeatherHourly({});assert(w.document.querySelector('#openweather-hourly').hidden);
+ w.setAiAccess(false);assert(ow.querySelector('button').disabled);assert(button.disabled);assert(w.document.querySelector('#ai-config-status').textContent.includes('SSH'));
  console.log('Gemini UI manual requests, race, secrets and escaping: OK');w.close();
 })().catch(e=>{console.error(e);w.close();process.exitCode=1});
