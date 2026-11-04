@@ -896,5 +896,28 @@ async function loadPortfolio(){
   }catch(e){if(seq===portfolioGeneration){$('#portfolio-status').textContent=e.message;for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity'])$('#'+id).textContent=''}}
   finally{if(seq===portfolioGeneration)$('#portfolio-refresh').disabled=false}
 }
+// Switching sections never reloads the account or changes the selected market.
+const portfolioTabs=$$('.portfolio-tab');
+function selectPortfolioTab(tab,focus=false){
+  if(!portfolioTabs.includes(tab))return;
+  for(const item of portfolioTabs){
+    const selected=item===tab;
+    item.setAttribute('aria-selected',String(selected));item.tabIndex=selected?0:-1;
+    const panel=document.getElementById(item.getAttribute('aria-controls'));if(panel)panel.hidden=!selected;
+  }
+  if(focus)tab.focus();
+}
+for(const tab of portfolioTabs){
+  tab.addEventListener('click',()=>selectPortfolioTab(tab));
+  tab.addEventListener('keydown',event=>{
+    const index=portfolioTabs.indexOf(tab);let next;
+    if(event.key==='ArrowRight')next=(index+1)%portfolioTabs.length;
+    else if(event.key==='ArrowLeft')next=(index-1+portfolioTabs.length)%portfolioTabs.length;
+    else if(event.key==='Home')next=0;
+    else if(event.key==='End')next=portfolioTabs.length-1;
+    else return;
+    event.preventDefault();selectPortfolioTab(portfolioTabs[next],true);
+  });
+}
 $('#portfolio-refresh').onclick=loadPortfolio;
 $('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.portfolio-open');if(b)portfolioOpen(b.dataset.slug)});
