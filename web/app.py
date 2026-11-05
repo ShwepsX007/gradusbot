@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, ai_forecast, openweather
+from web import metar_archive, forecast_ensemble, ai_forecast
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -95,7 +95,6 @@ def init_web_db():
         conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
     metar_archive.init_db()
     forecast_ensemble.init_db()
-    openweather.init_db()
     ai_forecast.init_db()
 
 
@@ -740,44 +739,18 @@ def weather(sid, active_view=False):
         save_solar_days(sid, opened, view_active=active_view)
         result['solar_days'] = get_solar_days(sid)
         metno=forecast_ensemble.get_metno(*coords)
-        # Only the active web view (or explicit Gemini request) triggers this
-        # source. Merely enabling a station for the bot does not.
-        owm=openweather.get_forecast(*coords) if active_view else {'status':'view_inactive','data':None}
-        result['forecast_openweather']=owm.get('data')
-        tz_candidates=[opened.get('timezone') if isinstance(opened,dict) else None]+[s.get('timezone') for s in result['solar_days']]+[(owm.get('data') or {}).get('timezone')]
+        tz_candidates=[opened.get('timezone') if isinstance(opened,dict) else None]+[s.get('timezone') for s in result['solar_days']]
         tz=next((name for name in tz_candidates if forecast_ensemble.valid_timezone(name)),None)
-        result['forecast_ensemble']=forecast_ensemble.ensemble(opened,metno.get('data'),tz,owm.get('data'))
+        result['forecast_ensemble']=forecast_ensemble.ensemble(opened,metno.get('data'),tz)
         has_open=any('Open-Meteo' in p['sources'] for p in result['forecast_ensemble']['points'])
         result['forecast_status']={'reason': 'ok' if tz else 'no_timezone', 'coordinate_source':coord_source,
             'open_meteo': 'ok' if has_open else 'unavailable',
             'met_norway':metno.get('status'), 'met_norway_updated_at':(metno.get('data') or {}).get('updated_at'),
-            'met_norway_fetched_at':metno.get('fetched_at'), 'openweather':owm.get('status'),
-            'openweather_fetched_at':owm.get('fetched_at'), 'openweather_next_attempt':owm.get('next_attempt')}
+            'met_norway_fetched_at':metno.get('fetched_at')}
     else:
         result['forecast_status']={'reason':'no_coordinates'}
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
-
-
-@app.route('/api/openweather/config', methods=['GET','POST','DELETE'])
-def openweather_config():
-    if not trusted_ssh_tunnel():return jsonify(error='Настройки OpenWeather доступны только через SSH-туннель.'),403
-    if request.method=='GET':
-        try:return jsonify(openweather.public_config())
-        except Exception:return jsonify(error='Не удалось прочитать настройки OpenWeather.'),503
-    name='openweather-config:'+(request.remote_addr or 'unknown')
-    if not login_allowed(name):return jsonify(error='Слишком много попыток. Повторите через 15 минут.'),429
-    data=request.get_json(silent=True)
-    if not isinstance(data,dict) or not isinstance(data.get('current_password'),str):return jsonify(error='Введите текущий пароль терминала.'),400
-    try:valid=len(data['current_password'])<=256 and check_password_hash(current_password_hash(),data['current_password'])
-    except (ValueError,TypeError):valid=False
-    if not valid:return jsonify(error='Неверный пароль терминала.'),400
-    with _login_lock:_login_attempts.pop(name,None)
-    try:
-        if request.method=='DELETE':openweather.delete_key();return jsonify(configured=False)
-        return jsonify(openweather.save_key(data.get('key')))
-    except openweather.OpenWeatherError as exc:return jsonify(error=str(exc)),400
-    except Exception:return jsonify(error='Не удалось безопасно изменить настройки OpenWeather.'),503
 
 
 @app.route('/api/ai/config', methods=['GET','POST'])
