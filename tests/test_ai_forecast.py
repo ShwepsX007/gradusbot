@@ -157,9 +157,9 @@ class GeminiTests(unittest.TestCase):
         with client.session_transaction() as sess:sess.update(auth_user='testuser',auth_version=web.auth_version(),csrf='csrf')
         client.environ_base['HTTP_X_CSRF_TOKEN']='csrf'
         metar={'temp':12.5,'obs_time':self.now-60,'raw_metar':'EGLL 101200Z'}
-        with patch.object(web,'trusted_ssh_tunnel',return_value=True),patch.object(web.metar_archive,'refresh'),patch.object(web.metar_archive,'get',return_value={'status':'error','reports':[]}),patch.object(web,'station_info',return_value={'lat':51.47,'lon':-.45}),patch.object(web.utils,'fetch_metar',return_value=metar),patch.object(web,'forecast',return_value=None),patch.object(web.forecast_ensemble,'get_metno',return_value={'status':'error','data':None}),patch.object(ai.requests,'post',return_value=answer()) as post:
+        with patch.object(web,'trusted_ssh_tunnel',return_value=True),patch.object(web.metar_archive,'refresh'),patch.object(web.metar_archive,'get',return_value={'status':'error','reports':[]}),patch.object(web,'station_info',return_value={'lat':51.47,'lon':-.45}),patch.object(web.utils,'fetch_metar',return_value=metar),patch.object(web,'forecast',return_value=None),patch.object(web.forecast_ensemble,'get_metno',return_value={'status':'error','data':None}),patch.object(web.forecast_history,'capture',side_effect=RuntimeError('DB locked')) as capture,patch.object(ai.requests,'post',return_value=answer()) as post:
             result=client.post(f'/api/stations/{self.sid}/ai-forecast',json={'confirm':True})
-        self.assertEqual(result.status_code,200,result.get_data(as_text=True))
+        self.assertEqual(result.status_code,200,result.get_data(as_text=True));capture.assert_called_once()
         self.assertEqual(result.get_json()['forecast']['text'],'Температура 20°C')
         sent=json.dumps(post.call_args.kwargs['json'],ensure_ascii=False)
         self.assertIn('EGLL 101200Z',sent);self.assertNotIn(K1,sent)

@@ -61,6 +61,13 @@ const tick=()=>new Promise(r=>setTimeout(r,30));
  const keyForm=w.document.querySelector('#ai-key-form');keyForm.elements.project.value='project-alpha';keyForm.elements.key.value='AIza'+'x'.repeat(30);keyForm.elements.current_password.value='terminal-password';keyForm.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();
  assert.equal(keyForm.elements.key.value,'');assert(w.document.querySelector('#ai-key-list').textContent.includes('project-alpha'));assert(!w.document.querySelector('#ai-key-list').textContent.includes('AIza'));
  w.document.querySelector('.ai-key-delete').click();await tick();assert(w.document.querySelector('#ai-key-list').textContent.includes('не добавлены'));
+ // The hourly strip is visibly separate from METAR; comparison uses both requested lead times.
+ const n=Date.now()/1000;w.renderHourlyStrip({forecast_ensemble:{points:[{time:n-3600,temp:4,sources:{'Open-Meteo':4}},{time:n+3600,temp:12,sources:{'Open-Meteo':10,'MET Norway':14}},{time:n+7200,temp:13,sources:{'MET Norway':13}}]}},n*1000);
+ const items=w.document.querySelectorAll('.hourly-strip-item');assert.equal(items.length,2);assert(items[0].textContent.includes('12°C'));assert(items[0].textContent.includes('OM: 10°C'));assert(items[1].textContent.includes('OM: —'));
+ w.renderForecastComparison({forecast_comparison:{obs_time:n-60,actual_temp:15,latest:{difference:2,forecast_temp:13,captured_at:n-120,sources:{'Open-Meteo':13},interpolated:true},three_hours:{difference:-1,forecast_temp:16,captured_at:n-12000,sources:{'MET Norway':16}}}});
+ const comp=w.document.querySelector('#forecast-comparison').textContent;assert(comp.includes('+2°C'));assert(comp.includes('-1°C'));assert(comp.includes('интерполяция'));assert(comp.includes('3 часа'));
+ assert.equal(w.deltaText(2,'F'),'+3.6°F');assert.equal(w.deltaText(-1,'F'),'-1.8°F');assert.equal(w.deltaText(1,'B'),'+1°C / +1.8°F');
+ w.renderForecastComparison({forecast_comparison:{obs_time:n-60,actual_temp:15,latest:null,three_hours:null}});assert(w.document.querySelector('#forecast-comparison').textContent.includes('Нет сохранённого подходящего прогноза'));
  w.setAiAccess(false);assert(button.disabled);assert(w.document.querySelector('#ai-config-status').textContent.includes('SSH'));
  console.log('Gemini UI manual requests, race, secrets and escaping: OK');w.close();
 })().catch(e=>{console.error(e);w.close();process.exitCode=1});

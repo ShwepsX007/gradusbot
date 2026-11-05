@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, ai_forecast
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -95,6 +95,7 @@ def init_web_db():
         conn.execute('INSERT OR IGNORE INTO web_monitor_control(id,interval_seconds) VALUES(1,30)')
     metar_archive.init_db()
     forecast_ensemble.init_db()
+    forecast_history.init_db()
     ai_forecast.init_db()
 
 
@@ -607,6 +608,7 @@ def remove_station(sid):
         conn.execute('DELETE FROM web_metar_history WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM web_station_solar WHERE station_id=?', (sid,))
         conn.execute('DELETE FROM web_ai_forecasts WHERE station_id=?', (sid,))
+        conn.execute('DELETE FROM web_forecast_snapshots WHERE station_id=?', (sid,))
         prefix = f'st_{sid}_'
         conn.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
         old_code=conn.execute('SELECT UPPER(station_code) AS code FROM stations WHERE id=?',(sid,)).fetchone()['code']
@@ -733,8 +735,11 @@ def weather(sid, active_view=False):
         info=archive.get('location');coord_source='metar_archive'
     result['info'] = info
     coords=forecast_ensemble.coordinates(info.get('lat'),info.get('lon')) if isinstance(info,dict) else None
+    history_error=False
     if coords:
         opened=forecast(*coords)
+        open_cache=_cache.get(('forecast',*coords))
+        open_requested_at=open_cache[0] if open_cache and opened is not None else None
         result['forecast']=opened
         save_solar_days(sid, opened, view_active=active_view)
         result['solar_days'] = get_solar_days(sid)
@@ -742,13 +747,19 @@ def weather(sid, active_view=False):
         tz_candidates=[opened.get('timezone') if isinstance(opened,dict) else None]+[s.get('timezone') for s in result['solar_days']]
         tz=next((name for name in tz_candidates if forecast_ensemble.valid_timezone(name)),None)
         result['forecast_ensemble']=forecast_ensemble.ensemble(opened,metno.get('data'),tz)
+        if active_view:
+            try:forecast_history.capture(sid,opened,metno.get('data'))
+            except Exception:app.logger.warning('Could not save forecast snapshot');history_error=True
         has_open=any('Open-Meteo' in p['sources'] for p in result['forecast_ensemble']['points'])
         result['forecast_status']={'reason': 'ok' if tz else 'no_timezone', 'coordinate_source':coord_source,
-            'open_meteo': 'ok' if has_open else 'unavailable',
+            'open_meteo': 'ok' if has_open else 'unavailable', 'open_meteo_requested_at':open_requested_at,
             'met_norway':metno.get('status'), 'met_norway_updated_at':(metno.get('data') or {}).get('updated_at'),
             'met_norway_fetched_at':metno.get('fetched_at')}
     else:
         result['forecast_status']={'reason':'no_coordinates'}
+    try:result['forecast_comparison']=forecast_history.compare(sid,metar)
+    except Exception:app.logger.warning('Could not compare forecast snapshot');result['forecast_comparison']=None;history_error=True
+    result['forecast_history_status']='error' if history_error else 'ok'
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
 
