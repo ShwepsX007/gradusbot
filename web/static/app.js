@@ -242,7 +242,7 @@ function updateClock(){
   const marker=$('#sun-marker');$('#arc-observations').innerHTML='';
   $('#arc-full').setAttribute('d',path||'');$('#arc-progress').setAttribute('d',path||'');
   if(!path||!local){
-    marker.classList.add('hidden');$('#arc-passed-rect').setAttribute('width',0);
+    marker.classList.add('hidden');$('#arc-passed-rect').setAttribute('width',0);$('#arc-observations').ownerSVGElement.setAttribute('viewBox','0 0 800 220');
     $('.sun-heading h4').textContent='Нет данных о восходе и закате';
     $('#arc-note').textContent='Нет данных о восходе и закате для выбранной даты: точки на дуге недоступны.';return;
   }
@@ -256,17 +256,35 @@ function updateClock(){
     const dayPhase=seconds>=sunrise&&seconds<sunset;$('#sun-dot').style.fill=dayPhase?'#e8d79c':'#c1d4e6';
   }
   $('.sun-heading h4').textContent=current?'Ночь · день · ночь':'История станции';
-  const observations=observationsForDay(w.history||[],tz,day,now);let lastLabelX=-Infinity;
-  $('#arc-observations').innerHTML=observations.map(item=>{
-    const p=curvePoint(item.seconds,sunrise,sunset);if(!p)return '';
-    const direction=item.trend==='up'?'↑':item.trend==='down'?'↓':'',trendNote=item.trend==='up'?' · выше предыдущего наблюдения':item.trend==='down'?' · ниже предыдущего наблюдения':'';
-    let label='';if(p.x-lastLabelX>=80&&(!pt||Math.abs(p.x-pt.x)>20)&&marks.every(m=>Math.abs(p.x-m.point.x)>45)){lastLabelX=p.x;label=`<text class="arc-temp-label" x="${p.x}" y="${p.y-(direction?19:11)}" text-anchor="middle">${esc(tempText(item.temp))}</text>`}
-    const arrowY=pt&&Math.abs(p.x-pt.x)<15?Math.min(p.y-5,pt.y-16):p.y-5;
+  const observations=observationsForDay(w.history||[],tz,day,now);
+  const points=observations.map(item=>{
+    const p=curvePoint(item.seconds,sunrise,sunset);if(!p)return null;
+    const direction=item.trend==='up'?'↑':item.trend==='down'?'↓':'';
+    return {item,p,direction};
+  }).filter(Boolean);
+  // Keep labels above their arrows and out of the way of markers and each other.
+  const obstacles=points.map(({p})=>({left:p.x-3,right:p.x+3,top:p.y-3,bottom:p.y+3}));
+  if(pt)obstacles.push({left:pt.x-16,right:pt.x+16,top:pt.y-16,bottom:pt.y+16});
+  for(const mark of marks){
+    const {x,y}=mark.point,labelX=Math.max(70,Math.min(730,x)),labelY=mark.kind==='min'?Math.min(213,y+29):Math.max(14,y-29);
+    obstacles.push({left:x-7,right:x+7,top:y-7,bottom:y+7},{left:labelX-23,right:labelX+23,top:labelY-13,bottom:labelY+4});
+  }
+  const arrows=WeatherView.layoutArcArrows(points.filter(p=>p.direction).map(({p})=>({x:p.x,pointY:p.y})),obstacles);
+  let arrowIndex=0;for(const point of points)if(point.direction)point.arrowY=arrows[arrowIndex++].y;
+  const labels=WeatherView.layoutArcTemperatures(points.filter(p=>p.direction).map(({item,p,arrowY})=>({x:p.x,arrowY,celsius:prettyNumber(item.temp)+'°C',fahrenheit:prettyNumber(item.temp*9/5+32)+'°F'})),[...obstacles,...arrows.map(a=>a.box)]);
+  // Expand upward, rather than clipping densely packed labels at the top.
+  const minY=labels.length?Math.min(0,Math.floor(Math.min(...labels.map(l=>l.box.top))-5)):0;
+  $('#arc-observations').ownerSVGElement.setAttribute('viewBox',`0 ${minY} 800 ${220-minY}`);
+  const lines=labels.map(l=>l.arrowY-l.box.bottom>12?`<line class="arc-temp-leader" x1="${l.x}" y1="${l.box.bottom+1}" x2="${l.x}" y2="${l.arrowY-11}"/>`:'').join('')+arrows.map(a=>a.pointY-a.y>7?`<line class="arc-temp-leader" x1="${a.x}" y1="${a.y+1}" x2="${a.x}" y2="${a.pointY-3}"/>`:'').join('');
+  const symbols=points.map(({item,p,direction,arrowY})=>{
+    const trendNote=item.trend==='up'?' · выше предыдущего наблюдения':item.trend==='down'?' · ниже предыдущего наблюдения':'';
     const arrow=direction?`<text class="arc-trend ${item.trend}" x="${p.x}" y="${arrowY}" text-anchor="middle" aria-hidden="true">${direction}</text>`:'';
-    return `<g class="arc-observation"><title>${esc(item.time)} · ${esc(tempText(item.temp)+trendNote)}</title><circle cx="${p.x}" cy="${p.y}" r="2.4"/>${arrow}${label}</g>`;
+    return `<g class="arc-observation"><title>${esc(item.time)} · ${esc(tempText(item.temp)+trendNote)}</title><circle cx="${p.x}" cy="${p.y}" r="2.4"/>${arrow}</g>`;
   }).join('');
+  const temperatures=labels.map(l=>`<text class="arc-temp-label" x="${l.x}" y="${l.box.bottom-12}" text-anchor="middle"><tspan x="${l.x}">${esc(l.celsius)}</tspan><tspan x="${l.x}" dy="10">${esc(l.fahrenheit)}</tspan></text>`).join('');
+  $('#arc-observations').innerHTML=lines+symbols+temperatures;
   const modelNote=extrema?`Цветные точки — ${current?'средний прогноз по доступным источникам':'данные модели за дату'} по доступным часам (${extrema.count})`:'Почасовые данные модели недоступны';
-  $('#arc-note').textContent=`Сохранено наблюдений: ${observations.length}. Стрелки показывают изменение относительно предыдущего сохранённого наблюдения, в том числе за прошлый день. ${modelNote}${current?'; на светиле — последний METAR':''}. Не гарантия результата рынка.`;
+  $('#arc-note').textContent=`Сохранено наблюдений: ${observations.length}. Стрелки показывают изменение относительно предыдущего сохранённого наблюдения, в том числе за прошлый день. Над каждой стрелкой — °C и °F. На узком экране дугу можно прокрутить по горизонтали. ${modelNote}${current?'; на светиле — последний METAR':''}. Не гарантия результата рынка.`;
 }
 
 $('#arc-prev').onclick=()=>{if(state.arcOffset>-6){state.arcOffset--;updateClock()}};

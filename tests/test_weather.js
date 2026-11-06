@@ -150,3 +150,24 @@ console.log('Seven-day chart and DST-aware ensemble extrema: OK');
 
 const repeatedEnd={timezone:'America/New_York',hourly:{time:['2026-11-01T01:00','2026-11-01T01:00','2026-11-01T02:00'],epoch:[Date.parse('2026-11-01T05:00:00Z')/1000,Date.parse('2026-11-01T06:00:00Z')/1000,Date.parse('2026-11-01T07:00:00Z')/1000],precipitation_probability:[10,70,30]}};
 assert.equal(precipitationForecast(repeatedEnd,Date.parse('2026-11-01T05:30:00Z')).probability,70);
+
+// Every change gets a readable, separately placed two-line label, including
+// repeated wall times (DST) and labels next to the sun/model markers.
+const {layoutArcTemperatures,layoutArcArrows}=require('../web/static/weather.js');
+const crowded=[{x:400,arrowY:50,celsius:'-5°C',fahrenheit:'23°F'},{x:400,arrowY:50,celsius:'-4°C',fahrenheit:'24.8°F'},{x:410,arrowY:52,celsius:'10°C',fahrenheit:'50°F'}];
+const reserved=[{left:390,right:410,top:30,bottom:60}];
+const layout=layoutArcTemperatures(crowded,reserved);
+assert.equal(layout.length,crowded.length);
+function overlap(a,b){return a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top}
+for(let i=0;i<layout.length;i++){
+ assert.equal(layout[i].x,crowded[i].x);assert(layout[i].box.bottom<layout[i].arrowY);
+ assert(!reserved.some(r=>overlap(r,layout[i].box)));
+ for(let j=0;j<i;j++)assert(!overlap(layout[j].box,layout[i].box));
+}
+assert(layout.some(l=>l.box.top<0));
+const arrows=layoutArcArrows([{x:400,pointY:80},{x:400,pointY:80},{x:405,pointY:80}],[{left:395,right:405,top:50,bottom:70}]);
+assert.equal(arrows.length,3);
+for(let i=0;i<arrows.length;i++){assert(arrows[i].y<arrows[i].pointY);for(let j=0;j<i;j++)assert(!overlap(arrows[i].box,arrows[j].box))}
+assert(arrows.every(a=>!overlap(a.box,{left:395,right:405,top:50,bottom:70})));
+assert.deepEqual(observationsForDay([[now/1000,1e200],[now/1000,''],[now/1000,true],['',1]],'UTC','2026-06-01',now),[]);
+console.log('Arc temperature labels preserve every change and avoid collisions: OK');

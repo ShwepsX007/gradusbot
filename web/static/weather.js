@@ -138,9 +138,9 @@
     catch { return []; }
     const points = [];
     for (const item of history) {
-      if (!Array.isArray(item) || item[1] == null || item[0] == null) continue;
+      if (!Array.isArray(item) || item[1] == null || item[0] == null || item[1] === '' || item[0] === '' || typeof item[1] === 'boolean' || typeof item[0] === 'boolean') continue;
       const ms=Number(item[0])*1000, temp=Number(item[1]);
-      if (!Number.isFinite(ms) || !Number.isFinite(temp) || ms > now) continue;
+      if (!Number.isFinite(ms) || !Number.isFinite(temp) || temp < -150 || temp > 150 || ms > now) continue;
       const local=localClock(ms,tz,formatter);
       if (local) points.push({ms,temp,seconds:local.seconds,time:local.time,day:local.day});
     }
@@ -151,6 +151,41 @@
       p.trend=!prev || prev.ms===p.ms || p.temp===prev.temp ? null : p.temp>prev.temp?'up':'down';
     }
     return points.filter(p=>p.day===day).sort((a,b)=>a.seconds-b.seconds || a.ms-b.ms);
+  }
+  // Very close observations (and repeated wall times) can otherwise draw
+  // their arrows on top of each other. Keep each arrow aligned to its time,
+  // moving it upward around other arrows and markers if needed.
+  function layoutArcArrows(entries, obstacles=[]) {
+    const occupied=obstacles.slice(), arrows=[];
+    for(const item of entries){
+      let y=item.pointY-5,box={left:item.x-6,right:item.x+6,top:y-12,bottom:y+1};
+      while(true){
+        const collisions=occupied.filter(o=>box.left<o.right && box.right>o.left && box.top<o.bottom && box.bottom>o.top);
+        if(!collisions.length)break;
+        y=Math.min(...collisions.map(o=>o.top))-3;
+        box={...box,top:y-12,bottom:y+1};
+      }
+      occupied.push(box);arrows.push({...item,y,box});
+    }
+    return arrows;
+  }
+  // Place every change label above its arrow, moving it up only when it would
+  // cover another label or a marker. Coordinates are in the arc's SVG units.
+  function layoutArcTemperatures(entries, obstacles=[]) {
+    const occupied=obstacles.slice(), labels=[];
+    for (const item of entries) {
+      const width=Math.max(item.celsius.length,item.fahrenheit.length)*6.5+4;
+      let bottom=item.arrowY-5;
+      let box={left:item.x-width/2,right:item.x+width/2,top:bottom-21,bottom};
+      while(true){
+        const collisions=occupied.filter(o=>box.left<o.right && box.right>o.left && box.top<o.bottom && box.bottom>o.top);
+        if(!collisions.length)break;
+        bottom=Math.min(...collisions.map(o=>o.top))-2;
+        box={...box,top:bottom-21,bottom};
+      }
+      occupied.push(box);labels.push({...item,box});
+    }
+    return labels;
   }
   // Last 24, 48, or 168 elapsed hours, with no extrapolation beyond actual reports.
   function metarChart(history, unit='C', now=Date.now(), hours=24) {
@@ -208,7 +243,7 @@
     return (Array.isArray(events)?events:[]).map(event=>({event,time:scanTimeInfo(event,deviceTz,now)}))
       .sort((a,b)=>a.time.rank-b.time.rank||a.time.seconds-b.time.seconds||(a.event.date||'').localeCompare(b.event.date||'')||String(a.event.title).localeCompare(String(b.event.title)));
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, ensembleExtremaForDay, metarIcon, observationsForDay, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, ensembleExtremaForDay, metarIcon, observationsForDay, layoutArcArrows, layoutArcTemperatures, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
