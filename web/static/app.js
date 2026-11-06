@@ -635,8 +635,8 @@ async function scanTemperatureMarkets(){
   catch(e){$('#scan-status').textContent='Не удалось получить список: '+e.message}
   finally{scanBusy=false;button.disabled=false}
 }
-async function addScannedMarket(slug,button){
-  const item=scanData?.events?.find(e=>e.slug===slug);if(!item||scanAdding.has(slug))return;
+async function addScannedMarket(slug,button,override=null){
+  const item=override||scanData?.events?.find(e=>e.slug===slug);if(!item||scanAdding.has(slug))return;
   scanAdding.add(slug);button.disabled=true;button.textContent='Проверка…';
   try{
     // Re-read rules at click time; server validates source again before creating a binding.
@@ -656,6 +656,42 @@ async function addScannedMarket(slug,button){
     await renderAllMarkets();
   }catch(e){toast(e.message)}finally{scanAdding.delete(slug);button.disabled=false;renderTemperatureScan()}
 }
+let opportunityRows=[],opportunitySession=null,opportunityNext=null,opportunityBusy=false,opportunityChecked=0,opportunityUnavailable=0,opportunityStale=0,opportunityMeta=null,opportunityGeneration=0;
+function opportunityStationTime(stamp,tz){
+  if(!Number.isFinite(Number(stamp)))return 'время неизвестно';
+  try{return new Intl.DateTimeFormat('ru-RU',{timeZone:tz||'UTC',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',timeZoneName:'shortOffset',hourCycle:'h23'}).format(new Date(Number(stamp)*1000))}
+  catch{return new Date(Number(stamp)*1000).toISOString().replace('T',' ').slice(0,16)+' UTC'}
+}
+function renderOpportunities(){
+  const now=Date.now()/1000;
+  $('#opportunity-results').innerHTML=opportunityRows.length?opportunityRows.map((r,i)=>{
+    const event=r.event||{},reference=r.reference||{},age=now-Number(r.book_at),stale=!Number.isFinite(age)||age>=120;
+    const quote=(name,level)=>`${name}: ${level?esc(priceCents(level.price))+' · '+esc(shares(level.size))+' долей':'нет'}`;
+    const ref=reference.kind==='observed'?`METAR ${reference.extreme==='min'?'минимум':'максимум'} ${esc(tempText(reference.temp))} · ${esc(reference.count)} сводок · последняя ${esc(opportunityStationTime(reference.last_observation,event.timezone))} · архив ${esc(reference.archive_status)} (может быть неполным)`: `лидер ${esc(r.leader?.label)} · YES ${esc(priceCents(r.leader?.yes_price))} (Gamma)`;
+    const gammaTime=Number(event.quotes_at)>0?new Date(event.quotes_at*1000).toLocaleString('ru-RU'):'неизвестно';
+    return `<article class="opportunity-card"><h4>${esc(event.title)}</h4><div>${esc(event.station_code||'станция не определена')} · дата ${esc(event.date||'неизвестна')} · ${esc(event.timezone||'пояс неизвестен')}</div><div><strong>${esc(r.label)} · ${esc(String(r.side).toUpperCase())}</strong> · разрыв ${esc(shares(r.gap))}°${esc(r.gap_units)} · ${ref}${reference.kind==='observed'?` · лидер ${esc(r.leader?.label)} · YES ${esc(priceCents(r.leader?.yes_price))} (Gamma)`:''}</div><div><strong>${quote('BID',r.bid)} &nbsp; | &nbsp; ${quote('ASK',r.ask)}</strong>${r.ask_entry?'':' <span class="opp-risk">· подходящего ASK для покупки нет</span>'}</div><small class="${stale?'opp-stale':''}">CLOB: ${esc(new Date(r.book_at*1000).toLocaleString('ru-RU'))}${stale?' · снимок устарел, запустите новый поиск':''} · Gamma: ${esc(gammaTime)}${now-Number(event.quotes_at)>=120?' · снимок лидера устарел':''} (время устройства). Цены и доступный объём могут измениться.</small><div class="opp-actions"><button type="button" class="button secondary opportunity-add" data-index="${i}">Добавить рынок</button><a href="https://polymarket.com/event/${encodeURIComponent(event.slug||'')}" target="_blank" rel="noopener noreferrer">Проверить рынок и правила ↗</a></div></article>`;
+  }).join(''):'<div class="empty-state">В проверенной порции совпадений нет.</div>';
+  $$('.opportunity-add').forEach(b=>b.onclick=()=>{const row=opportunityRows[Number(b.dataset.index)];if(row)addScannedMarket(row.event.slug,b,row.event)});
+}
+async function searchOpportunities(next=false){
+  if(opportunityBusy)return;opportunityBusy=true;const generation=opportunityGeneration,form=$('#opportunity-form'),submit=form.querySelector('button[type=submit]'),more=$('#opportunity-more');submit.disabled=true;more.disabled=true;
+  if(!next){opportunityRows=[];opportunitySession=null;opportunityNext=null;opportunityChecked=0;opportunityUnavailable=0;opportunityStale=0;$('#opportunity-results').innerHTML='';}
+  $('#opportunity-status').textContent='Проверяем каталог и стаканы CLOB. Это может занять некоторое время…';
+  try{
+    const params=next?new URLSearchParams({session:opportunitySession,offset:String(opportunityNext)}):new URLSearchParams(new FormData(form));
+    const data=await api('/api/temperature-opportunities?'+params.toString());if(generation!==opportunityGeneration)return;opportunityMeta=data;opportunitySession=data.session;opportunityNext=data.next_offset;
+    opportunityChecked+=data.checked;opportunityUnavailable+=data.unavailable;opportunityStale+=data.stale_leader||0;opportunityRows.push(...data.rows);
+    renderOpportunities();
+    const skipped=data.skipped||{};
+    $('#opportunity-status').textContent=`Проверено позиций: ${opportunityChecked} из ${data.total_candidates} · совпадений: ${opportunityRows.length} · стакан недоступен: ${opportunityUnavailable}.`+(opportunityStale?` Исключено из-за устаревшей цены лидера: ${opportunityStale}; запустите новый поиск.`:'')+(data.catalog_incomplete?' Каталог неполный.':'')+(data.candidate_limit?' Достигнут предел кандидатов; уточните поиск.':'')+(skipped.no_observation?` Без подходящих сохранённых METAR: ${skipped.no_observation} событий.`:'')+(skipped.no_leader?` Без однозначного подходящего лидера: ${skipped.no_leader} событий.`:'')+(skipped.unparsed?` Нераспознанных диапазонов: ${skipped.unparsed}.`:'')+(skipped.no_tokens?` Без подтверждённых токенов YES/NO: ${skipped.no_tokens}.`:'')+(skipped.truncated_events?` Часть событий исключена: неполные данные исходов (${skipped.truncated_events}).`:'')+(data.next_offset!==null?' Проверьте следующую порцию.':'');
+    more.classList.toggle('hidden',data.next_offset===null);
+  }catch(e){if(generation===opportunityGeneration){$('#opportunity-status').textContent='Поиск не завершён: '+e.message;more.classList.add('hidden')}}
+  finally{opportunityBusy=false;submit.disabled=false;more.disabled=false}
+}
+$('#opportunity-form').addEventListener('submit',e=>{e.preventDefault();searchOpportunities()});
+$('#opportunity-form').addEventListener('input',()=>{opportunityGeneration++;opportunitySession=null;opportunityNext=null;opportunityRows=[];$('#opportunity-results').innerHTML='';$('#opportunity-more').classList.add('hidden');$('#opportunity-status').textContent='Фильтр изменён: нажмите «Найти зазоры» заново.'});
+$('#opportunity-more').onclick=()=>{if(opportunitySession&&opportunityNext!==null)searchOpportunities(true)};
+setInterval(()=>{if(opportunityRows.length&&!document.hidden&&!$('#markets-page').classList.contains('hidden'))renderOpportunities()},30000);
 $('#scan-temperature').onclick=scanTemperatureMarkets;
 $('#scan-filter').addEventListener('input',renderTemperatureScan);
 setInterval(()=>{if(scanData&&!document.hidden&& !$('#markets-page').classList.contains('hidden'))renderTemperatureScan()},60000);

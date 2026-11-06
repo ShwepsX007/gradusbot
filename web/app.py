@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -1053,19 +1053,88 @@ def build_temperature_scan():
             'unknown_timezones':sum(1 for e in events if not e['timezone'])}
 
 
-@app.get('/api/temperature-scan')
-def temperature_scan():
+def temperature_scan_data():
     global _scan_cache
     with _scan_lock:
         if _scan_cache and time.time() - _scan_cache[0] < 120:
-            return jsonify(_scan_cache[1])
-        try:
-            data = build_temperature_scan()
-        except Exception:
-            app.logger.warning('Temperature scan failed', exc_info=True)
-            return jsonify(error='Polymarket временно недоступен. Повторите сканирование позже.'), 502
-        _scan_cache = (time.time(), data)
-    return jsonify(data)
+            now=time.time()
+            quotes=[e.get('quotes_at') for e in _scan_cache[1].get('events',[]) if isinstance(e.get('quotes_at'),(int,float))]
+            if not quotes or all(0<=now-t<120 for t in quotes):return _scan_cache[1]
+        data=build_temperature_scan()
+        _scan_cache=(time.time(),data)
+        return data
+
+
+@app.get('/api/temperature-scan')
+def temperature_scan():
+    try:
+        data=temperature_scan_data()
+        # Internal candidate metadata can be large and is not needed by the catalog UI.
+        return jsonify({**data,'events':[{k:v for k,v in event.items() if k not in ('opportunity_markets','opportunity_truncated')} for event in data['events']]})
+    except Exception:
+        app.logger.warning('Temperature scan failed', exc_info=True)
+        return jsonify(error='Polymarket временно недоступен. Повторите сканирование позже.'),502
+
+
+_opp_lock=threading.Lock()
+_opp_busy=threading.BoundedSemaphore(1)
+_opp_sessions=OrderedDict()
+OPP_MAX_CANDIDATES=5000
+OPP_SESSION_TTL=300
+
+
+@app.get('/api/temperature-opportunities')
+def temperature_opportunities():
+    session_id=request.args.get('session')
+    if session_id:
+        with _opp_lock:
+            item=_opp_sessions.get(session_id)
+            if not item or time.time()-item['created']>OPP_SESSION_TTL:
+                return jsonify(error='Время поиска истекло. Запустите поиск заново.'),409
+        try:offset=int(request.args.get('offset',''))
+        except ValueError:return jsonify(error='Некорректная страница поиска.'),400
+        if offset<0 or offset>=len(item['candidates']) or offset%opportunity_scan.PAGE_TOKENS:
+            return jsonify(error='Некорректная страница поиска.'),400
+    else:
+        def num(name,default,lo,hi):
+            return opportunity_scan.number(request.args.get(name,default),lo,hi)
+        settings={'price':num('price','97',0,100),'leader_min':num('leader_min','97',0,100),
+                  'gap':num('gap','1',0,100),'gap_units':request.args.get('gap_units','C'),
+                  'side':request.args.get('side','no'),'quote':request.args.get('quote','ask'),
+                  'reference':request.args.get('reference','leader'),'query':request.args.get('query','').strip()}
+        if any(settings[k] is None for k in ('price','leader_min','gap')) or settings['gap_units'] not in ('C','F') or settings['side'] not in ('yes','no','both') or settings['quote'] not in ('ask','bid','either','both') or settings['reference'] not in ('leader','observed') or len(settings['query'])>100:
+            return jsonify(error='Проверьте цены, разрыв и настройки фильтра.'),400
+        offset=0;item=None
+    if not _opp_busy.acquire(blocking=False):return jsonify(error='Поиск уже выполняется. Попробуйте позже.'),429
+    try:
+        if item is None:
+            try:data=temperature_scan_data()
+            except Exception:return jsonify(error='Каталог Polymarket временно недоступен.'),502
+            candidates,skipped=opportunity_scan.prepare(data['events'],settings)
+            limited=len(candidates)>OPP_MAX_CANDIDATES
+            candidates=candidates[:OPP_MAX_CANDIDATES]
+            item={'candidates':candidates,'settings':settings,'created':time.time(),'scanned_at':data.get('scanned_at'),
+                  'incomplete':data.get('incomplete',False),'limited':limited,'skipped':skipped}
+            session_id=secrets.token_urlsafe(18)
+            with _opp_lock:
+                for key in list(_opp_sessions):
+                    if time.time()-_opp_sessions[key]['created']>OPP_SESSION_TTL:del _opp_sessions[key]
+                _opp_sessions[session_id]=item
+                while len(_opp_sessions)>10:_opp_sessions.popitem(last=False)
+        selected=item['candidates'][offset:offset+opportunity_scan.PAGE_TOKENS]
+        now=time.time()
+        fresh=[candidate for candidate in selected if isinstance(candidate['event'].get('quotes_at'),(int,float)) and 0<=now-candidate['event']['quotes_at']<120]
+        stale_leader=len(selected)-len(fresh)
+        books=opportunity_scan.books_for([candidate['token'] for candidate in fresh])
+        after_books=time.time()
+        still_fresh=[candidate for candidate in fresh if 0<=after_books-candidate['event']['quotes_at']<120]
+        stale_leader+=len(fresh)-len(still_fresh)
+        rows,unavailable=opportunity_scan.matched_rows(still_fresh,books,item['settings'])
+        next_offset=offset+len(selected)
+        return jsonify(rows=rows,session=session_id,next_offset=next_offset if next_offset<len(item['candidates']) else None,
+            checked=len(selected),total_candidates=len(item['candidates']),unavailable=unavailable,stale_leader=stale_leader,skipped=item['skipped'],
+            catalog_incomplete=item['incomplete'],candidate_limit=item['limited'],scanned_at=item['scanned_at'],settings=item['settings'])
+    finally:_opp_busy.release()
 
 
 @app.get('/api/markets')

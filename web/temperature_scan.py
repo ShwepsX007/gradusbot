@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from web.market_station import identify_station, resolution_fields, URL_RE
+from web.opportunity_scan import scan_markets
 
 MONTHS = {name: n for n, name in enumerate(('january','february','march','april','may','june',
                                             'july','august','september','october','november','december'), 1)}
@@ -106,10 +107,12 @@ def event_summary(event):
     active = [m for m in markets if isinstance(m, dict) and m.get('closed') is not True and m.get('active') is not False]
     suspended = bool(active) and all(m.get('acceptingOrders') is False for m in active)
     top_quotes, max_odds_quote = yes_price_summary(active)
+    opportunity_markets, opportunity_truncated = scan_markets(event)
     return {'slug':slug, 'title':title, 'date':observation_date(slug), 'station':resolution,
             'timezone':timezone, 'timezone_basis':basis, 'orders_suspended':suspended,
             'station_code':candidate['code'] if candidate else None,
-            'top_yes_prices':top_quotes, 'max_odds_yes':max_odds_quote}
+            'top_yes_prices':top_quotes, 'max_odds_yes':max_odds_quote,
+            'opportunity_markets':opportunity_markets, 'opportunity_truncated':opportunity_truncated}
 
 
 def valid_zone(value):
