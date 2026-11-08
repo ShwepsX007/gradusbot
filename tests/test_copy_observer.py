@@ -155,4 +155,91 @@ class CopyObserverTests(unittest.TestCase):
                 self.assertEqual(c.post('/api/copy-observer',base_url=base,json=data,headers={'X-CSRF-Token':'token'}).status_code,201)
         finally:web.app.config.clear();web.app.config.update(config)
 
+    def test_notification_counter_is_transactional_and_survives_deletion(self):
+        leader=self.add();start=leader['started_at'];initial=observer.notification()
+        self.assertEqual(initial['seq'],0)
+        event=observer._trade(trade(start+1),W)
+        with patch.object(observer,'fetch_trades',return_value=[event]),patch.object(observer.orderbook,'fetch_batch',return_value={}):
+            observer.poll_leader(leader,start+3);observer.poll_leader(leader,start+4)
+        self.assertEqual(observer.notification()['seq'],1)
+        self.assertEqual(observer.status()['notification'],observer.notification())
+        self.assertTrue(observer.status()['signals'][0]['event_key'].endswith(':1'))
+        observer.delete_leader(leader['id']);self.assertEqual(observer.notification()['seq'],1)
+        observer.init_db();self.assertEqual(observer.notification(),{'epoch':initial['epoch'],'seq':1})
+        with self.assertRaises(RuntimeError):
+            with observer.db.get_db() as conn:
+                conn.execute("INSERT INTO web_copy_signals VALUES (99,'foo',1,1,'{}')")
+                raise RuntimeError()
+        self.assertEqual(observer.notification()['seq'],1)
+
+    def test_more_trade_fields_and_saved_book(self):
+        stamp=int(time.time())-1
+        key,a=observer._trade(trade(stamp,event_slug='safe-event',slug='market',outcome_index=1,name='A',pseudonym='B'),W)
+        key2,b=observer._trade(trade(stamp,event_slug='different'),W)
+        self.assertEqual(key,key2)  # metadata must not change deduplication
+        self.assertEqual((a['event_slug'],a['market_slug'],a['outcome_index'],a['trader_name'],a['pseudonym']),('safe-event','market',1,'A','B'))
+        self.assertIsNone(observer._trade(trade(stamp,outcome_index=999),W)[1]['outcome_index'])
+        book={'bids':[{'price':'0.3','size':'2'}],'asks':[{'price':'0.4','size':'4'}],'fetched_at':stamp}
+        result=observer.evaluate(a,{'mode':'same','cap':'5'},book)
+        self.assertEqual(result['book_levels']['bids'],book['bids'])
+        self.assertIsNone(observer.evaluate(a,{'mode':'same','cap':'5'},None)['book_levels'])
+
+    def test_history_filters_token_and_limits_pages(self):
+        stamp=int(time.time())-100
+        other=trade(stamp-1,token_id='456')
+        malformed=trade(stamp-2,side='INVALID')
+        pages=[envelope([trade(stamp),other,malformed],True,'next1'),envelope([trade(stamp-3,'SELL')],True,'next2'),envelope([trade(stamp-4)],True,'next3')]
+        with patch.object(observer,'_get',side_effect=pages) as get:
+            h=observer._history(W,C,'123')
+        self.assertEqual([x['side'] for x in h['trades']],['BUY','SELL','BUY'])
+        self.assertTrue(h['partial']);self.assertEqual(h['skipped'],1)
+        self.assertEqual(get.call_count,3);self.assertEqual(get.call_args_list[1].args[1]['cursor'],'next1')
+        self.assertTrue(all(call.args[1]['condition']==C and call.args[1]['taker_only']=='false' for call in get.call_args_list))
+        with patch.object(observer,'_get',return_value=envelope([],True,None)):
+            self.assertTrue(observer._history(W,C,'123')['partial'])
+
+    def test_detail_independent_sources_and_metadata_safety(self):
+        leader=self.add();start=leader['started_at'];event=observer._trade(trade(start+1),W)
+        with patch.object(observer,'fetch_trades',return_value=[event]),patch.object(observer.orderbook,'fetch_batch',return_value={}):observer.poll_leader(leader,start+2)
+        key=observer.status()['signals'][0]['event_key']
+        position={'proxy_wallet':W,'condition_id':C,'token_id':'123','status':'OPEN','current_size':5,'avg_price':0.4,'total_pnl':None,'realized_pnl':'NaN'}
+        def get(url,params):
+            if url.endswith('/tokens'):return {'data':[{'token_id':'123','condition_id':C,'event_slug':'real-event'}]}
+            if url.endswith('/positions'):
+                if params['status']=='CLOSED':raise ValueError('upstream secret')
+                return envelope([position,dict(position,token_id='456')],True,'other')
+            if url.endswith('/trades'):return envelope([trade(int(time.time())-1,'SELL')])
+            raise AssertionError(url)
+        from web import trading_orders
+        with patch.object(observer,'_get',side_effect=get),patch.object(observer.trading_account,'load',side_effect=AssertionError('keys forbidden')),patch.object(trading_orders,'place',side_effect=AssertionError('trade forbidden'),create=True):
+            d=observer.signal_detail(leader['id'],key)
+        self.assertEqual(d['metadata']['event_slug'],'real-event')
+        self.assertEqual(d['history']['trades'][0]['side'],'SELL')
+        self.assertTrue(d['positions']['OPEN']['partial'])
+        self.assertEqual(len(d['positions']['OPEN']['rows']),1)
+        self.assertIsNone(d['positions']['OPEN']['rows'][0]['realized_pnl'])
+        self.assertNotIn('secret',d['positions']['CLOSED']['error'])
+        with patch.object(observer,'_get',return_value={'data':[{'token_id':'123','condition_id':'bad'}]}):
+            self.assertEqual(observer.metadata(['123']),{})
+        for tokens in [[],['1']*51,['123,456'],[None]]:
+            with self.assertRaises(observer.ObserverError):observer.metadata(tokens)
+        with self.assertRaises(observer.ObserverError):observer.signal_detail(leader['id'],'../../bad')
+        observer.delete_leader(leader['id'])
+        with self.assertRaises(observer.ObserverError):observer.signal_detail(leader['id'],key)
+
+    def test_new_endpoints_require_auth_and_tunnel(self):
+        config=dict(web.app.config)
+        try:
+            web.app.config.update(WEB_AUTH_CONFIGURED=True,WEB_USERNAME='test',WEB_PASSWORD_HASH=generate_password_hash('password long enough'),SECRET_KEY='a'*48,SESSION_COOKIE_SECURE=False,WEB_TUNNEL_ONLY=True,WEB_TRUST_PROXY=False,TESTING=True)
+            c=web.app.test_client();base='http://127.0.0.1:8108'
+            c.environ_base.update({'SERVER_NAME':'127.0.0.1','SERVER_PORT':'8108','REMOTE_ADDR':'127.0.0.1','gunicorn.socket':object()})
+            urls=['/api/copy-observer/notification','/api/copy-observer/metadata?tokens=123','/api/copy-observer/1/signal/'+('a'*64)+':1']
+            for url in urls:self.assertEqual(c.get(url,base_url=base).status_code,401)
+            with c.session_transaction(base_url=base) as sess:sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='token'
+            for url in urls:self.assertEqual(c.get(url,base_url=base,environ_overrides={'SERVER_NAME':'0.0.0.0'}).status_code,403)
+            self.assertEqual(c.get(urls[0],base_url=base).status_code,200)
+            with patch.object(observer,'_get',return_value={'data':[]}):self.assertEqual(c.get(urls[1],base_url=base).status_code,200)
+            self.assertEqual(c.get(urls[2],base_url=base).status_code,400)
+        finally:web.app.config.clear();web.app.config.update(config)
+
 if __name__=='__main__':unittest.main()

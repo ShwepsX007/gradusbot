@@ -9,10 +9,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import stat
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, unquote
 
@@ -52,6 +54,14 @@ def init_db():
             observed_at REAL NOT NULL, payload TEXT NOT NULL,
             PRIMARY KEY(leader_id,event_key))''')
         conn.execute('CREATE INDEX IF NOT EXISTS web_copy_signals_recent ON web_copy_signals(observed_at DESC)')
+        # Persistent, monotonic counter: survives signal pruning and leader deletion.
+        # The epoch distinguishes a new database from a previously seen one.
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_copy_notifications (
+            id INTEGER PRIMARY KEY CHECK(id=1), epoch TEXT NOT NULL, seq INTEGER NOT NULL)''')
+        conn.execute('INSERT OR IGNORE INTO web_copy_notifications VALUES(1,?,0)',(secrets.token_hex(16),))
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS web_copy_signal_notification
+            AFTER INSERT ON web_copy_signals BEGIN
+            UPDATE web_copy_notifications SET seq=seq+1 WHERE id=1; END''')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_copy_service (
             id INTEGER PRIMARY KEY CHECK(id=1), checked_at REAL NOT NULL)''')
 
@@ -169,18 +179,140 @@ def delete_leader(leader_id):
 
 def status():
     with db.get_db() as conn:
+        conn.execute('BEGIN')  # the notification watermark and displayed signals share a snapshot
         leaders=[dict(r) for r in conn.execute('SELECT * FROM web_copy_leaders ORDER BY id')]
         rows=conn.execute('''SELECT s.*,l.wallet,l.label FROM web_copy_signals s
             JOIN web_copy_leaders l ON l.id=s.leader_id ORDER BY s.observed_at DESC,s.rowid DESC LIMIT 100''').fetchall()
         heartbeat=conn.execute('SELECT checked_at FROM web_copy_service WHERE id=1').fetchone()
+        notification=dict(conn.execute('SELECT epoch,seq FROM web_copy_notifications WHERE id=1').fetchone())
     signals=[]
     for row in rows:
         try: payload=json.loads(row['payload'])
         except (ValueError,TypeError): continue
-        if isinstance(payload,dict): signals.append({**payload,'leader_id':row['leader_id'],'wallet':row['wallet'],'label':row['label'],'observed_at':row['observed_at']})
+        if isinstance(payload,dict): signals.append({**payload,'leader_id':row['leader_id'],'wallet':row['wallet'],'label':row['label'],'observed_at':row['observed_at'],'event_key':row['event_key']})
     stamp=heartbeat['checked_at'] if heartbeat else None
     service='running' if stamp and -10<=time.time()-stamp<=90 else 'stale' if stamp else 'not_running'
-    return {'service':service,'service_checked_at':stamp,'leaders':leaders,'signals':signals}
+    return {'service':service,'service_checked_at':stamp,'leaders':leaders,'signals':signals,'notification':notification}
+
+
+
+# Only fixed Polymarket endpoints are called, never URLs supplied by the client.
+_detail_slots = threading.BoundedSemaphore(2)
+_METADATA_FIELDS = ('token_id','condition_id','event_slug','market_slug','title','outcome')
+_POSITION_NUMBERS = ('current_size','avg_price','entry_cost_usdc','entry_fees_usdc',
+    'current_price','current_value','total_size','realized_pnl','unrealized_pnl',
+    'total_pnl','percent_pnl','percent_realized_pnl','first_entry_at','last_event_at')
+
+
+def notification():
+    with db.get_db() as conn:
+        return dict(conn.execute('SELECT epoch,seq FROM web_copy_notifications WHERE id=1').fetchone())
+
+
+def _metadata(tokens):
+    data=_get('https://data-api.polymarket.com/v2/tokens',{'token_id':','.join(tokens)})
+    if not isinstance(data,dict) or not isinstance(data.get('data'),list):
+        raise ObserverError('Ответ справочника исходов недоступен.')
+    result={}
+    for row in data['data'][:50]:
+        if not isinstance(row,dict): continue
+        token=str(row.get('token_id') or '')
+        condition=str(row.get('condition_id') or '').lower()
+        if token not in tokens or not HASH.fullmatch(condition): continue
+        result[token]={k:str(row.get(k) or '')[:200] for k in _METADATA_FIELDS}
+        # Never truncate a URL slug into a different, apparently valid event.
+        for field in ('event_slug','market_slug'):
+            value=row.get(field)
+            result[token][field]=value if isinstance(value,str) and len(value)<=200 else ''
+        result[token]['condition_id']=condition
+    return result
+
+
+def metadata(tokens):
+    if not isinstance(tokens,list) or not tokens or len(tokens)>50 or any(not isinstance(t,str) or not TOKEN.fullmatch(t) for t in tokens):
+        raise ObserverError('Неверный список исходов.')
+    if not _detail_slots.acquire(blocking=False): raise ObserverError('Слишком много запросов, повторите позже.')
+    try: return _metadata(list(dict.fromkeys(tokens)))
+    except ObserverError: raise
+    except Exception: raise ObserverError('Справочник исходов Polymarket временно недоступен.') from None
+    finally: _detail_slots.release()
+
+
+def _history(wallet, condition, token):
+    # Bounded market-wide walk; a busy opposite outcome can exhaust the limit.
+    params={'user':wallet,'condition':condition,'limit':100,'taker_only':'false'}
+    items=[]; cursors=set(); skipped=0; partial=False; last=None
+    for page in range(3):
+        data=_get(DATA_URL,dict(params))
+        if not isinstance(data,dict) or not isinstance(data.get('data'),list) or not isinstance(data.get('pagination'),dict):
+            raise ObserverError('История сделок недоступна.')
+        pagination=data['pagination'];more=pagination.get('has_more')
+        if type(more) is not bool: raise ObserverError('Неизвестна полнота истории.')
+        if len(data['data'])>100: partial=True
+        for row in data['data'][:100]:
+            try: _,event=_trade(row,wallet)
+            except ObserverError: skipped+=1;continue
+            if last is not None and event['timestamp']>last: partial=True
+            last=event['timestamp']
+            if event['condition_id']==condition and event['token_id']==token: items.append(event)
+        if not more: break
+        cursor=pagination.get('next_cursor')
+        if not isinstance(cursor,str) or not cursor or cursor in cursors:
+            partial=True;break
+        cursors.add(cursor);params['cursor']=cursor
+        if page==2: partial=True
+    return {'trades':items,'partial':partial or skipped>0,'skipped':skipped,'fetched_at':time.time()}
+
+
+def _positions(wallet,condition,token):
+    snapshots={}
+    for status in ('OPEN','CLOSED'):
+        try:
+            data=_get('https://data-api.polymarket.com/v2/positions',{'user':wallet,'condition':condition,'status':status,'limit':100})
+            if not isinstance(data,dict) or not isinstance(data.get('data'),list) or not isinstance(data.get('pagination'),dict) or type(data['pagination'].get('has_more')) is not bool:
+                raise ValueError('invalid response')
+            rows=[]
+            for row in data['data'][:100]:
+                if not isinstance(row,dict) or str(row.get('proxy_wallet','')).lower()!=wallet or str(row.get('condition_id','')).lower()!=condition or str(row.get('token_id',''))!=token: continue
+                result={}
+                for field in _POSITION_NUMBERS:
+                    value=row.get(field)
+                    try:
+                        number=Decimal(str(value))
+                        result[field]=str(number) if not isinstance(value,bool) and number.is_finite() and abs(number)<=Decimal('1e18') else None
+                    except (InvalidOperation,TypeError,ValueError): result[field]=None
+                result['status']=str(row.get('status') or '')[:30]
+                rows.append(result)
+            snapshots[status]={'rows':rows,'partial':data['pagination']['has_more'] or len(data['data'])>100,'fetched_at':time.time()}
+        except Exception: snapshots[status]={'error':'Снимок позиции Polymarket недоступен.'}
+    return snapshots
+
+
+def signal_detail(leader_id, event_key):
+    if not re.fullmatch(r'[0-9a-f]{64}:[1-9][0-9]{0,5}',event_key):
+        raise ObserverError('Сделка не найдена.')
+    with db.get_db() as conn:
+        row=conn.execute('''SELECT s.payload,l.wallet FROM web_copy_signals s
+            JOIN web_copy_leaders l ON l.id=s.leader_id WHERE s.leader_id=? AND s.event_key=?''',
+            (leader_id,event_key)).fetchone()
+    if not row: raise ObserverError('Сделка не найдена или была удалена.')
+    try:
+        event=json.loads(row['payload']);wallet=row['wallet'];token=event['token_id'];condition=event['condition_id']
+        if not ADDRESS.fullmatch(wallet) or not TOKEN.fullmatch(token) or not HASH.fullmatch(condition): raise ValueError()
+    except (ValueError,TypeError,KeyError): raise ObserverError('Данные сохранённой сделки повреждены.') from None
+    if not _detail_slots.acquire(blocking=False): raise ObserverError('Слишком много запросов, повторите позже.')
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            history=pool.submit(_history,wallet,condition,token)
+            positions=pool.submit(_positions,wallet,condition,token)
+            reference=pool.submit(_metadata,[token])
+            try: h=history.result()
+            except Exception: h={'error':'История сделок Polymarket временно недоступна.'}
+            try: m=reference.result().get(token)
+            except Exception: m=None
+            if m and m['condition_id']!=condition: m=None
+            return {'history':h,'positions':positions.result(),'metadata':m}
+    finally: _detail_slots.release()
 
 
 def _trade(row, wallet):
@@ -198,7 +330,12 @@ def _trade(row, wallet):
     except ObserverError: raise ObserverError('Некорректный размер или цена сделки в публичной ленте.') from None
     canonical={'timestamp':stamp,'condition_id':condition.lower(),'token_id':token,'transaction_hash':tx.lower(),'side':side,'size':str(size.normalize()),'price':str(price.normalize())}
     key=hashlib.sha256(json.dumps(canonical,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-    return key,{**canonical,'title':str(row.get('title') or '')[:200],'outcome':str(row.get('outcome') or '')[:100], 'event_slug':str(row.get('event_slug') or '')[:160]}
+    index=row.get('outcome_index')
+    return key,{**canonical,'title':str(row.get('title') or '')[:200],
+        'outcome':str(row.get('outcome') or '')[:100], 'event_slug':str(row.get('event_slug') or '')[:300],
+        'market_slug':str(row.get('slug') or '')[:300],
+        'outcome_index':index if type(index) is int and 0<=index<999 else None,
+        'trader_name':str(row.get('name') or '')[:100], 'pseudonym':str(row.get('pseudonym') or '')[:100]}
 
 
 def fetch_trades(wallet, since):
@@ -238,7 +375,8 @@ def evaluate(event, leader, book):
     result={'desired_shares':str(desired.quantize(Decimal('0.000001'))) if desired is not None else None,
             'desired_value':str((desired*price).quantize(Decimal('0.000001'))) if desired is not None else None,
             'capped':capped,'book_available':book is not None,'available_shares':None,'best_price':None,
-            'book_at':book.get('fetched_at') if book else None}
+            'book_at':book.get('fetched_at') if book else None,
+            'book_levels':{'bids':book['bids'],'asks':book['asks']} if book is not None else None}
     if book is not None:
         levels=book['asks'] if event['side']=='BUY' else book['bids']
         result['best_price']=levels[0]['price'] if levels else None

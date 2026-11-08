@@ -373,6 +373,27 @@ def copy_observer_traders():
     return jsonify(wallet=wallet),201
 
 
+@app.get('/api/copy-observer/notification')
+def copy_observer_notification():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    return jsonify(copy_observer.notification())
+
+
+@app.get('/api/copy-observer/metadata')
+def copy_observer_metadata():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    try: return jsonify(copy_observer.metadata(request.args.get('tokens','').split(',')))
+    except copy_observer.ObserverError as exc: return jsonify(error=str(exc)),400
+
+
+@app.get('/api/copy-observer/<int:leader_id>/signal/<event_key>')
+def copy_observer_signal(leader_id,event_key):
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    try: return jsonify(copy_observer.signal_detail(leader_id,event_key))
+    except copy_observer.ObserverError as exc: return jsonify(error=str(exc)),400
+    except Exception: return jsonify(error='Не удалось получить детали сделки.'),503
+
+
 @app.route('/api/copy-observer/<int:leader_id>', methods=['PATCH','DELETE'])
 def copy_observer_trader(leader_id):
     if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403

@@ -15,8 +15,8 @@ function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherContr
 function resumeOverview(){return loadStation(state.weather?.station?.id===state.selected)}
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok){const e=Error(data.error||'Ошибка запроса');e.code=data.code;e.nonces=data.nonces;throw e}return data}
-function page(name,refreshOnEnter=true){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver();if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
-$$('.nav').forEach(x=>x.onclick=()=>page(x.dataset.page));
+function page(name,refreshOnEnter=true,ackCopy=false){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver(ackCopy);if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
+$$('.nav').forEach(x=>x.onclick=()=>{if(x.dataset.page==='copy'){copyClickVersion++;ackCopyNotice();page(x.dataset.page,true,true)}else page(x.dataset.page)});
 function showDialog(id){$(`#${id}`).showModal()}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 $('#add-station-top').onclick=$('#demo-add').onclick=$('.add-station').onclick=()=>showDialog('station-dialog');
@@ -841,7 +841,7 @@ $('#ai-key-form').onsubmit=async e=>{e.preventDefault();if(!aiTunnel)return;cons
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
 async function loadSecurityInfo(){
   const form=$('#password-form'),button=form.querySelector('button'),accountButton=$('#account-form button[type=submit]'),deleteButton=$('#account-delete'),controlButton=$('#trade-control-form button');button.disabled=true;accountButton.disabled=true;deleteButton.disabled=true;controlButton.disabled=true;
-  try{let s;try{s=await api('/api/security-info')}catch(e){setAiAccess(false);throw e}setAiAccess(s.tunnel);if(s.tunnel)loadAiConfig();button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;$('#monitor-interval-form button').disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
+  try{let s;try{s=await api('/api/security-info')}catch(e){setAiAccess(false);setCopyNoticeAccess(false);throw e}setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel)loadAiConfig();button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;$('#monitor-interval-form button').disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
     if(s.tunnel){try{const interval=await api('/api/trading/monitor-interval');$('#monitor-interval-form [name=interval_seconds]').value=interval.interval_seconds;$('#monitor-interval-status').textContent='Служба применит изменение при следующей проверке.'}catch(e){$('#monitor-interval-status').textContent='Интервал недоступен: '+e.message}const c=await api('/api/trading/account-config');$('#account-config-status').textContent=c.configured?`Настроен кошелёк ${c.wallet} · тип подписи ${c.signature_type}. Доступ к бирже ещё нужно проверить.`:'Аккаунт ещё не настроен.'}
     else {$('#account-config-status').textContent='Настройка доступна только через SSH-туннель.';$('#monitor-interval-status').textContent='Требуется SSH-туннель.';}
   }catch(e){$('#password-status').textContent='Не удалось проверить подключение: '+e.message;$('#account-config-status').textContent='Не удалось получить состояние аккаунта.'}
@@ -892,16 +892,92 @@ $('#password-form').onsubmit=async e=>{
 };
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{let result=await api('/api/settings',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.currentTarget)))});state.units=result.units;renderWeather();toast('Настройки сохранены')}catch(err){toast(err.message)}};
 // Read-only public trade observation. Never calls the trading or cancellation APIs.
-let copyBusy=false,copyGeneration=0;
-function copyTime(stamp){return Number.isFinite(Number(stamp))&&Number(stamp)>0?new Date(Number(stamp)*1000).toLocaleString('ru-RU'):'—'}
+let copyBusy=false,copyGeneration=0,copyClickVersion=0;
+let copyNoticeAccess=false,copyNoticeLatest=null,copyNoticeRequest=0,copyNoticeApplied=0,copyNoticeFailed=false;
+const copyNoticeKey='gradus.copy.notification.v1',copyDetails=new Map(),copyMetadata=new Map();
+let copyNoticeMemory=null;
+function copyTime(stamp){if(stamp===null||stamp===undefined||!Number.isFinite(Number(stamp))||Number(stamp)<=0)return '—';const d=new Date(Number(stamp)*1000);return Number.isFinite(d.getTime())?d.toLocaleString('ru-RU'):'—'}
+function copySavedNotice(){try{const x=JSON.parse(localStorage.getItem(copyNoticeKey));if(x&&typeof x.epoch==='string'&&Number.isSafeInteger(x.seen)&&x.seen>=0)return x}catch{}return copyNoticeMemory}
+function copyStoreNotice(x){copyNoticeMemory=x;try{localStorage.setItem(copyNoticeKey,JSON.stringify(x))}catch{}}
+function renderCopyNotice(){
+  const button=$('[data-page="copy"]'),saved=copySavedNotice(),latest=copyNoticeLatest;
+  const unseen=!!(latest&&latest.seq>0&&(!saved||saved.epoch!==latest.epoch||saved.seen<latest.seq));
+  button.classList.toggle('copy-unread',unseen);button.classList.toggle('copy-notice-error',copyNoticeFailed);
+  button.setAttribute('aria-label',`Копирование${unseen?' — есть новые сигналы':''}${copyNoticeFailed?' — проверка сигналов недоступна':''}`);
+  button.title=[unseen?'Есть новые сигналы. Нажмите, чтобы просмотреть.':'',copyNoticeFailed?'Не удалось проверить сигналы; повторим автоматически.':''].filter(Boolean).join(' ');
+}
+function acceptCopyNotice(n,request){
+  if(!n||typeof n.epoch!=='string'||!Number.isSafeInteger(n.seq)||n.seq<0)return;
+  if(request<copyNoticeApplied)return;copyNoticeApplied=request;copyNoticeFailed=false;
+  if(copyNoticeLatest&&copyNoticeLatest.epoch===n.epoch&&n.seq<copyNoticeLatest.seq){renderCopyNotice();return;}
+  copyNoticeLatest=n;renderCopyNotice();
+}
+function ackCopyNotice(n=copyNoticeLatest){
+  if(!n||typeof n.epoch!=='string'||!Number.isSafeInteger(n.seq)||n.seq<0)return;const saved=copySavedNotice();
+  copyStoreNotice({epoch:n.epoch,seen:Math.max(n.seq,saved&&saved.epoch===n.epoch?saved.seen:0)});renderCopyNotice();
+}
+async function pollCopyNotice(){
+  if(!copyNoticeAccess||document.hidden)return;
+  const request=++copyNoticeRequest;
+  try{const n=await api('/api/copy-observer/notification');acceptCopyNotice(n,request)}catch{if(request>=copyNoticeApplied){copyNoticeApplied=request;copyNoticeFailed=true;renderCopyNotice()}}
+}
+function setCopyNoticeAccess(allowed){copyNoticeAccess=!!allowed;if(allowed)pollCopyNotice()}
+window.addEventListener('storage',e=>{if(e.key===copyNoticeKey)renderCopyNotice()});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollCopyNotice()});
+function copySafeSlug(slug){return typeof slug==='string'&&/^[a-zA-Z0-9_-]{1,200}$/.test(slug)?slug:''}
+function copyEventLink(slug){slug=copySafeSlug(slug);return slug?`<a href="https://polymarket.com/event/${esc(slug)}" target="_blank" rel="noopener noreferrer">Открыть событие ↗</a>`:'<span class="copy-link-missing">Ссылка на событие недоступна</span>'}
+function copyTx(hash){return /^0x[0-9a-f]{64}$/i.test(hash||'')?`<a href="https://polygonscan.com/tx/${esc(hash)}" target="_blank" rel="noopener noreferrer">Транзакция ↗</a>`:'Транзакция недоступна'}
+function copyProfile(wallet){return /^0x[0-9a-f]{40}$/i.test(wallet||'')?`<a href="https://polymarket.com/profile/${esc(wallet)}" target="_blank" rel="noopener noreferrer">Профиль трейдера ↗</a>`:'Профиль недоступен'}
+function copyNum(value,digits=6){if(value===null||value===undefined||value===''||!Number.isFinite(Number(value)))return '—';return new Intl.NumberFormat('ru-RU',{maximumFractionDigits:digits}).format(Number(value))}
+function copyPercent(value){const n=copyNum(value);return n==='—'?n:n+'%'}
+function copyBookLevels(x){if(!x||!Array.isArray(x.bids)||!Array.isArray(x.asks))return 'Уровни стакана не сохранены.';const side=rows=>rows.length?rows.slice(0,5).map(l=>`${esc(l?.price??'—')} × ${esc(l?.size??'—')}`).join(' · '):'пусто';return `BID: ${side(x.bids)}<br>ASK: ${side(x.asks)} <span>(цена × доли)</span>`}
+function copyValue(t){if(t.size==null||t.price==null||t.size===''||t.price==='')return '—';const a=Number(t.size),b=Number(t.price);return Number.isFinite(a)&&Number.isFinite(b)?copyNum(a*b):'—'}
+function copyHistorySummary(trades){return ['BUY','SELL'].map(side=>{const rows=trades.filter(t=>t.side===side&&t.size!=null&&t.price!=null&&Number.isFinite(Number(t.size))&&Number(t.size)>0&&Number.isFinite(Number(t.price)));const shares=rows.reduce((n,t)=>n+Number(t.size),0),value=rows.reduce((n,t)=>n+Number(t.size)*Number(t.price),0);return `${side==='BUY'?'Покупки':'Продажи'}: ${rows.length} исполнений · ${esc(copyNum(shares))} долей · ≈ ${esc(copyNum(value))} USD · средняя цена ≈ ${shares?esc(copyNum(value/shares)):'—'}`}).join('<br>')}
+function copyDetailKey(s){return `${s.leader_id}:${s.event_key}`}
+function copyPositionHTML(section,label){
+  if(!section||section.error)return `<div>${esc(label)}: ${esc(section?.error||'нет данных')}</div>`;
+  const rows=Array.isArray(section.rows)?section.rows:[];
+  if(!rows.length)return `<div>${esc(label)}: API не вернул позицию${section.partial?' (прочитана только первая страница)':''}.</div>`;
+  return rows.map(p=>`<div class="copy-position"><b>${esc(label)} · ${esc(p.status||'статус неизвестен')}</b><small>Остаток: ${esc(copyNum(p.current_size))} долей · средняя цена: ${esc(copyNum(p.avg_price))} pUSD · текущая цена: ${esc(copyNum(p.current_price))} pUSD</small><small>Стоимость входа: ${esc(copyNum(p.entry_cost_usdc))} USD · комиссия входа по API: ${esc(copyNum(p.entry_fees_usdc))} USD · текущая стоимость: ${esc(copyNum(p.current_value))} USD</small><small>Реализованный PnL: ${esc(copyNum(p.realized_pnl))} USD · нереализованный: ${esc(copyNum(p.unrealized_pnl))} USD · общий: ${esc(copyNum(p.total_pnl))} USD</small><small>Общий объём по API: ${esc(copyNum(p.total_size))} долей · PnL: ${esc(copyPercent(p.percent_pnl))} · реализованный PnL: ${esc(copyPercent(p.percent_realized_pnl))}</small><small>Первый вход по API: ${esc(copyTime(p.first_entry_at))} · последнее событие: ${esc(copyTime(p.last_event_at))} · получено: ${esc(copyTime(section.fetched_at))}${section.partial?' · первая страница':''}</small></div>`).join('');
+}
+function copyDetailHTML(d){
+  if(!d||!d.open)return '';
+  if(d.loading)return '<div class="copy-detail-content" role="status">Загружаем публичную историю и снимок позиции…</div>';
+  if(d.error)return `<div class="copy-detail-content" role="status">${esc(d.error)} <button type="button" class="button secondary copy-detail-retry">Повторить</button></div>`;
+  const data=d.data||{},h=data.history||{},p=data.positions||{},trades=Array.isArray(h.trades)?h.trades:[];
+  const history=h.error?`<p>${esc(h.error)}</p>`:trades.length?`<div class="copy-history">${trades.map(t=>`<div class="copy-history-row"><strong>${t.side==='BUY'?'BUY · покупка':'SELL · продажа'}</strong><span>${esc(copyTime(t.timestamp))}</span><span>${esc(copyNum(t.size))} долей × ${esc(copyNum(t.price))} pUSD ≈ ${esc(copyValue(t))} USD</span><span>${copyTx(t.transaction_hash)}</span></div>`).join('')}</div>`:'<p>API не вернул сделок для этого исхода в прочитанной части.</p>';
+  return `<div class="copy-detail-content"><button type="button" class="button secondary copy-detail-refresh">Обновить историю и позицию</button><h4>Покупки и продажи этого исхода</h4><p>Публичная история Polymarket: от новых к старым, до 300 последних сделок всего рынка, затем отбор по этому исходу. ${h.partial?'История обрезана или содержит пропуски.':'Источник может запаздывать и не содержать все операции.'} Получено: ${esc(copyTime(h.fetched_at))}.</p>${trades.length?`<div class="copy-history-summary">${copyHistorySummary(trades)}<small>Только показанная выборка; сумма = цена × доли, без комиссий. Это не остаток и не прибыль.</small></div>`:''}${history}<h4>Позиция трейдера по данным Polymarket</h4><p>Это снимок на момент запроса, а не состояние в момент сигнала. Нет строки не означает, что позиция закрыта. PnL и средняя цена — значения API для позиции, не прибыль этой сделки.</p>${copyPositionHTML(p.OPEN,'Открытая / доступная к погашению')}${copyPositionHTML(p.CLOSED,'Закрытая')}<p>Покупки и продажи не связываются в пары: возможны частичные исполнения, прежние сделки, переводы, погашения, split/merge и пропуски. Порядок сделок в одну секунду может быть неопределён.</p></div>`;
+}
+function updateCopyDetail(key){
+  const card=[...$('#copy-signals').querySelectorAll('.copy-signal')].find(x=>x.dataset.detailKey===key);if(!card)return;
+  const d=copyDetails.get(key),area=card.querySelector('.copy-detail-area'),button=card.querySelector('.copy-detail-toggle');
+  if(!area||!button)return;area.innerHTML=copyDetailHTML(d);button.textContent=d?.open?'Скрыть историю':'История и позиция';button.setAttribute('aria-expanded',d?.open?'true':'false');
+  const retry=area.querySelector('.copy-detail-retry'),refresh=area.querySelector('.copy-detail-refresh');if(retry)retry.onclick=()=>fetchCopyDetail(key,card.dataset.leaderId,card.dataset.eventKey);if(refresh)refresh.onclick=()=>fetchCopyDetail(key,card.dataset.leaderId,card.dataset.eventKey);
+}
+async function fetchCopyDetail(key,leaderId,eventKey){
+  const d=copyDetails.get(key);if(!d||d.loading)return;d.loading=true;d.error=null;updateCopyDetail(key);
+  try{d.data=await api(`/api/copy-observer/${encodeURIComponent(leaderId)}/signal/${encodeURIComponent(eventKey)}`);if(d.data.metadata)copyMetadata.set(d.data.metadata.token_id,{data:d.data.metadata,at:Date.now()})}
+  catch(e){d.error=e.message}finally{d.loading=false;updateCopyDetail(key);updateCopyLinks()}
+}
+function updateCopyLinks(){
+  $('#copy-signals').querySelectorAll('.copy-event-link').forEach(el=>{
+    const m=copyMetadata.get(el.dataset.token)?.data;
+    const slug=el.dataset.slug||(m&&m.condition_id===el.dataset.condition?m.event_slug:'');el.innerHTML=copyEventLink(slug);
+  });
+}
+async function lookupCopyLinks(signals){
+  const now=Date.now(),tokens=[...new Set(signals.filter(s=>!copySafeSlug(s.event_slug)&&/^[0-9]{1,80}$/.test(s.token_id||'')&&(!copyMetadata.has(s.token_id)||now-copyMetadata.get(s.token_id).at>300000)).map(s=>s.token_id))];
+  if(!tokens.length)return;tokens.forEach(t=>copyMetadata.set(t,{data:null,at:now}));
+  for(let i=0;i<tokens.length;i+=50){const batch=tokens.slice(i,i+50);try{const result=await api('/api/copy-observer/metadata?tokens='+encodeURIComponent(batch.join(',')));for(const t of batch)copyMetadata.set(t,{data:result[t]||null,at:now});updateCopyLinks()}catch{/* Retry after the cache interval; a missing link is never guessed. */}}
+}
 function copyAmountMode(){
   const mode=$('#copy-mode').value,label=$('#copy-amount-label');label.style.display=mode==='same'?'none':'';
   label.childNodes[0].textContent=mode==='percent'?'Процент от долей трейдера':'Сумма на каждую сделку, pUSD';
 }
 $('#copy-mode').addEventListener('change',copyAmountMode);copyAmountMode();
-async function loadCopyObserver(){
-  const generation=++copyGeneration;
-  try{const data=await api('/api/copy-observer');if(generation!==copyGeneration)return;
+async function loadCopyObserver(ack=false){
+  const generation=++copyGeneration,clickVersion=copyClickVersion,noticeRequest=++copyNoticeRequest;
+  try{const data=await api('/api/copy-observer');if(data.notification){acceptCopyNotice(data.notification,noticeRequest);if(ack&&(!copyNoticeLatest||copyNoticeLatest.epoch===data.notification.epoch)&&clickVersion===copyClickVersion&&!$('#copy-page').classList.contains('hidden'))ackCopyNotice(data.notification)}if(generation!==copyGeneration)return;
     const status={running:'свежий сигнал',stale:'давно не отвечала',not_running:'не запущена'};
     $('#copy-service-status').textContent=`Служба наблюдения: ${status[data.service]||'неизвестно'}${data.service_checked_at?' · '+copyTime(data.service_checked_at):''}. Только публичное чтение.`;
     const leaders=Array.isArray(data.leaders)?data.leaders:[];
@@ -920,12 +996,22 @@ async function loadCopyObserver(){
     $('#copy-leaders').querySelectorAll('[data-copy-toggle]').forEach(b=>b.onclick=async()=>{const on=b.dataset.enabled==='1';if(on&&!confirm('Возобновить с текущего времени? Сделки во время паузы не обрабатываются.'))return;b.disabled=true;try{await api('/api/copy-observer/'+b.dataset.copyToggle,{method:'PATCH',body:JSON.stringify({enabled:on,confirm:true})});await loadCopyObserver()}catch(e){toast(e.message);b.disabled=false}});
     $('#copy-leaders').querySelectorAll('[data-copy-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Удалить трейдера и сохранённые наблюдения?'))return;b.disabled=true;try{await api('/api/copy-observer/'+b.dataset.copyDelete,{method:'DELETE',body:JSON.stringify({confirm:true})});await loadCopyObserver()}catch(e){toast(e.message);b.disabled=false}});
     const signals=Array.isArray(data.signals)?data.signals:[];
+    const visibleKeys=new Set(signals.map(copyDetailKey));for(const key of copyDetails.keys())if(!visibleKeys.has(key))copyDetails.delete(key);
+    while(copyMetadata.size>1000)copyMetadata.delete(copyMetadata.keys().next().value);
     $('#copy-signals').innerHTML=signals.length?signals.map(s=>{
       const x=s.estimate||{},buy=s.side==='BUY',best=x.best_price==null?'нет данных':`${esc(x.best_price)} pUSD`,depth=x.available_shares==null?'стакан недоступен':`${esc(x.available_shares)} долей на пяти уровнях`;
-      const target=buy?`Расчёт: ${esc(x.desired_shares)} долей ≈ ${esc(x.desired_value)} pUSD${x.capped?' · ограничено потолком':''}`:'Размер продажи не рассчитан: виртуальная позиция и доля выхода пока не моделируются.';
-      const eventLink=/^[a-z0-9-]{1,160}$/.test(s.event_slug||'')?` <a href="https://polymarket.com/event/${esc(s.event_slug)}" target="_blank" rel="noopener noreferrer">Рынок ↗</a>`:'';
-      return `<article class="copy-signal"><div class="copy-signal-head"><strong>${buy?'ПОКУПКА':'ПРОДАЖА'} · ${esc(s.outcome||'исход не указан')}</strong><span>${esc(copyTime(s.timestamp))} · обнаружена ${esc(copyTime(s.observed_at))}</span></div><b>${esc(s.title||'Без названия')}${eventLink}</b><small>${esc(s.label)} · ${esc(s.size)} долей по ${esc(s.price)} pUSD</small><small>${target}</small><small>Лучший ${buy?'ASK':'BID'}: ${best} · по цене трейдера или лучше: ${depth}</small><small>Снимок стакана: ${esc(copyTime(x.book_at))} · это не исполнение и не гарантия доступности.</small><code>${esc(s.transaction_hash)}</code></article>`;
+      const target=buy?`Расчёт: ${esc(x.desired_shares??'—')} долей ≈ ${esc(x.desired_value??'—')} pUSD${x.capped?' · ограничено потолком':''}`:'Размер продажи не рассчитан: виртуальная позиция и доля выхода пока не моделируются.';
+      const key=copyDetailKey(s),detail=copyDetails.get(key),validKey=Number.isSafeInteger(Number(s.leader_id))&&/^[0-9a-f]{64}:[1-9][0-9]{0,5}$/.test(s.event_key||'');
+      const delay=Number(s.observed_at)-Number(s.timestamp),latency=Number.isFinite(delay)&&delay>=0?`${copyNum(delay,1)} с`:'неизвестна';
+      return `<article class="copy-signal" data-detail-key="${esc(key)}" data-leader-id="${esc(s.leader_id)}" data-event-key="${esc(s.event_key)}"><div class="copy-signal-head"><strong>${buy?'ПОКУПКА':'ПРОДАЖА'} · ${esc(s.outcome||'исход не указан')}</strong><span>Сделка: ${esc(copyTime(s.timestamp))} · обнаружена: ${esc(copyTime(s.observed_at))} · задержка: ${esc(latency)}</span></div><b>${esc(s.title||'Без названия')}</b><div class="copy-links"><span class="copy-event-link" data-token="${esc(s.token_id)}" data-condition="${esc(s.condition_id)}" data-slug="${esc(copySafeSlug(s.event_slug))}">${copyEventLink(s.event_slug)}</span> ${copyProfile(s.wallet)} ${copyTx(s.transaction_hash)}</div><small>${esc(s.label)}${s.trader_name?' · '+esc(s.trader_name):''}${s.pseudonym?' · '+esc(s.pseudonym):''} · ${esc(s.size)} долей по ${esc(s.price)} pUSD ≈ ${esc(copyValue(s))} USD (цена × доли, без комиссий)</small><small>${target}</small><small>Лучший ${buy?'ASK':'BID'}: ${best} · по цене трейдера или лучше: ${depth}</small><small>Снимок стакана: ${esc(copyTime(x.book_at))} · это не исполнение и не гарантия доступности.</small><small>${copyBookLevels(x.book_levels)}</small><code>Кошелёк: ${esc(s.wallet||'—')} · Исход / token: ${esc(s.token_id||'—')}${s.outcome_index==null?'':` (индекс ${esc(s.outcome_index)})`} · Рынок / condition: ${esc(s.condition_id||'—')} · Транзакция: ${esc(s.transaction_hash||'—')}</code>${validKey?`<button type="button" class="button secondary copy-detail-toggle" aria-expanded="${detail?.open?'true':'false'}">${detail?.open?'Скрыть историю':'История и позиция'}</button><div class="copy-detail-area">${copyDetailHTML(detail)}</div>`:''}</article>`;
     }).join(''):'Новых сделок пока нет.';
+    $('#copy-signals').querySelectorAll('.copy-signal').forEach(card=>{
+      const button=card.querySelector('.copy-detail-toggle');if(!button)return;
+      const key=card.dataset.detailKey;button.onclick=()=>{let d=copyDetails.get(key);if(!d){d={open:false};copyDetails.set(key,d)}d.open=!d.open;updateCopyDetail(key);if(d.open&&!d.data&&!d.error)fetchCopyDetail(key,card.dataset.leaderId,card.dataset.eventKey)};
+      updateCopyDetail(key);
+    });
+    updateCopyLinks();lookupCopyLinks(signals);
+
   }catch(e){if(generation===copyGeneration){$('#copy-service-status').textContent='Наблюдение недоступно: '+e.message;$('#copy-leaders').textContent='Не удалось загрузить трейдеров.';$('#copy-signals').textContent='Не удалось загрузить сделки.'}}
 }
 $('#copy-refresh').onclick=()=>loadCopyObserver();
@@ -940,8 +1026,8 @@ $('#copy-form').onsubmit=async e=>{e.preventDefault();if(copyBusy)return;const f
     await loadCopyObserver()
   }catch(err){$('#copy-form-status').textContent=err.message}finally{copyBusy=false;button.disabled=false}
 };
-setInterval(()=>{if(!document.hidden&&!$('#copy-page').classList.contains('hidden'))loadCopyObserver()},15000);
-$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+setInterval(()=>{if(!document.hidden){pollCopyNotice();if(!$('#copy-page').classList.contains('hidden'))loadCopyObserver()}},15000);
+$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
 
 // Portfolio is read-only. Never infer a station from a title or market name.
 let portfolioGeneration=0;
