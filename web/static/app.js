@@ -713,13 +713,20 @@ setInterval(()=>{if(opportunityRows.length&&!document.hidden&&!$('#markets-page'
 $('#scan-temperature').onclick=scanTemperatureMarkets;
 $('#scan-filter').addEventListener('input',renderTemperatureScan);
 setInterval(()=>{if(scanData&&!document.hidden&& !$('#markets-page').classList.contains('hidden'))renderTemperatureScan()},60000);
+function filterSavedMarkets(){
+  const q=$('#saved-markets-search').value.trim().toLocaleLowerCase(),rows=$$('#all-markets .saved-market-row');let visible=0;
+  for(const row of rows){row.hidden=!!q&&!row.dataset.search.toLocaleLowerCase().includes(q);if(!row.hidden)visible++}
+  const empty=$('#saved-markets-filter-empty');if(empty)empty.hidden=!q||visible>0;
+}
+$('#saved-markets-search').addEventListener('input',filterSavedMarkets);
 async function renderAllMarkets(){
   try{
     let [markets,all]=await Promise.all([api('/api/markets'),Promise.all(state.stations.map(async s=>({s,b:await api(`/api/stations/${s.id}/bindings`)})))]);
     scanSaved=new Map(markets.map(m=>[m.slug,{codes:all.filter(x=>x.b.some(b=>b.market_slug===m.slug)).map(x=>x.s.station_code)}]));
     renderTemperatureScan();
     if(!markets.length){$('#all-markets').innerHTML='<div class="empty-state">Рынков пока нет. Найдите и привяжите первый рынок.</div>';return}
-    $('#all-markets').innerHTML=markets.map(m=>{let linked=all.filter(x=>x.b.some(b=>b.market_slug===m.slug));return `<div class="manage-row"><div><b>${esc(m.name)}</b><small>${linked.length?linked.map(x=>esc(x.s.name)).join(' · '):'Не привязан к станции'} · ${esc(m.slug)}</small></div><div class="manage-actions">${linked.length?`<button class="button secondary open-managed-market" data-id="${linked[0].s.id}" data-slug="${esc(m.slug)}">Открыть ↗</button>`:''}<button class="button secondary resolve-managed-market" data-slug="${esc(m.slug)}">Найти станцию</button><button class="button secondary rename-managed-market" data-slug="${esc(m.slug)}">Переименовать</button><button class="button danger delete-managed-market" data-slug="${esc(m.slug)}">Удалить</button></div></div>`}).join('');
+    $('#all-markets').innerHTML=markets.map(m=>{let linked=all.filter(x=>x.b.some(b=>b.market_slug===m.slug));let linkedNames=linked.length?linked.map(x=>x.s.name).join(' · '):'Не привязан к станции';return `<div class="manage-row saved-market-row" data-search="${esc([m.name,m.slug,...linked.map(x=>x.s.name),...linked.map(x=>x.s.station_code)].join(' '))}"><div class="saved-market-main"><span class="portfolio-market-icon" aria-hidden="true">◈</span><div><b>${esc(m.name)}</b><small>${esc(linkedNames)} · ${esc(m.slug)}</small></div></div><div class="manage-actions">${linked.length?`<button class="button secondary open-managed-market" data-id="${linked[0].s.id}" data-slug="${esc(m.slug)}">Открыть ↗</button>`:''}<button class="button secondary resolve-managed-market" data-slug="${esc(m.slug)}">Найти станцию</button><button class="button secondary rename-managed-market" data-slug="${esc(m.slug)}">Переименовать</button><button class="button danger delete-managed-market" data-slug="${esc(m.slug)}">Удалить</button></div></div>`}).join('')+'<div id="saved-markets-filter-empty" class="portfolio-filter-empty" hidden>По вашему запросу ничего не найдено.</div>';
+    filterSavedMarkets();
     $$('.open-managed-market').forEach(b=>b.onclick=async()=>{state.selected=Number(b.dataset.id);page('weather',false);renderStationTabs();await loadStation();state.market=b.dataset.slug;renderMarketTabs();await loadMarket()});
     $$('.resolve-managed-market').forEach(b=>b.onclick=()=>openMarketFirst(b.dataset.slug, true));
     $$('.rename-managed-market').forEach(b=>b.onclick=async()=>{let m=markets.find(x=>x.slug===b.dataset.slug);if(!m)return;let name=prompt('Новое название рынка (изменится во всех станциях и в базе бота):',m.name);if(name===null)return;try{await api('/api/markets/'+encodeURIComponent(m.slug),{method:'PATCH',body:JSON.stringify({name})});if(state.selected)await loadStation(true);await renderAllMarkets();toast('Рынок переименован')}catch(e){toast(e.message)}});
@@ -938,15 +945,18 @@ $('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.
 
 // Portfolio is read-only. Never infer a station from a title or market name.
 let portfolioGeneration=0;
-const portfolioColors=['#168a64','#8bc9ad','#d8ae63','#687cb9','#c96b66','#7a948b','#b6a9cf','#88a4bc'];
+const portfolioColors=['#4a70ff','#8c72f7','#48b9cd','#d39f65','#7290b8','#bb80aa','#90ba9c','#c9b777'];
 function portfolioNum(n,digits=2){return n===null||n===undefined||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('ru-RU',{maximumFractionDigits:digits})}
 function portfolioLine(points){
-  if(!Array.isArray(points)||points.filter(p=>p.value!==null&&p.timestamp!==null).length<2)return '<p>Недостаточно данных PnL.</p>';
+  if(!Array.isArray(points))return '<p>Данные PnL недоступны.</p>';
   const valid=points.filter(p=>p.value!==null&&p.timestamp!==null&&Number.isFinite(Number(p.value))&&Number.isFinite(Number(p.timestamp)));
-  if(valid.length<2)return '<p>Недостаточно данных PnL.</p>';
+  if(!valid.length)return '<p>Нет доступных данных PnL.</p>';
+  const latest=valid.at(-1),latestValue=Number(latest.value),stamp=new Date(Number(latest.timestamp)*1000);
+  const summary=`<div class="portfolio-pnl-value ${latestValue>0?'positive':latestValue<0?'negative':''}">${esc(portfolioNum(latestValue))} <span>pUSD</span></div><div class="portfolio-pnl-caption">Последнее доступное значение · ${esc(Number.isFinite(stamp.getTime())?stamp.toLocaleString('ru-RU'):'время неизвестно')}</div>`;
+  if(valid.length<2)return summary+'<p>Для графика недостаточно данных.</p>';
   let min=Math.min(...valid.map(p=>Number(p.value))),max=Math.max(...valid.map(p=>Number(p.value))),start=Number(valid[0].timestamp),end=Number(valid.at(-1).timestamp),dx=end-start||1,dy=max-min||1;
-  let segments=[],current=[];for(const p of points){if(p.value===null||p.timestamp===null||!Number.isFinite(Number(p.value))||!Number.isFinite(Number(p.timestamp))){if(current.length)segments.push(current);current=[];continue}current.push(`${20+360*(Number(p.timestamp)-start)/dx},${160-135*(Number(p.value)-min)/dy}`)}if(current.length)segments.push(current);
-  return `<svg viewBox="0 0 400 190" role="img" aria-label="График PnL позиций за месяц"><line x1="20" y1="160" x2="380" y2="160" stroke="#cbd8d1"/>${segments.map(a=>`<polyline points="${a.join(' ')}" fill="none" stroke="#168a64" stroke-width="2"/>`).join('')}<text x="20" y="15" class="portfolio-chart-label">${esc(portfolioNum(max))} pUSD</text><text x="20" y="185" class="portfolio-chart-label">${esc(portfolioNum(min))} pUSD</text></svg><small>${esc(new Date(start*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date(end*1000).toLocaleDateString('ru-RU'))}</small>`;
+  let segments=[],current=[];for(const p of points){if(p.value===null||p.timestamp===null||!Number.isFinite(Number(p.value))||!Number.isFinite(Number(p.timestamp))){if(current.length)segments.push(current);current=[];continue}current.push(`${20+360*(Number(p.timestamp)-start)/dx},${90-75*(Number(p.value)-min)/dy}`)}if(current.length)segments.push(current);
+  return `${summary}<svg viewBox="0 0 400 100" preserveAspectRatio="none" role="img" aria-label="График PnL позиций за месяц"><defs><linearGradient id="portfolio-pnl-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5268f8" stop-opacity=".35"/><stop offset="100%" stop-color="#5268f8" stop-opacity="0"/></linearGradient></defs><line x1="20" y1="90" x2="380" y2="90" stroke="#353d52"/>${segments.map(a=>`${a.length>1?`<polygon points="${a.join(' ')} ${a.at(-1).split(',')[0]},90 ${a[0].split(',')[0]},90" fill="url(#portfolio-pnl-fill)"/>`:''}<polyline points="${a.join(' ')}" fill="none" stroke="#6f7aff" stroke-width="2.5"/>`).join('')}</svg><small>Диапазон ${esc(portfolioNum(min))}…${esc(portfolioNum(max))} pUSD · ${esc(new Date(start*1000).toLocaleDateString('ru-RU'))} — ${esc(new Date(end*1000).toLocaleDateString('ru-RU'))}</small>`;
 }
 function portfolioDistribution(positions,partial){
   if(!Array.isArray(positions))return '<p>Данные недоступны.</p>';
@@ -965,20 +975,42 @@ async function portfolioOpen(slug){
     state.selected=match.station.id;page('weather',false);renderStationTabs();await loadStation();if(!state.bindings.some(b=>b.market_slug===slug)){toast('Привязка изменилась. Обновите портфель.');return}state.market=slug;renderMarketTabs();await loadMarket();
   }catch(e){toast('Не удалось проверить привязки: '+e.message)}
 }
+// Rows display only fields supplied by the snapshot; opening a market remains a separate action.
+function portfolioMarket(title,subtitle,badge,subtitleTitle){
+  const side=String(badge||'').toLowerCase(),style=side==='yes'?'yes':side==='no'?'no':'neutral';
+  return `<div class="portfolio-market"><span class="portfolio-market-icon" aria-hidden="true">◈</span><div class="portfolio-market-copy"><b title="${esc(title||'Рынок не определён')}">${esc(title||'Рынок не определён')}</b><small title="${esc(subtitleTitle||subtitle||'')}">${badge?`<span class="portfolio-pill ${style}">${esc(badge)}</span> `:''}${esc(subtitle||'')}</small></div></div>`;
+}
+function portfolioCell(label,value,extra=''){return `<div class="portfolio-cell" data-label="${esc(label)}"><strong class="${extra}">${esc(value)}</strong></div>`}
+function portfolioAction(slug){return `<button type="button" class="button secondary portfolio-open" data-slug="${esc(slug||'')}">Открыть ↗</button>`}
+function portfolioRow(search,market,cells,slug){return `<div class="portfolio-row" data-search="${esc(search)}">${market}${cells}${portfolioAction(slug)}</div>`}
+function portfolioRows(data,headers,make,empty,unavailable){
+  if(!Array.isArray(data))return `<div class="portfolio-empty">${esc(unavailable)}</div>`;
+  if(!data.length)return `<div class="portfolio-empty">${esc(empty)}</div>`;
+  return `<div class="portfolio-table-head"><span>РЫНОК</span>${headers.map(h=>`<span>${esc(h)}</span>`).join('')}<span></span></div><div class="portfolio-row-list">${data.map(make).join('')}</div><div class="portfolio-filter-empty" hidden>По вашему запросу ничего не найдено.</div>`;
+}
+function filterPortfolioRows(){
+  const q=$('#portfolio-search').value.trim().toLocaleLowerCase();
+  for(const id of ['portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity']){
+    const root=$('#'+id),rows=[...root.querySelectorAll('.portfolio-row')];let visible=0;
+    for(const row of rows){row.hidden=!!q&&!row.dataset.search.toLocaleLowerCase().includes(q);if(!row.hidden)visible++}
+    const empty=root.querySelector('.portfolio-filter-empty');if(empty)empty.hidden=!q||visible>0;
+  }
+}
+$('#portfolio-search').addEventListener('input',filterPortfolioRows);
 async function loadPortfolio(){
   const seq=++portfolioGeneration;$('#portfolio-refresh').disabled=true;$('#portfolio-status').textContent='Загружаем снимок…';for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity'])$('#'+id).textContent='';
   try{
     const data=await api('/api/trading/portfolio');if(seq!==portfolioGeneration)return;
-    $('#portfolio-status').textContent=[`Кошелёк ${data.wallet}.`,...(data.errors||[]),data.orders_partial?'Список ордеров CLOB усечён.':'',data.positions_partial?'Показаны первые 500 позиций.':'',data.activity_partial?'Показаны первые 500 действий.':''].filter(Boolean).join(' ');
-    const total=data.balance!==null&&data.value!==null?Number(data.balance)+Number(data.value):null;
-    $('#portfolio-balances').innerHTML=`<div class="portfolio-values">Баланс CLOB: ${esc(portfolioNum(data.balance))} pUSD · Оценка позиций: ${esc(portfolioNum(data.value))} pUSD · Всего: ${esc(portfolioNum(total))} pUSD</div>`;
+    $('#portfolio-status').textContent=[`Получено терминалом: ${new Date().toLocaleString('ru-RU')}. Кошелёк ${data.wallet}.`,...(data.errors||[]),data.orders_partial?'Список ордеров CLOB усечён.':'',data.positions_partial?'Показаны первые 500 позиций.':'',data.activity_partial?'Показаны первые 500 действий.':''].filter(Boolean).join(' ');
+    const total=data.balance!==null&&data.balance!==undefined&&data.value!==null&&data.value!==undefined&&Number.isFinite(Number(data.balance))&&Number.isFinite(Number(data.value))?Number(data.balance)+Number(data.value):null;
+    $('#portfolio-balances').innerHTML=`<strong>${esc(portfolioNum(total))} <span>pUSD</span></strong><small class="portfolio-total-note">Сумма независимых снимков</small><div class="portfolio-balance-breakdown"><div><small>Баланс CLOB</small><b>${esc(portfolioNum(data.balance))} pUSD</b></div><div><small>Оценка позиций</small><b>${esc(portfolioNum(data.value))} pUSD</b></div></div>`;
     $('#portfolio-pnl').innerHTML=portfolioLine(data.pnl);$('#portfolio-allocation').innerHTML=portfolioDistribution(data.positions,data.positions_partial);
-    const row=(title,detail,slug)=>`<div class="portfolio-row"><div><b>${esc(title||'Рынок не определён')}</b><small>${esc(detail)}</small></div><button class="button secondary portfolio-open" data-slug="${esc(slug||'')}">Открыть ↗</button></div>`;
-    $('#portfolio-positions').innerHTML=Array.isArray(data.positions)?(data.positions.map(p=>row(p.title||p.event_slug,`${p.outcome||'Исход неизвестен'} · ${portfolioNum(p.size)} долей · оценка ${portfolioNum(p.value)} pUSD · PnL ${portfolioNum(p.pnl)}${p.redeemable?' · доступно погашение':''}`,p.event_slug)).join('')||'<p>Позиций нет.</p>'):'<p>Позиции недоступны.</p>';
-    const slugByAsset=new Map();for(const p of [...(data.positions||[]),...(data.activity||[]),...(data.intents||[]).map(i=>({asset:i.asset,event_slug:i.slug}))])if(p.asset&&p.event_slug){let slugs=slugByAsset.get(p.asset)||new Set();slugs.add(p.event_slug);slugByAsset.set(p.asset,slugs)}
-    $('#portfolio-orders').innerHTML=Array.isArray(data.orders)?(data.orders.map(o=>{let slugs=slugByAsset.get(o.asset_id),slug=slugs?.size===1?[...slugs][0]:'';return row(slug||`Ордер ${o.id}`,`${o.side} · цена ${portfolioNum(o.price,4)} pUSD · сопоставлено ${portfolioNum(o.size_matched)} из ${portfolioNum(o.original_size)} долей · ${o.status}`,slug)}).join('')||'<p>Открытых ордеров в полученном снимке нет.</p>'):'<p>Ордера недоступны.</p>';
-    $('#portfolio-intents').innerHTML=Array.isArray(data.intents)?(data.intents.map(x=>{let r=x.reconciliation,detail=`${x.side} · ${x.execution_mode==='market'?'FAK':'GTC'} · ${x.size} ${x.execution_mode==='market'&&x.side==='BUY'?'pUSD':'долей'} · ${x.state==='accepted'?'принят CLOB, исполнение не подтверждено':x.state==='not_sent'?'не отправлен':'результат неизвестен'}`;if(r?.size_matched!=null)detail+=` · сопоставлено ${r.size_matched}, подтверждено ${r.confirmed_size}, ошибка ${r.failed_size}`;return row(x.slug,detail,x.slug)}).join('')||'<p>Записей терминала нет.</p>'):'<p>Журнал терминала недоступен.</p>';
-    $('#portfolio-activity').innerHTML=Array.isArray(data.activity)?(data.activity.map(p=>row(p.title||p.event_slug,`${p.type||'Действие'} ${p.side||''} · ${p.outcome||''} · ${portfolioNum(p.size)} долей · ${portfolioNum(p.value)} pUSD · ${p.timestamp?new Date(p.timestamp*1000).toLocaleString('ru-RU'):'время недоступно'}`,p.event_slug)).join('')||'<p>Активность отсутствует.</p>'):'<p>История недоступна.</p>';
+    $('#portfolio-positions').innerHTML=portfolioRows(data.positions,['ДОЛИ','ОЦЕНКА','PNL'],p=>portfolioRow([p.title,p.event_slug,p.outcome].join(' '),portfolioMarket(p.title||p.event_slug,p.redeemable?'Доступно погашение':'Открытая позиция',p.outcome),portfolioCell('Доли',portfolioNum(p.size))+portfolioCell('Оценка',portfolioNum(p.value)+' pUSD')+portfolioCell('PnL',portfolioNum(p.pnl)+' pUSD',p.pnl==null?'':Number(p.pnl)>0?'positive':Number(p.pnl)<0?'negative':''),p.event_slug),'Позиций нет.','Позиции недоступны.');
+    const byAsset=new Map();for(const p of [...(data.positions||[]),...(data.activity||[]),...(data.intents||[]).map(i=>({asset:i.asset,event_slug:i.slug}))])if(p.asset&&p.event_slug){let info=byAsset.get(p.asset)||{slugs:new Set(),titles:new Set()};info.slugs.add(p.event_slug);if(p.title)info.titles.add(p.title);byAsset.set(p.asset,info)}
+    $('#portfolio-orders').innerHTML=portfolioRows(data.orders,['ЦЕНА','СОПОСТАВЛЕНО','СТАТУС'],o=>{let info=byAsset.get(o.asset_id),slug=info?.slugs.size===1?[...info.slugs][0]:'',title=slug&&info.titles.size===1?[...info.titles][0]:slug||`Ордер ${o.id}`,id=String(o.id||''),shortId=id.length>20?id.slice(0,10)+'…'+id.slice(-6):id;let price=o.price==null?'—':portfolioNum(Number(o.price)*100,4)+'¢';return portfolioRow([title,slug,o.id,o.side,o.status].join(' '),portfolioMarket(title,shortId?'ID '+shortId:'',o.side,id),portfolioCell('Цена',price)+portfolioCell('Сопоставлено',`${portfolioNum(o.size_matched)} / ${portfolioNum(o.original_size)}`)+portfolioCell('Статус',o.status||'—'),slug)},'Открытых ордеров в полученном снимке нет.','Ордера недоступны.');
+    $('#portfolio-intents').innerHTML=portfolioRows(data.intents,['ТИП','ОБЪЁМ','СОСТОЯНИЕ'],x=>{let r=x.reconciliation,detail=r?.size_matched!=null?`Сопоставлено ${r.size_matched}, подтверждено ${r.confirmed_size}, ошибка ${r.failed_size}`:'Локальная запись терминала',status=x.state==='accepted'?'Принят CLOB, исполнение не подтверждено':x.state==='not_sent'?'Не отправлен':'Результат неизвестен';return portfolioRow([x.slug,x.side,x.state,detail].join(' '),portfolioMarket(x.slug,detail,x.side),portfolioCell('Тип',x.execution_mode==='market'?'FAK':'GTC')+portfolioCell('Объём',`${portfolioNum(x.size)} ${x.execution_mode==='market'&&x.side==='BUY'?'pUSD':'долей'}`)+portfolioCell('Состояние',status),x.slug)},'Записей терминала нет.','Журнал терминала недоступен.');
+    $('#portfolio-activity').innerHTML=portfolioRows(data.activity,['ДОЛИ','СУММА','ВРЕМЯ'],p=>{let date=new Date(Number(p.timestamp)*1000),when=p.timestamp!=null&&Number.isFinite(date.getTime())?date.toLocaleString('ru-RU'):'Время недоступно',type=String(p.type||'').toUpperCase(),side=String(p.side||'').toUpperCase(),action=type==='TRADE'&&side==='BUY'?'Покупка':type==='TRADE'&&side==='SELL'?'Продажа':[p.type,p.side].filter(Boolean).join(' ')||'Действие';return portfolioRow([p.title,p.event_slug,p.outcome,action].join(' '),portfolioMarket(p.title||p.event_slug,action,p.outcome),portfolioCell('Доли',portfolioNum(p.size))+portfolioCell('Сумма',portfolioNum(p.value)+' pUSD')+portfolioCell('Время',when),p.event_slug)},'Активность отсутствует.','История недоступна.');
+    filterPortfolioRows();
   }catch(e){if(seq===portfolioGeneration){$('#portfolio-status').textContent=e.message;for(const id of ['portfolio-balances','portfolio-pnl','portfolio-allocation','portfolio-positions','portfolio-orders','portfolio-intents','portfolio-activity'])$('#'+id).textContent=''}}
   finally{if(seq===portfolioGeneration)$('#portfolio-refresh').disabled=false}
 }
