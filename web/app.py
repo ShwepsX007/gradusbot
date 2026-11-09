@@ -101,8 +101,9 @@ def init_web_db():
 
 
 init_web_db()
-from web import copy_observer
+from web import copy_observer, auto_scalp
 copy_observer.init_db()
+auto_scalp.init_db()
 _lock = threading.RLock()
 _cache = {}
 
@@ -361,6 +362,24 @@ def trading_monitor_interval():
     except ValueError as exc: return jsonify(error=str(exc)),400
     except Exception: return jsonify(error='Не удалось сохранить интервал наблюдения.'),503
     return jsonify(interval_seconds=position_monitor.get_interval())
+
+
+@app.route('/api/auto-scalp', methods=['GET','POST'])
+def auto_scalp_api():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    if request.method=='GET': return jsonify(auto_scalp.status())
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or data.get('confirm') is not True: return jsonify(error='Требуется подтверждение.'),400
+    try:
+        if data.get('mode')!='demo': raise auto_scalp.ScalpError('Реальная автоматическая торговля ещё не реализована.')
+        action=data.get('action')
+        if action=='settings':auto_scalp.set_settings(data.get('settings'))
+        elif action=='start':auto_scalp.set_enabled(True)
+        elif action=='stop':auto_scalp.set_enabled(False)
+        else:raise auto_scalp.ScalpError('Неизвестное действие.')
+    except auto_scalp.ScalpError as exc:return jsonify(error=str(exc)),400
+    except Exception:return jsonify(error='Не удалось изменить настройки демо.'),503
+    return jsonify(ok=True)
 
 
 @app.route('/api/copy-observer', methods=['GET','POST'])

@@ -15,7 +15,7 @@ function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherContr
 function resumeOverview(){return loadStation(state.weather?.station?.id===state.selected)}
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok){const e=Error(data.error||'Ошибка запроса');e.code=data.code;e.nonces=data.nonces;throw e}return data}
-function page(name,refreshOnEnter=true,ackCopy=false){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver(ackCopy);if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
+function page(name,refreshOnEnter=true,ackCopy=false){const wasWeather=!$('#weather-page').classList.contains('hidden');if(name!=='weather'&&wasWeather)stopViewRequests();$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${name}-page`).classList.remove('hidden');$$('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('#crumb').textContent=({weather:'Обзор',stations:'Станции',markets:'Рынки',portfolio:'Портфель',copy:'Копирование',scalp:'Авто Скальп',settings:'Настройки'})[name];if(name==='stations')renderStations();if(name==='markets')renderAllMarkets();if(name==='portfolio')loadPortfolio();if(name==='copy')loadCopyObserver(ackCopy);if(name==='scalp')loadScalp();if(name==='settings'){loadSettings();loadSecurityInfo()}if(name==='weather'&&!wasWeather&&refreshOnEnter&&overviewActive())resumeOverview()}
 $$('.nav').forEach(x=>x.onclick=()=>{if(x.dataset.page==='copy'){copyClickVersion++;ackCopyNotice();page(x.dataset.page,true,true)}else page(x.dataset.page)});
 function showDialog(id){$(`#${id}`).showModal()}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
@@ -1125,3 +1125,43 @@ for(const tab of portfolioTabs){
 }
 $('#portfolio-refresh').onclick=loadPortfolio;
 $('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.portfolio-open');if(b)portfolioOpen(b.dataset.slug)});
+
+// Auto Scalping is currently a demo-only public-data simulator.
+let scalpGeneration=0,scalpDirty=false,scalpBusy=false;
+function scalpNumber(x){return x===null||x===undefined||!Number.isFinite(Number(x))?'—':new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(Number(x))}
+function scalpChart(journal){
+  const sells=journal.filter(x=>x.kind==='SELL'&&x.pnl!==null&&Number.isFinite(Number(x.pnl))).slice().reverse();
+  if(!sells.length)return '<p>Для графика нужна хотя бы одна виртуальная продажа.</p>';
+  let total=0;const points=[0,...sells.map(x=>total+=Number(x.pnl))],min=Math.min(...points),max=Math.max(...points),span=max-min||1;
+  const coords=points.map((p,i)=>`${10+380*i/(points.length-1)},${85-70*(p-min)/span}`);
+  return `<div class="scalp-graph-title">Реализованный результат в последних 200 записях: ${esc(scalpNumber(total))} pUSD</div><svg viewBox="0 0 400 100" preserveAspectRatio="none" role="img" aria-label="График виртуального реализованного результата"><line x1="10" y1="85" x2="390" y2="85" stroke="#34463b"/><polyline points="${coords.join(' ')}" fill="none" stroke="#89d9ab" stroke-width="2"/></svg><small>Только показанный журнал, без открытых позиций и результата разрешения.</small>`;
+}
+async function loadScalp(){
+  const generation=++scalpGeneration;
+  try{const data=await api('/api/auto-scalp');if(generation!==scalpGeneration)return;
+    const cfg=data.config||{},settings=cfg.settings||{},positions=Array.isArray(data.positions)?data.positions:[],journal=Array.isArray(data.journal)?data.journal:[];
+    const form=$('#scalp-form');if(!scalpDirty)for(const name of Object.keys(settings))if(form.elements[name])form.elements[name].value=settings[name];
+    form.querySelector('button[type=submit]').disabled=!!cfg.enabled||scalpBusy;
+    $('#scalp-start').disabled=!!cfg.enabled||scalpBusy;$('#scalp-stop').disabled=!cfg.enabled||scalpBusy;
+    const service={running:'работает',stale:'давно не отвечала',not_running:'не запущена'};
+    $('#scalp-status').textContent=`Служба: ${service[cfg.service]||'неизвестно'} · новые входы: ${cfg.enabled?'включены':'остановлены'} · ${cfg.message||'ожидание'}${cfg.scan_at?' · проверка '+copyTime(cfg.scan_at):''}`;
+    const opened=positions.filter(p=>!p.closed),exposure=opened.reduce((n,p)=>n+Number(p.remaining)*Number(p.entry_price),0);
+    $('#scalp-stats').innerHTML=`<div><small>ДЕМО · СВОБОДНО</small><strong>${esc(scalpNumber(cfg.balance))} pUSD</strong></div><div><small>ОТКРЫТО ПОЗИЦИЙ</small><strong>${opened.length}</strong></div><div><small>СТОИМОСТЬ ВХОДА ОСТАТКА</small><strong>≈ ${esc(scalpNumber(exposure))} pUSD</strong></div>`;
+    $('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small>${copyEventLink(p.event_slug)}</div></article>`).join(''):'Демо-позиций пока нет.';
+    const byId=new Map(positions.map(p=>[p.id,p]));
+    $('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small></div></article>`).join(''):'Виртуальных сделок пока нет.';
+    $('#scalp-chart').innerHTML=scalpChart(journal);
+  }catch(e){if(generation===scalpGeneration)$('#scalp-status').textContent='Демо-скальпер недоступен: '+e.message}
+}
+$('#scalp-form').addEventListener('input',()=>{scalpDirty=true});
+$('#scalp-refresh').onclick=()=>loadScalp();
+async function scalpAction(action,settings){
+  if(scalpBusy)return;
+  if(!confirm(action==='start'?'Запустить только демо? Реальные заявки не отправляются.':action==='stop'?'Остановить новые демо-входы? Виртуальные выходы продолжат наблюдаться.':'Сохранить настройки демо?'))return;
+  scalpBusy=true;$('#scalp-form-status').textContent='Выполняется…';
+  try{await api('/api/auto-scalp',{method:'POST',body:JSON.stringify({mode:'demo',action,settings,confirm:true})});if(action==='settings')scalpDirty=false;$('#scalp-form-status').textContent='Готово.';await loadScalp()}
+  catch(e){$('#scalp-form-status').textContent=e.message}finally{scalpBusy=false;await loadScalp()}
+}
+$('#scalp-form').onsubmit=e=>{e.preventDefault();const form=e.currentTarget,settings=Object.fromEntries(new FormData(form));settings.max_positions=Number(settings.max_positions);settings.interval_seconds=Number(settings.interval_seconds);scalpAction('settings',settings)};
+$('#scalp-start').onclick=()=>scalpAction('start');$('#scalp-stop').onclick=()=>scalpAction('stop');
+setInterval(()=>{if(!document.hidden&&!$('#scalp-page').classList.contains('hidden'))loadScalp()},15000);

@@ -1,0 +1,16 @@
+[Unit]
+Description=Gradus automatic scalping demo (no real trades)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradus-web
+WorkingDirectory=/opt/gradusbot-web
+ExecStart=/bin/sh /opt/gradusbot-web/web/run_auto_scalp_demo.sh
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
