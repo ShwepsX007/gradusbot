@@ -567,7 +567,7 @@ function bookSide(title,book,index,token,groups){
   return `<section class="book-side"><h4>${title}</h4><div class="book-updated">${updated}</div><div class="book-columns"><div><div class="book-column-title">Покупатели · BID</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book?.bids,'bid')}</div><div><div class="book-column-title">Продавцы · ASK</div><div class="book-level book-label"><span>Цена</span><span>Количество</span></div>${levels(book?.asks,'ask')}</div></div>${unknown}</section>`;
 }
 // History is indicative CLOB data, not archived executable bid/ask levels.
-let historySide='yes',historyPeriod='1d',historyView=null,historySeq=0;
+let historySide='yes',historyPeriod='1d',historyView=null,historySeq=0,historyShowBid=true,historyShowAsk=true;
 function historyKey(){
   const option=marketData?.market?.options?.[bookChoice],token=option?.['token_'+historySide];
   if(state.demo||bookChoice===null||bookSlug!==state.market||!state.market||typeof token!=='string'||!/^\d{1,80}$/.test(token))return null;
@@ -592,23 +592,56 @@ async function syncBookHistory(force=false){
   updateBookHistory();
 }
 function historyDate(t){return new Date(t*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}
-function historyGraph(data){
-  const points=data.history.filter(p=>typeof p.t==='number'&&Number.isFinite(p.t)&&typeof p.p==='number'&&Number.isFinite(p.p)&&p.p>=0&&p.p<=1).sort((a,b)=>a.t-b.t);
-  if(!points.length)return '<div class="book-chart-empty">За выбранный период история отсутствует.</div>';
-  const first=points[0].t,last=points[points.length-1].t,low=Math.min(...points.map(p=>p.p)),high=Math.max(...points.map(p=>p.p));
-  const pad=Math.max((high-low)*0.15,0.02),min=Math.max(0,low-pad),max=Math.min(1,high+pad),span=max-min||1;
-  const x=t=>(last===first?0.5:(t-first)/(last-first))*728,y=p=>5+(max-p)/span*90;
-  const line=points.map((p,i)=>`${i?'L':'M'}${x(p.t).toFixed(2)},${y(p.p).toFixed(2)}`).join(' ');
-  const grid=[5,50,95].map(yy=>`<line x1="0" y1="${yy}" x2="728" y2="${yy}" class="history-grid"/>`).join('');
-  return `<div class="book-history-plot"><div class="history-axis-y"><span>${esc(priceCents(max))}</span><span>${esc(priceCents((min+max)/2))}</span><span>${esc(priceCents(min))}</span></div><div class="history-plot-main"><svg class="book-history-svg" viewBox="0 0 728 100" preserveAspectRatio="none" role="img" aria-label="История цены ${historySide.toUpperCase()} за выбранный период"><title>История цены Polymarket в центах. Время — часовой пояс устройства.</title>${grid}<line class="history-cursor" x1="0" x2="0" y1="5" y2="95" visibility="hidden"/><path class="history-line" d="${line}"/><circle class="history-last" cx="${x(last).toFixed(2)}" cy="${y(points[points.length-1].p).toFixed(2)}" r="3"/></svg><div class="history-axis-x"><span>${esc(historyDate(first))}</span>${first===last?'':`<span>${esc(historyDate(last))}</span>`}</div></div></div><div class="book-history-value" aria-live="polite">Последняя точка: ${esc(priceCents(points[points.length-1].p))} · ${esc(historyDate(last))}</div>`;
+function historyGraph(data,option){
+  const now=Date.now()/1000,durations={'1h':3600,'6h':21600,'1d':86400,'1w':604800};
+  const validPrice=p=>typeof p==='number'&&Number.isFinite(p)&&p>=0&&p<=1;
+  const prices=(Array.isArray(data.history)?data.history:[]).filter(p=>typeof p.t==='number'&&Number.isFinite(p.t)&&validPrice(p.p)).sort((a,b)=>a.t-b.t);
+  const quotes=(Array.isArray(data.quotes)?data.quotes:[]).filter(p=>typeof p.t==='number'&&Number.isFinite(p.t)).map(p=>({t:p.t,bid:validPrice(p.bid)?p.bid:null,ask:validPrice(p.ask)?p.ask:null}));
+  // The current book has its own real observation time; never synthesize old bid/ask values.
+  const book=bookFor(option,historySide);
+  if(book&&Number.isFinite(Number(book.fetched_at))){
+    const read=levels=>{if(!levels?.length)return null;const n=Number(levels[0].price);return validPrice(n)?n:null};
+    const t=Number(book.fetched_at),snapshot={t,bid:read(book.bids),ask:read(book.asks)};
+    if(!quotes.some(q=>Math.abs(q.t-t)<.001))quotes.push(snapshot);
+  }
+  quotes.sort((a,b)=>a.t-b.t);
+  const allTimes=[...prices.map(p=>p.t),...quotes.map(p=>p.t)].filter(t=>t>0&&t<=now+60);
+  const end=now,start=durations[historyPeriod]?end-durations[historyPeriod]:(allTimes.length?Math.min(...allTimes):end-86400);
+  const inRange=p=>p.t>=start&&p.t<=end+60;
+  const pricePoints=prices.filter(inRange),quotePoints=quotes.filter(inRange),values=pricePoints.map(p=>p.p);
+  for(const q of quotePoints){if(historyShowBid&&q.bid!==null)values.push(q.bid);if(historyShowAsk&&q.ask!==null)values.push(q.ask)}
+  if(!values.length)return '<div class="book-chart-empty">'+(data.history_error?esc(data.history_error):'За выбранный период история отсутствует.')+'</div>';
+  const low=Math.min(...values),high=Math.max(...values),pad=Math.max((high-low)*.15,.02),min=Math.max(0,low-pad),max=Math.min(1,high+pad),span=max-min||1;
+  const x=t=>Math.max(0,Math.min(728,(t-start)/Math.max(1,end-start)*728)),y=p=>5+(max-p)/span*90;
+  const line=pricePoints.map((p,i)=>`${i?'L':'M'}${x(p.t).toFixed(2)},${y(p.p).toFixed(2)}`).join(' ');
+  const series=(side,show)=>{
+    if(!show)return '';
+    const segments=[];let segment=[];
+    const flush=()=>{if(segment.length)segments.push(segment);segment=[]};
+    for(const p of quotePoints){
+      if(p[side]===null){flush();continue}
+      if(segment.length&&p.t-segment[segment.length-1].t>90)flush();
+      segment.push(p);
+    }
+    flush();
+    return segments.map(part=>part.length===1?`<circle class="history-${side}-dot" cx="${x(part[0].t).toFixed(2)}" cy="${y(part[0][side]).toFixed(2)}" r="2"/>`:`<path class="history-${side}-line" d="${part.map((p,i)=>`${i?'L':'M'}${x(p.t).toFixed(2)},${y(p[side]).toFixed(2)}`).join(' ')}"/>`).join('');
+  };
+  const horizontal=Array.from({length:5},(_,i)=>{const yy=5+i*22.5;return `<line x1="0" y1="${yy}" x2="728" y2="${yy}" class="history-grid"/>`}).join('');
+  const vertical=Array.from({length:7},(_,i)=>`<line x1="${i*728/6}" y1="5" x2="${i*728/6}" y2="95" class="history-grid time-grid"/>`).join('');
+  const ylabels=Array.from({length:5},(_,i)=>`<span>${esc(priceCents(max-i*span/4))}</span>`).join('');
+  const xlabels=Array.from({length:7},(_,i)=>`<span style="left:${i*100/6}%">${esc(historyDate(start+(end-start)*i/6))}</span>`).join('');
+  const last=pricePoints[pricePoints.length-1];
+  return `<div class="book-history-plot"><div class="history-axis-y">${ylabels}</div><div class="history-plot-main"><svg class="book-history-svg" viewBox="0 0 728 100" preserveAspectRatio="none" role="img" aria-label="История цены и снимков стакана ${historySide.toUpperCase()}"><title>Цена CLOB и сохранённые снимки BID/ASK. Время устройства.</title>${horizontal}${vertical}<line class="history-cursor" x1="0" x2="0" y1="5" y2="95" visibility="hidden"/><path class="history-line" d="${line}"/>${last?`<circle class="history-last" cx="${x(last.t).toFixed(2)}" cy="${y(last.p).toFixed(2)}" r="3"/>`:''}${series('bid',historyShowBid)}${series('ask',historyShowAsk)}</svg><div class="history-axis-x">${xlabels}</div></div></div><div class="book-history-value" aria-live="polite">${last?`Цена CLOB: ${esc(priceCents(last.p))} · ${esc(historyDate(last.t))}`:'Цена CLOB отсутствует.'}</div>`;
 }
+
 function bookHistory(option){
   const key=historyKey(),v=key&&historyView?.id===key.id?historyView:null;
   const sides=['yes','no'].map(x=>`<button type="button" class="history-side ${historySide===x?'active':''}" data-side="${x}" aria-pressed="${historySide===x}">${x.toUpperCase()}</button>`).join('');
   const periods=[['1h','1ч'],['6h','6ч'],['1d','1д'],['1w','1н'],['max','Всё']].map(([id,label])=>`<button type="button" class="history-period ${historyPeriod===id?'active':''}" data-period="${id}" aria-pressed="${historyPeriod===id}">${label}</button>`).join('');
-  let graph=!key?'<div class="book-chart-empty">Нет подтверждённого токена для истории.</div>':!v||v.status==='loading'?'<div class="book-chart-empty">Загрузка истории…</div>':v.status==='error'?`<div class="book-chart-empty">${esc(v.message)} <button type="button" class="history-retry">Повторить</button></div>`:historyGraph(v.data);
+  let graph=!key?'<div class="book-chart-empty">Нет подтверждённого токена для истории.</div>':!v||v.status==='loading'?'<div class="book-chart-empty">Загрузка истории…</div>':v.status==='error'?`<div class="book-chart-empty">${esc(v.message)} <button type="button" class="history-retry">Повторить</button></div>`:historyGraph(v.data,option);
   const book=bookFor(option,historySide),bid=book?.bids?.[0],ask=book?.asks?.[0];
-  return `<section class="book-history"><div class="book-history-head"><div><strong>История цены · ${esc(option.label)}</strong><small>Polymarket CLOB · время устройства</small></div><div class="history-controls" aria-label="Исход">${sides}</div><div class="history-controls" aria-label="Период">${periods}</div></div>${graph}<div class="book-history-note">Наведите на график для цены и времени. Историческая цена Polymarket, не история BID/ASK и не гарантия исполнения. Сейчас в снимке ${historySide.toUpperCase()}: BID ${bid?esc(priceCents(bid.price)):'—'} / ASK ${ask?esc(priceCents(ask.price)):'—'}${book?' · '+esc(new Date(book.fetched_at*1000).toLocaleTimeString('ru-RU')):''}. ${v?.status==='ready'?`Шаг запроса ${esc(v.data.fidelity_minutes)} мин; последняя точка может отставать.`:''}</div></section>`;
+  const overlays=`<div class="history-controls history-overlays" aria-label="Линии стакана"><button type="button" class="history-overlay bid ${historyShowBid?'active':''}" data-line="bid" aria-pressed="${historyShowBid}">● BID</button><button type="button" class="history-overlay ask ${historyShowAsk?'active':''}" data-line="ask" aria-pressed="${historyShowAsk}">● ASK</button></div>`;
+  return `<section class="book-history"><div class="book-history-head"><div><strong>История цены · ${esc(option.label)}</strong><small>Polymarket CLOB · время устройства</small></div><div class="history-controls" aria-label="Исход">${sides}</div><div class="history-controls" aria-label="Период">${periods}</div>${overlays}</div>${graph}<div class="book-history-note">Цена CLOB — отдельная серия; BID/ASK — реальные снимки терминала с момента наблюдения (не чаще 30 сек, хранение до 7 дней). Пробелы не соединяются; доступность данных и цены исполнения не гарантируются. Сейчас в снимке ${historySide.toUpperCase()}: BID ${bid?esc(priceCents(bid.price)):'—'} / ASK ${ask?esc(priceCents(ask.price)):'—'}${book?' · '+esc(new Date(book.fetched_at*1000).toLocaleTimeString('ru-RU')):''}. ${v?.status==='ready'?`Шаг цены ${esc(v.data.fidelity_minutes)} мин; ${esc(v.data.history_error||v.data.quote_error||'прошлые BID/ASK до наблюдения недоступны')}.`:''}</div></section>`;
 }
 function updateBookHistory(){
   const current=$('.book-history'),option=marketData?.market?.options?.[bookChoice];
@@ -619,11 +652,18 @@ function bindHistoryControls(){
   $$('.history-side').forEach(btn=>btn.onclick=()=>{historySide=btn.dataset.side;updateBookHistory();syncBookHistory()});
   $$('.history-period').forEach(btn=>btn.onclick=()=>{historyPeriod=btn.dataset.period;updateBookHistory();syncBookHistory()});
   const retry=$('.history-retry');if(retry)retry.onclick=()=>syncBookHistory(true);
+  $$('.history-overlay').forEach(btn=>btn.onclick=()=>{if(btn.dataset.line==='bid')historyShowBid=!historyShowBid;else historyShowAsk=!historyShowAsk;updateBookHistory()});
   const svg=$('.book-history-svg'),value=$('.book-history-value');
   if(svg&&value){
-    const points=historyView.data.history.filter(p=>typeof p.t==='number'&&Number.isFinite(p.t)&&typeof p.p==='number'&&Number.isFinite(p.p)&&p.p>=0&&p.p<=1).sort((a,b)=>a.t-b.t);
+    const data=historyView.data,option=marketData?.market?.options?.[bookChoice],now=Date.now()/1000,durations={'1h':3600,'6h':21600,'1d':86400,'1w':604800};
+    const prices=(Array.isArray(data.history)?data.history:[]).filter(p=>typeof p.t==='number'&&Number.isFinite(p.t)&&typeof p.p==='number'&&Number.isFinite(p.p)&&p.p>=0&&p.p<=1);
+    const quotes=(Array.isArray(data.quotes)?data.quotes:[]).filter(q=>typeof q.t==='number'&&Number.isFinite(q.t));
+    const book=bookFor(option,historySide),read=levels=>{if(!levels?.length)return null;const n=Number(levels[0].price);return Number.isFinite(n)&&n>=0&&n<=1?n:null};
+    if(book&&Number.isFinite(Number(book.fetched_at)))quotes.push({t:Number(book.fetched_at),bid:read(book.bids),ask:read(book.asks)});
+    const times=[...prices.map(p=>p.t),...quotes.map(p=>p.t)].filter(t=>t>0&&t<=now+60),start=durations[historyPeriod]?now-durations[historyPeriod]:(times.length?Math.min(...times):now-86400);
+    const candidates=[...prices.map(p=>({t:p.t,text:`Цена CLOB ${priceCents(p.p)}`})),...quotes.filter(q=>(historyShowBid&&typeof q.bid==='number')||(historyShowAsk&&typeof q.ask==='number')).map(q=>({t:q.t,text:[historyShowBid?'BID '+(q.bid==null?'—':priceCents(q.bid)):null,historyShowAsk?'ASK '+(q.ask==null?'—':priceCents(q.ask)):null].filter(Boolean).join(' / ')}))].filter(p=>p.t>=start&&p.t<=now+60);
     const original=value.textContent,cursor=svg.querySelector('.history-cursor');
-    svg.addEventListener('pointermove',e=>{const box=svg.getBoundingClientRect();if(!box.width||!points.length)return;const ratio=Math.max(0,Math.min(1,(e.clientX-box.left)/box.width));const target=points[0].t+ratio*(points[points.length-1].t-points[0].t);let nearest=points[0];for(const p of points)if(Math.abs(p.t-target)<Math.abs(nearest.t-target))nearest=p;const x=(points.length===1?0.5:(nearest.t-points[0].t)/(points[points.length-1].t-points[0].t))*728;cursor.setAttribute('x1',x);cursor.setAttribute('x2',x);cursor.setAttribute('visibility','visible');value.textContent=`${priceCents(nearest.p)} · ${historyDate(nearest.t)}`});
+    svg.addEventListener('pointermove',e=>{const box=svg.getBoundingClientRect();if(!box.width||!candidates.length)return;const ratio=Math.max(0,Math.min(1,(e.clientX-box.left)/box.width)),target=start+ratio*(now-start);let nearest=candidates[0];for(const p of candidates)if(Math.abs(p.t-target)<Math.abs(nearest.t-target))nearest=p;const x=Math.max(0,Math.min(728,(nearest.t-start)/Math.max(1,now-start)*728));cursor.setAttribute('x1',x);cursor.setAttribute('x2',x);cursor.setAttribute('visibility','visible');value.textContent=`${nearest.text} · ${historyDate(nearest.t)}`});
     svg.addEventListener('pointerleave',()=>{cursor.setAttribute('visibility','hidden');value.textContent=original});
   }
 }
@@ -1132,7 +1172,7 @@ $('#copy-form').onsubmit=async e=>{e.preventDefault();if(copyBusy)return;const f
   }catch(err){$('#copy-form-status').textContent=err.message}finally{copyBusy=false;button.disabled=false}
 };
 setInterval(()=>{if(!document.hidden){pollCopyNotice();if(!$('#copy-page').classList.contains('hidden'))loadCopyObserver()}},15000);
-$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(!document.hidden&&!state.demo)loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(overviewActive())loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
 
 // Portfolio is read-only. Never infer a station from a title or market name.
 let portfolioGeneration=0;

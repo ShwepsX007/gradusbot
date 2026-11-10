@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -97,6 +97,7 @@ def init_web_db():
     forecast_ensemble.init_db()
     forecast_history.init_db()
     ai_forecast.init_db()
+    book_history.init_db()
 
 
 
@@ -1296,6 +1297,8 @@ def market_books(slug):
         event = event_for_station(slug)
         if not event: return jsonify(error='Не удалось загрузить данные события'), 502
         data = fetch_event_books(event)
+        try: book_history.record(data)
+        except Exception: app.logger.warning('Could not save order-book history', exc_info=True)
         _books_cache[slug] = (time.time(), data)
         _books_cache.move_to_end(slug)
         while len(_books_cache) > 32:
@@ -1323,19 +1326,28 @@ def market_price_history(slug):
     key=(slug,token,period)
     with _history_lock:
         entry=_history_cache.get(key)
-        if entry and time.time()-entry[0]<60:
-            _history_cache.move_to_end(key)
-            return jsonify(entry[1])
-    if not _history_slots.acquire(blocking=False):
-        return jsonify(error='Слишком много запросов истории. Повторите позже.'),503
-    try: data=price_history.fetch_history(token,period)
-    finally: _history_slots.release()
-    if data is None: return jsonify(error='История цен Polymarket временно недоступна.'),502
-    with _history_lock:
-        _history_cache[key]=(time.time(),data)
-        _history_cache.move_to_end(key)
-        while len(_history_cache)>128: _history_cache.popitem(last=False)
-    return jsonify(data)
+        data=entry[1] if entry and time.time()-entry[0]<60 else None
+        if data is not None: _history_cache.move_to_end(key)
+    history_error=None
+    if data is None:
+        if not _history_slots.acquire(blocking=False):
+            history_error='Слишком много запросов истории цены. Повторите позже.'
+        else:
+            try: data=price_history.fetch_history(token,period)
+            finally: _history_slots.release()
+            if data is None: history_error='История цены Polymarket временно недоступна.'
+            else:
+                with _history_lock:
+                    _history_cache[key]=(time.time(),data)
+                    _history_cache.move_to_end(key)
+                    while len(_history_cache)>128: _history_cache.popitem(last=False)
+    try: snapshots=book_history.read(token,period);quote_error=None
+    except Exception:
+        app.logger.warning('Could not read order-book history', exc_info=True)
+        snapshots=[];quote_error='Локальная история BID/ASK недоступна.'
+    return jsonify(**(data or {'history':[],'fidelity_minutes':price_history.PERIODS[period],'fetched_at':None}),
+                   quotes=snapshots,history_error=history_error,quote_error=quote_error)
+
 
 
 @app.get('/api/search')
