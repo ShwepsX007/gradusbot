@@ -101,7 +101,7 @@ def init_web_db():
 
 
 init_web_db()
-from web import copy_observer, auto_scalp, orderbook
+from web import copy_observer, auto_scalp, orderbook, price_history
 copy_observer.init_db()
 auto_scalp.init_db()
 _lock = threading.RLock()
@@ -1300,6 +1300,41 @@ def market_books(slug):
         _books_cache.move_to_end(slug)
         while len(_books_cache) > 32:
             _books_cache.popitem(last=False)
+    return jsonify(data)
+
+
+_history_lock = threading.Lock()
+_history_cache = OrderedDict()
+_history_slots = threading.BoundedSemaphore(4)
+
+
+@app.get('/api/market/<slug>/price-history')
+def market_price_history(slug):
+    token=request.args.get('token', '')
+    period=request.args.get('period', '1d')
+    side=request.args.get('side', '')
+    if not valid_slug(slug) or not re.fullmatch(r'[0-9]{1,80}',token) or period not in price_history.PERIODS or side not in ('yes','no'):
+        return jsonify(error='Неверный рынок, исход или период.'),400
+    event=event_for_station(slug)
+    if not event: return jsonify(error='Не удалось проверить событие Polymarket.'),502
+    pairs=orderbook.event_tokens(event)
+    if sum(token in (pair['yes'],pair['no']) for pair in pairs)!=1 or not any(pair[side]==token for pair in pairs):
+        return jsonify(error='Исход не подтверждён для этого события.'),404
+    key=(slug,token,period)
+    with _history_lock:
+        entry=_history_cache.get(key)
+        if entry and time.time()-entry[0]<60:
+            _history_cache.move_to_end(key)
+            return jsonify(entry[1])
+    if not _history_slots.acquire(blocking=False):
+        return jsonify(error='Слишком много запросов истории. Повторите позже.'),503
+    try: data=price_history.fetch_history(token,period)
+    finally: _history_slots.release()
+    if data is None: return jsonify(error='История цен Polymarket временно недоступна.'),502
+    with _history_lock:
+        _history_cache[key]=(time.time(),data)
+        _history_cache.move_to_end(key)
+        while len(_history_cache)>128: _history_cache.popitem(last=False)
     return jsonify(data)
 
 
