@@ -62,6 +62,7 @@ class ScalpDemoTests(unittest.TestCase):
         with patch.object(scalp.trading_account,'load',side_effect=AssertionError('keys forbidden')):
             scalp.process_books(self.items,{T:book(self.now)},self.now)
         self.assertEqual(len(scalp.status()['journal']),1)
+        entry=scalp.status()['journal'][0];self.assertEqual(entry['token'],T);self.assertEqual(entry['condition_id'],C);self.assertEqual(entry['event_slug'],market(self.now)['slug'])
 
     def test_api_rejects_live_and_requires_auth_tunnel_csrf(self):
         from web import app as web

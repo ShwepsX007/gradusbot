@@ -100,7 +100,9 @@ def status():
         cfg=dict(c.execute('SELECT * FROM web_scalp_config WHERE id=1').fetchone());cfg['settings']=json.loads(cfg['settings'])
         positions=[dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id DESC')]
         positions.extend(dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NOT NULL ORDER BY id DESC LIMIT 100'))
-        logs=[dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_log ORDER BY id DESC LIMIT 200')]
+        logs=[dict(x) for x in c.execute('''SELECT l.*,p.token,p.condition_id,p.event_slug,p.title,p.label
+            FROM web_scalp_demo_log l LEFT JOIN web_scalp_demo_positions p ON p.id=l.position_id
+            ORDER BY l.id DESC LIMIT 200''')]
     age=time.time()-cfg['heartbeat'] if cfg['heartbeat'] else None
     cfg['service']='running' if age is not None and -10<=age<=max(90,3*cfg['settings']['interval_seconds']) else 'stale' if age is not None else 'not_running'
     return {'config':cfg,'positions':positions,'journal':logs,'real_available':False}

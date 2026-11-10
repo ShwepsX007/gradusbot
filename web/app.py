@@ -101,7 +101,7 @@ def init_web_db():
 
 
 init_web_db()
-from web import copy_observer, auto_scalp
+from web import copy_observer, auto_scalp, orderbook
 copy_observer.init_db()
 auto_scalp.init_db()
 _lock = threading.RLock()
@@ -953,6 +953,10 @@ def add_market_station():
     if result['status'] != 'found' or data.get('code') != result['candidate']['code']:
         return jsonify(error='Источник не подтверждён или станция изменилась. Проверьте правила заново.'), 409
     code = result['candidate']['code']
+    return jsonify(ensure_market_station(slug,event,code))
+
+
+def ensure_market_station(slug,event,code,market_enabled=True):
     # Never turn on a newly discovered station or strategy. Atomic reuse/add avoids duplicates.
     with db.get_db() as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -966,12 +970,62 @@ def add_market_station():
         market = conn.execute('SELECT * FROM markets WHERE slug=? ORDER BY id LIMIT 1', (slug,)).fetchone()
         name = market['name'] if market else event['title']
         if not market:
-            conn.execute("INSERT INTO markets (name,slug,enabled,last_probs) VALUES (?,?,1,'{}')", (name, slug))
+            conn.execute("INSERT INTO markets (name,slug,enabled,last_probs) VALUES (?,?,?,'{}')", (name, slug, int(market_enabled)))
         binding = conn.execute('SELECT id FROM station_market_bindings WHERE station_id=? AND market_slug=? LIMIT 1', (sid, slug)).fetchone()
         already_bound = binding is not None
         if not binding:
             conn.execute('INSERT INTO station_market_bindings (station_id,market_slug,market_name) VALUES (?,?,?)', (sid, slug, name))
-    return jsonify(station=public_station(dict(station)), created_station=created, already_bound=already_bound, slug=slug)
+    return dict(station=public_station(dict(station)), created_station=created, already_bound=already_bound, slug=slug)
+
+
+@app.post('/api/market-station/quick-open')
+def quick_open_market_station():
+    """User-initiated add/open; never guess a station or send a trade."""
+    data=market_input()
+    if data.get('confirm') is not True: return jsonify(error='Подтвердите добавление рынка.'),400
+    raw_slug=data.get('slug') or ''
+    token=data.get('token') or ''
+    condition=data.get('condition_id') or ''
+    if not isinstance(raw_slug,str) or len(raw_slug)>200 or (raw_slug and not re.fullmatch(r'[a-z0-9-]{1,200}',raw_slug)):
+        return jsonify(error='Неверный адрес события.'),400
+    if not isinstance(token,str) or (token and not re.fullmatch(r'[0-9]{1,80}',token)):
+        return jsonify(error='Неверный идентификатор исхода.'),400
+    if not isinstance(condition,str) or (condition and not re.fullmatch(r'0x[0-9a-fA-F]{64}',condition)):
+        return jsonify(error='Неверный идентификатор рынка.'),400
+    condition=condition.lower()
+    slug=raw_slug
+    if not slug:
+        if not token: return jsonify(error='Нет адреса события или идентификатора исхода.'),400
+        try: info=copy_observer.metadata([token]).get(token)
+        except copy_observer.ObserverError: return jsonify(error='Не удалось определить событие по исходу. Попробуйте позже.'),502
+        if not info or (condition and info.get('condition_id')!=condition):
+            return jsonify(error='Не удалось подтвердить событие и рынок по исходу.'),409
+        slug=info.get('event_slug') or ''
+        if not re.fullmatch(r'[a-z0-9-]{1,200}',slug): return jsonify(error='Polymarket не вернул допустимый адрес события.'),409
+    event,result=market_resolution(slug)
+    if result is None: return jsonify(error='Не удалось загрузить правила события из Polymarket.'),502
+    # If a signal identifies a market, verify that it belongs to this event.
+    # Match by token, never by title or guessed YES/NO index.
+    selection=None
+    if token or condition:
+        markets=event.get('markets') if isinstance(event.get('markets'),list) else []
+        matches=[]
+        for market in markets:
+            if not isinstance(market,dict):continue
+            mid=str(market.get('conditionId') or market.get('condition_id') or '').lower()
+            if condition and mid!=condition:continue
+            ids=orderbook._list(market.get('clobTokenIds'))+orderbook._list(market.get('positionIds'))
+            if token and token not in [str(x) for x in ids]:continue
+            matches.append(market)
+        if len(matches)!=1:return jsonify(error='Не удалось однозначно подтвердить исход и рынок в событии. Привязка не создана.'),409
+        market=matches[0];names=orderbook._list(market.get('outcomes'));ids=orderbook._list(market.get('clobTokenIds'))
+        if token and len(names)==2 and len(ids)==2 and all(isinstance(x,str) for x in names):
+            names=[x.strip().lower() for x in names];ids=[str(x) for x in ids]
+            if sorted(names)==['no','yes'] and len(set(ids))==2 and token in ids: selection=names[ids.index(token)]
+    if result['status']!='found':return jsonify(needs_review=True, resolution=result, slug=slug)
+    saved=ensure_market_station(slug,event,result['candidate']['code'],market_enabled=False)
+    saved.update(needs_review=False,token=token,selection=selection)
+    return jsonify(saved)
 
 
 @app.post('/api/markets')

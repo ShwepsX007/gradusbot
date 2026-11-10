@@ -146,6 +146,82 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(len(web.db.get_bindings(sid)), 1)
             self.assertEqual(fetch.call_count, 4)  # resolution is refreshed before each confirmed binding
 
+    def test_quick_open_creates_or_reuses_station_and_verifies_token(self):
+        slug='highest-temperature-in-london-on-may-1-2026';condition='0x'+'a'*64
+        event={'title':'London', 'resolutionSource':'https://aviationweather.gov/api/data/metar?ids=EGLL',
+               'markets':[{'conditionId':condition,'outcomes':['No','Yes'],'clobTokenIds':'["123","456"]'}]}
+        body={'slug':slug,'token':'123','condition_id':condition,'confirm':True}
+        from web import trading_orders
+        with patch.object(web,'upstream',return_value=event),patch.object(trading_orders,'submit',side_effect=AssertionError('must not trade')):
+            first=self.client.post('/api/market-station/quick-open',json=body)
+            self.assertEqual(first.status_code,200);data=first.get_json()
+            self.assertFalse(data['needs_review']);self.assertEqual(data['selection'],'no');self.assertTrue(data['created_station']);self.assertFalse(data['station']['enabled'])
+            sid=data['station']['id'];self.assertEqual(len(web.db.get_bindings(sid)),1)
+            second=self.client.post('/api/market-station/quick-open',json=body).get_json()
+            self.assertTrue(second['already_bound']);self.assertEqual(len(web.db.get_stations()),1);self.assertEqual(len(web.db.get_bindings(sid)),1)
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json={**body,'token':'999'}).status_code,409)
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json={**body,'condition_id':'0x'+'b'*64}).status_code,409)
+        self.assertEqual(len(web.db.get_markets()),1);self.assertEqual(web.db.get_markets()[0]['enabled'],0)
+
+    def test_quick_open_auth_csrf_and_upstream_failure(self):
+        body={'slug':'london-event','token':'123','confirm':True}
+        unauth=web.app.test_client()
+        with patch.object(web,'upstream') as fetch:
+            self.assertEqual(unauth.post('/api/market-station/quick-open',json=body).status_code,401)
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json=body,headers={'X-CSRF-Token':'invalid'}).status_code,403)
+            fetch.assert_not_called()
+        with patch.object(web,'upstream',side_effect=RuntimeError('offline')):
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json=body).status_code,502)
+        self.assertEqual(web.db.get_stations(),[]);self.assertEqual(web.db.get_markets(),[])
+
+    def test_quick_open_reuses_enabled_station_and_preserves_existing_settings(self):
+        sid=web.db.add_station('Custom', '', '', 'EGLL', 'metar');web.db.update_station(sid,enabled=1)
+        condition='0x'+'a'*64
+        event={'title':'London','description':'ICAO: EGLL','markets':[{'conditionId':condition,'outcomes':['Yes','No'],'clobTokenIds':['456','123']}]}
+        body={'slug':'london-event','token':'123','condition_id':condition,'confirm':True}
+        with patch.object(web,'upstream',return_value=event):
+            result=self.client.post('/api/market-station/quick-open',json=body).get_json()
+        self.assertEqual(result['station']['id'],sid);self.assertEqual(web.db.get_station(sid)['enabled'],1)
+        binding=web.db.get_bindings(sid)[0]
+        self.assertEqual(web.db.get_binding_setting(binding['id'],'enabled','0'),'0')
+        self.assertEqual(web.db.get_markets()[0]['enabled'],0)
+        web.db.update_market(web.db.get_markets()[0]['id'],enabled=1)
+        with patch.object(web,'upstream',return_value=event):
+            self.client.post('/api/market-station/quick-open',json=body)
+        self.assertEqual(web.db.get_markets()[0]['enabled'],1)
+
+    def test_quick_open_missing_slug_uses_verified_token_metadata(self):
+        condition='0x'+'a'*64;event={'title':'London','description':'ICAO: EGLL',
+              'markets':[{'conditionId':condition,'outcomes':['Yes','No'],'clobTokenIds':['456','123']}]}
+        body={'token':'123','condition_id':condition,'confirm':True}
+        with patch.object(web.copy_observer,'metadata',return_value={'123':{'condition_id':condition,'event_slug':'london-event'}}),patch.object(web,'upstream',return_value=event):
+            result=self.client.post('/api/market-station/quick-open',json=body)
+            self.assertEqual(result.status_code,200);self.assertEqual(result.get_json()['selection'],'no')
+        with patch.object(web.copy_observer,'metadata',return_value={'123':{'condition_id':'0x'+'b'*64,'event_slug':'bad-event'}}),patch.object(web,'upstream') as get:
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json=body).status_code,409);get.assert_not_called()
+        with patch.object(web.copy_observer,'metadata',side_effect=web.copy_observer.ObserverError('failure')):
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json=body).status_code,502)
+        self.assertEqual(len(web.db.get_markets()),1)
+
+    def test_quick_open_never_guesses_conflicting_station_or_outcome(self):
+        condition='0x'+'a'*64;body={'slug':'event','token':'123','condition_id':condition,'confirm':True}
+        event={'title':'Event','description':'ICAO: EGLL ICAO: EGLC','markets':[{'conditionId':condition,'outcomes':['No','Yes'],'clobTokenIds':['123','456']}]}
+        with patch.object(web,'upstream',return_value=event):
+            response=self.client.post('/api/market-station/quick-open',json=body)
+            self.assertTrue(response.get_json()['needs_review']);self.assertEqual(response.get_json()['resolution']['status'],'conflict')
+        self.assertEqual(web.db.get_stations(),[]);self.assertEqual(web.db.get_markets(),[])
+        event['description']='ICAO: EGLL';event['markets'][0]['outcomes']=['unknown','other']
+        with patch.object(web,'upstream',return_value=event):
+            self.assertIsNone(self.client.post('/api/market-station/quick-open',json=body).get_json()['selection'])
+        # A missing, malformed or ambiguous token never reaches the network or creates a binding.
+        with patch.object(web,'upstream') as get:
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json={**body,'slug':'https://evil/','token':'123'}).status_code,400)
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json={**body,'token':'1 OR 1=1'}).status_code,400)
+            self.assertEqual(self.client.post('/api/market-station/quick-open',json={**body,'confirm':False}).status_code,400)
+            get.assert_not_called()
+        event['markets'].append(event['markets'][0])
+        with patch.object(web,'upstream',return_value=event):self.assertEqual(self.client.post('/api/market-station/quick-open',json=body).status_code,409)
+
     def test_rules_are_refreshed_before_binding(self):
         first = {'title':'Manila','resolutionSource':'https://aviationweather.gov/api/data/metar?ids=RPLL'}
         changed = {'title':'Manila','resolutionSource':'https://aviationweather.gov/api/data/metar?ids=KLGA'}
