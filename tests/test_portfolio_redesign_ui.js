@@ -4,9 +4,9 @@ const vc=new VirtualConsole();vc.on('jsdomError',e=>{throw e});
 const dom=new JSDOM(fs.readFileSync('web/static/index.html','utf8'),{url:'http://127.0.0.1:8108',runScripts:'outside-only',pretendToBeVisual:true,virtualConsole:vc});
 const w=dom.window;let calls=[],mode='normal';w.confirm=()=>false;
 const portfolio={wallet:'0x123',balance:'3.83',value:9.18,errors:['История частично недоступна.'],orders_partial:true,positions_partial:true,activity_partial:false,
- positions:[{asset:'a',event_slug:'london',title:'London <img id="bad">',outcome:'No',size:12,value:9.18,pnl:-2.58},{asset:'b',event_slug:'paris',title:'Paris',outcome:'Yes',size:5,value:null,pnl:null}],
+ positions:[{asset:'a',event_slug:'london',title:'London <img id="bad">',outcome:'No',size:12,value:9.18,pnl:-2.58,avg_price:.2,bid:.4,bid_size:2,bid_at:1234},{asset:'b',event_slug:'paris',title:'Paris',outcome:'Yes',size:5,value:null,pnl:null}],
  orders:[{asset_id:'a',id:'0x'+'a'.repeat(64),side:'SELL',price:.99,size_matched:2,original_size:12,status:'LIVE'},{asset_id:'unmapped',id:'0x'+'b'.repeat(64),side:'BUY',price:null,size_matched:0,original_size:10,status:'LIVE'}],
- intents:[],activity:[{event_slug:'london',title:'London',outcome:'No',type:'TRADE',side:'BUY',size:12,value:11.77,timestamp:1234}],pnl:[{timestamp:100,value:1},{timestamp:200,value:null},{timestamp:300,value:-2}]};
+ intents:[],activity:[{event_slug:'london',title:'London',outcome:'No',type:'TRADE',side:'BUY',price:.2,size:12,value:11.77,timestamp:1234},{event_slug:'paris',type:'TRADE',side:'SELL',price:.6,size:2,timestamp:1234}],pnl:[{timestamp:100,value:1},{timestamp:200,value:null},{timestamp:300,value:-2}]};
 const markets=[{name:'London weather',slug:'london'},{name:'Paris <img id="bad2">',slug:'paris'}];
 w.fetch=async(url,options={})=>{calls.push([url,options]);let data;
  if(url==='/api/session')data={csrf:'x'};else if(url==='/api/settings')data={units:'C'};
@@ -25,6 +25,7 @@ const tick=()=>new Promise(r=>setTimeout(r,30));
  assert.equal(rows('portfolio-positions').length,2);assert.equal(rows('portfolio-orders').length,2);assert(!get('bad'));assert.equal(rows('portfolio-positions')[0].querySelector('.portfolio-pill').textContent,'No');
  assert(rows('portfolio-positions')[0].textContent.includes('-2,58'));assert(rows('portfolio-positions')[1].textContent.includes('—'));
  assert(rows('portfolio-orders')[0].textContent.includes('London'));assert.equal(rows('portfolio-orders')[0].querySelector('.portfolio-market-copy small').title,'0x'+'a'.repeat(64));assert(rows('portfolio-orders')[0].textContent.includes('2 / 12'));assert(rows('portfolio-orders')[0].textContent.includes('99¢'));assert.equal(rows('portfolio-orders')[0].querySelector('.portfolio-open').dataset.slug,'london');assert.equal(rows('portfolio-orders')[1].querySelector('.portfolio-open').dataset.slug,'');
+ assert(rows('portfolio-positions')[0].textContent.includes('20¢ / 40¢'));assert(rows('portfolio-positions')[0].textContent.includes('2 долей'));assert(rows('portfolio-activity')[0].textContent.includes('Вход 20¢'));assert(rows('portfolio-activity')[1].textContent.includes('Вход — · выход 60¢'));
  assert(get('portfolio-panel-orders').textContent.includes('не обязательно рассчитано'));assert(get('portfolio-activity').textContent.includes('Покупка'));assert.equal(get('portfolio-pnl').querySelectorAll('polyline').length,2);
  assert(!w.document.querySelector('#portfolio-page .account-cancel'));assert(!w.document.querySelector('#portfolio-page #trade-submit'));
  const before=calls.length,search=get('portfolio-search');search.value='london';search.dispatchEvent(new w.Event('input',{bubbles:true}));

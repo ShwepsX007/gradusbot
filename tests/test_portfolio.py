@@ -41,6 +41,41 @@ class PortfolioTests(unittest.TestCase):
         self.assertIsNone(snapshot['pnl'][0]['value']);self.assertEqual(snapshot['pnl'][1]['value'],1.5)
         self.assertIn('Стоимость портфеля Data API недоступна.',snapshot['errors'])
         self.assertNotIn('secret',str(snapshot));self.assertFalse(snapshot['orders_partial'])
+    def test_prices_and_books_are_not_inferred(self):
+        def get(path, params):
+            if path == 'positions':
+                rows = [{'token_id':'12','event_slug':'event','current_size':4,'avg_price':0.35},
+                        {'token_id':'13','current_size':2,'avg_price':None},
+                        {'token_id':'14','current_size':2,'avg_price':0.4}]
+                return {'data': rows, 'pagination': {'has_more':False,'next_cursor':None}}
+            if path == 'activity':
+                return {'data':[{'type':'TRADE','side':'SELL','price':0.65},{'type':'TRADE','side':'BUY','price':0.2}], 'pagination':{'has_more':False,'next_cursor':None}}
+            if path == 'value': return {'data': {'value': 1}}
+            return {'data': {'points': []}}
+        books={'12':{'bids':[{'price':'0.6','size':'1.5'}], 'fetched_at':123},
+               '13':{'bids':[], 'fetched_at':124}, '14':None}
+        with patch.object(portfolio,'_get',side_effect=get), patch.object(portfolio.orderbook,'fetch_batch',return_value=books) as fetch, patch.object(portfolio,'_open_orders',return_value=([],False)), patch.object(account,'_balance',return_value='2'):
+            result=portfolio.snapshot()
+        fetch.assert_called_once_with(['12','13','14'])
+        a,b,c=result['positions']
+        self.assertEqual((a['avg_price'],a['bid'],a['bid_size'],a['bid_at']),(0.35,0.6,1.5,123))
+        self.assertIsNone(b['bid']);self.assertEqual(b['bid_at'],124)
+        self.assertIsNone(c['bid']);self.assertIsNone(c['bid_at'])
+        self.assertEqual([a['price'] for a in result['activity']],[0.65,0.2])
+        self.assertNotIn('avg_price',result['activity'][0])
+
+    def test_quote_cap_and_invalid_tokens(self):
+        rows=[{'token_id':str(i+1),'current_size':1} for i in range(105)]+[{'token_id':'invalid','current_size':1},{'token_id':'200','current_size':0}]
+        def get(path,params):
+            if path=='positions': return {'data':rows,'pagination':{'has_more':False,'next_cursor':None}}
+            if path=='activity': return {'data':[],'pagination':{'has_more':False,'next_cursor':None}}
+            if path=='value': return {'data':{'value':0}}
+            return {'data':{'points':[]}}
+        with patch.object(portfolio,'_get',side_effect=get),patch.object(portfolio.orderbook,'fetch_batch',return_value={}) as fetch,patch.object(portfolio,'_open_orders',return_value=([],False)),patch.object(account,'_balance',return_value='0'):
+            result=portfolio.snapshot()
+        self.assertTrue(result['quotes_partial']);self.assertEqual(sum(len(c.args[0]) for c in fetch.call_args_list),100)
+        self.assertIsNone(result['positions'][-1]['bid'])
+
     def test_account_changed_while_reading(self):
         c=account.load()
         with patch.object(account,'load',side_effect=[c,{**c,'funder':'0x'+'3'*40}]),patch.object(portfolio,'_get',side_effect=RuntimeError()),patch.object(portfolio,'_open_orders',side_effect=RuntimeError()),patch.object(account,'_balance',side_effect=RuntimeError()):

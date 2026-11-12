@@ -4,7 +4,8 @@ import requests
 from importlib.metadata import version
 from py_clob_client_v2.constants import INITIAL_CURSOR, END_CURSOR
 from py_clob_client_v2.endpoints import ORDERS
-from web import trading_orders
+from web import trading_orders, orderbook
+import re
 
 BASE = 'https://data-api.polymarket.com/v2/'
 PAGE_LIMIT = 5  # Limit latency; the response explicitly reports truncation.
@@ -88,17 +89,37 @@ def snapshot():
         result['positions'] = [{'asset': account._string(p.get('token_id') or p.get('position_id') or p.get('asset_id'), 100),
             'event_slug': account._string(p.get('event_slug')), 'title': account._string(p.get('title')),
             'outcome': account._string(p.get('outcome'), 80), 'size': account._number(p.get('current_size')),
+            'avg_price': account._number(p.get('avg_price')),
             'value': account._number(p.get('current_value')), 'pnl': account._number(p.get('total_pnl')),
             'redeemable': p.get('redeemable') is True} for p in rows]
     except Exception:
         result['errors'].append('Позиции Data API недоступны.')
+    # Public order books are separate, time-stamped snapshots, not executions.
+    # Bound quote requests independently of position pagination.
+    if result['positions'] is not None:
+        tokens = list(dict.fromkeys(p['asset'] for p in result['positions']
+                      if re.fullmatch(r'[0-9]{1,80}', p['asset']) and p['size'] is not None and p['size'] > 0))
+        selected = tokens[:orderbook.MAX_TOKENS]
+        books = {}
+        for i in range(0, len(selected), orderbook.BATCH_SIZE):
+            try:
+                books.update(orderbook.fetch_batch(selected[i:i + orderbook.BATCH_SIZE]))
+            except Exception:
+                pass  # Missing quotes are not zero prices.
+        result['quotes_partial'] = len(tokens) > len(selected)
+        for p in result['positions']:
+            book = books.get(p['asset'])
+            bid = book['bids'][0] if book and book.get('bids') else None
+            p['bid'] = account._number(bid.get('price')) if bid else None
+            p['bid_size'] = account._number(bid.get('size')) if bid else None
+            p['bid_at'] = account._number(book.get('fetched_at')) if book else None
     try:
         rows, result['activity_partial'] = _pages('activity', wallet, {'start': 1, 'exclude_deposits_withdrawals': 'false'})
         result['activity'] = [{'event_slug': account._string(p.get('event_slug')), 'title': account._string(p.get('title')),
             'asset': account._string(p.get('token_id') or p.get('asset_id'), 100),
             'outcome': account._string(p.get('outcome'), 80), 'type': account._string(p.get('type'), 40),
             'side': account._string(p.get('side'), 10), 'size': account._number(p.get('size')),
-            'value': account._number(p.get('usdc_size')), 'timestamp': account._number(p.get('timestamp') or p.get('block_timestamp'))} for p in rows]
+            'value': account._number(p.get('usdc_size')), 'price': account._number(p.get('price')), 'timestamp': account._number(p.get('timestamp') or p.get('block_timestamp'))} for p in rows]
     except Exception:
         result['errors'].append('История Data API недоступна.')
     try:

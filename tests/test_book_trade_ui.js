@@ -6,7 +6,7 @@ const w=dom.window,calls=[],messages=[],timers=[];w.setInterval=(fn,ms)=>{timers
 const stations=[{id:1,name:'Лондон <img id="inject">',station_code:'EGLL',station_type:'metar',enabled:0},{id:2,name:'Париж',station_code:'LFPG',station_type:'metar',enabled:1}];
 const opts=[{label:'20°C',token_yes:'101',token_no:'102'},{label:'21°C',token_yes:'201',token_no:'202'}];
 const book={bids:[{price:'0.40',size:'50'}],asks:[{price:'0.45',size:'30'}],fetched_at:Date.now()/1000};
-const positions=[{asset:'101',event_slug:'first',title:'L',size:3.456},{asset:'102',event_slug:'first',title:'L',size:2.5},{asset:'201',event_slug:'first',title:'L',size:7}];
+const positions=[{asset:'101',event_slug:'first',title:'L',size:3.456,avg_price:.31},{asset:'102',event_slug:'first',title:'L',size:2.5,avg_price:.73},{asset:'201',event_slug:'first',title:'L',size:7}];
 let release=null,mode='ok',unknown=false,tradeEnabled=true;
 w.fetch=async(url,o={})=>{calls.push([url,o]);let data;
  if(url==='/api/session')data={csrf:'x'};else if(url==='/api/settings')data={units:'C'};
@@ -33,11 +33,12 @@ const tick=()=>new Promise(r=>setTimeout(r,25)),get=s=>w.document.querySelector(
 function set(field,value){const input=get(`.book-trade [data-field="${field}"]`);input.value=value;input.dispatchEvent(new w.Event('input',{bubbles:true}))}
 (async()=>{
  await tick();await tick();await tick();
+ assert(get('#market-position-note').textContent.includes('Отсутствие отметки'));assert(get('.market-tab[data-slug=first]').classList.contains('has-position'));assert(!get('.market-tab[data-slug=second]').classList.contains('has-position'));
  // Dropdown is searchable by name/ICAO; selecting uses the same safe weather navigation.
  get('#station-picker').open=true;get('#station-picker-search').value='lfpg';get('#station-picker-search').dispatchEvent(new w.Event('input'));
  assert.equal(all('.station-picker-item').length,1);get('.station-picker-item').click();await tick();assert.equal(get('#station-code').textContent,'LFPG');assert(!get('#station-picker').open);assert(get('.station-tab[data-id="2"]').classList.contains('active'));
  get('#station-picker-search').value='';get('#station-picker-search').dispatchEvent(new w.Event('input'));assert(!get('#inject'));get('.station-picker-item[data-id="1"]').click();await tick();await tick();assert.equal(get('#station-code').textContent,'EGLL');
- get('.book-toggle[data-index="0"]').click();await tick();assert(get('.book-trade'));assert.equal(all('.book-prepare-sale').length,2);assert.equal(posts().length,0);
+ get('.book-toggle[data-index="0"]').click();await tick();assert(get('.book-trade'));assert(get('.book-trade-positions').textContent.includes('средний вход 31¢'));assert(get('.book-trade-positions').textContent.includes('средний вход 73¢'));assert.equal(all('.book-prepare-sale').length,2);assert.equal(posts().length,0);
  // Sale fills only a local, confirmed draft; never sends and respects quantity precision.
  get('.book-prepare-sale[data-asset="102"]').click();assert.equal(posts().length,0);assert.equal(get('.book-trade [data-field="token"]').value,'no');assert.equal(get('.book-trade [data-field="action"]').value,'SELL');assert.equal(get('.book-trade [data-field="size"]').value,'2.5');assert.equal(get('.book-trade [data-field="price"]').value,'40');
  assert.equal(get('#trade-action').value,'BUY');
@@ -60,7 +61,7 @@ function set(field,value){const input=get(`.book-trade [data-field="${field}"]`)
  // Trading switch applies to both forms and is enforced without sending a request.
  w.document.querySelector('[data-page="settings"]').click();await tick();const ctl=get('#trade-control-form');ctl.elements.enabled.value='false';ctl.elements.current_password.value='pw';ctl.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await tick();w.document.querySelector('[data-page="weather"]').click();await tick();await tick();assert(get('.book-trade-submit').disabled);assert(get('#trade-submit').disabled);const stopped=posts().length;get('.book-trade-submit').click();assert.equal(posts().length,stopped);
  // Stale snapshot prevents a one-click sale draft.
- w.Date.now=()=>Date.now()+70000;w.renderAccountSnapshot();assert(all('.book-prepare-sale').every(b=>b.disabled));assert(get('.book-trade-positions').textContent.includes('УСТАРЕЛ'));w.Date.now=Date.now;
+ w.Date.now=()=>Date.now()+70000;w.renderAccountSnapshot();assert(all('.book-prepare-sale').every(b=>b.disabled));assert(get('.book-trade-positions').textContent.includes('УСТАРЕЛ'));assert(get('.market-tab[data-slug=first]').classList.contains('position-stale'));assert(get('#market-position-note').textContent.includes('УСТАРЕЛА'));w.Date.now=Date.now;
  // Different event and range cannot inherit the old draft or its selected token.
  all('.market-tab')[1].click();await tick();await tick();get('.book-toggle').click();await tick();assert.equal(get('.book-trade [data-field="price"]').value,'');assert.equal(get('.book-trade [data-field="size"]').value,'');assert(get('.book-trade-heading').textContent.includes('Other'));
  assert(!calls.some(([u,o])=>/^\/api\/stations\/\d+$/.test(u)&&o.method==='PATCH'));
