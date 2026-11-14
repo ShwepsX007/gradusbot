@@ -464,6 +464,12 @@ async function loadTradeJournal(){
   try{
     const slug=state.market;if(!slug){$('#trade-journal').innerHTML='';return}
     const data=await api('/api/trading/intents?slug='+encodeURIComponent(slug));if(state.market!==slug)return;
+    const auto=await api('/api/trading/auto-sell').catch(()=>null);if(state.market!==slug)return;
+    const area=$('#auto-sell-status');if(area){
+      const plans=(auto?.plans||[]).filter(p=>p.slug===slug),stateLabel={active:'Активно',paused:'Пауза',halt:'Проверить вручную',done:'Завершено'};
+      area.innerHTML=`<div class="account-list-title">АВТОПРОДАЖА · ${auto?.running?'СЛУЖБА РАБОТАЕТ':'СЛУЖБА НЕДОСТУПНА'}</div>`+plans.map(p=>`<div class="account-item"><b>+${esc(priceCents(p.offset))} · ${esc(stateLabel[p.state]||p.state)}</b><span>${esc(p.reason||'Ожидаем сверку')}</span>${['paused','active'].includes(p.state)?`<button type="button" class="button secondary auto-sell-control" data-command="${p.state==='paused'?'resume':'pause'}" data-nonce="${esc(p.buy_nonce)}">${p.state==='paused'?'Возобновить':'Пауза'}</button>`:''}</div>`).join('');
+      area.querySelectorAll('.auto-sell-control').forEach(b=>b.onclick=async()=>{const cmd=b.dataset.command;if(!confirm(cmd==='resume'?'Возобновить автоматическую продажу по этому плану?':'Приостановить автопродажу? Уже выставленный SELL останется на бирже.'))return;try{await api('/api/trading/auto-sell/'+cmd,{method:'POST',body:JSON.stringify({nonce:b.dataset.nonce,confirm:true})});await loadTradeJournal()}catch(e){toast(e.message)}})
+    }
     const rows=(data.intents||[]).filter(x=>x.slug===slug);
     $('#trade-journal').innerHTML=rows.length?'<div class="account-list-title">ЖУРНАЛ ОТПРАВОК И СВЕРКА СДЕЛОК</div>'+rows.map(x=>{
       const state=x.state==='accepted'?'Подтверждён ордер CLOB':x.state==='not_sent'?'Не отправлен':'РЕЗУЛЬТАТ НЕИЗВЕСТЕН — не повторяйте';
@@ -484,11 +490,14 @@ async function submitTrade(draft,quickKey=null){
   if(d.index===''||!o||!bookFor(o,d.token)||(quickKey&&(!confirmedMarketTokens().has(d.token==='yes'?o.token_yes:o.token_no)||quickKey!==bookTradeKey(o)))){toast('Выберите подтверждённый исход с доступным стаканом.');return}
   const price=Number(d.price),size=Number(d.size),asset=d.token==='yes'?o.token_yes:o.token_no;
   if(!Number.isFinite(price)||price<=0||price>=100||!Number.isFinite(size)||size<=0){toast('Укажите допустимую цену и количество.');return}
+  const auto=quickKey&&d.action==='BUY'&&d.auto_sell_cents!==''?Number(d.auto_sell_cents):null;
+  if(auto!==null&&(!Number.isFinite(auto)||auto<=0||auto>=100||Math.abs(auto*100-Math.round(auto*100))>1e-8)){toast('Укажите автопродажу от 0 до 100 центов с точностью 0,01.');return}
   const isMarket=d.type==='FAK',unit=isMarket&&d.action==='BUY'?'pUSD':'долей';
   const estimate=estimateForDraft(d);
   const message=`РЕАЛЬНЫЙ ОРДЕР: ${state.market} · ${o.label} · ${d.token.toUpperCase()} · ${d.action} · ${isMarket?'РЫНОЧНЫЙ FAK':'ЛИМИТНЫЙ GTC'} · ${isMarket?(d.action==='BUY'?'максимум':'минимум')+' ':''}${d.price}¢ · ${d.size} ${unit}. ${estimate} Комиссии могут изменить итоговую сумму. ${isMarket?'Неисполненный остаток отменяется.':'Ордер останется на бирже до исполнения или отмены.'} Отправить?`;
-  if(!confirm(message))return;
+  if(!confirm(message+(auto!==null?` После подтверждения покупки разрешается АВТОМАТИЧЕСКАЯ ПРОДАЖА: средний вход + ${auto}¢. Служба может отменять и заменять SELL при изменении объёма; выключение торговли ставит процесс на паузу.`:'')))return;
   const body={slug:state.market,asset,selection:d.token,side:d.action,order_type:d.type,execution_mode:isMarket?'market':'limit',price:(price/100).toFixed(6),size:d.size,nonce:newTradeNonce(),confirm:true};
+  if(auto!==null)body.auto_sell_cents=String(auto);
   tradeSending=true;updateTradingControls();report('Отправляем заявку. Не закрывайте страницу и не повторяйте запрос.');
   try{
     let result;
@@ -707,14 +716,14 @@ function bookTradeDraft(option,index){
   const key=bookTradeKey(option,index);
   if(!bookTradeDrafts.has(key)){
     if(bookTradeDrafts.size>=100)bookTradeDrafts.delete(bookTradeDrafts.keys().next().value);
-    bookTradeDrafts.set(key,{index:String(index),token:'yes',action:'BUY',type:'GTC',price:'',size:'',status:'Черновик отдельно от общего торгового блока. Ордер ещё не отправлен.'});
+    bookTradeDrafts.set(key,{index:String(index),token:'yes',action:'BUY',type:'GTC',price:'',size:'',auto_sell_cents:'',status:'Черновик отдельно от общего торгового блока. Ордер ещё не отправлен.'});
   }
   const draft=bookTradeDrafts.get(key);draft.index=String(index);return draft;
 }
 function bookTradePanel(option,index){
   const d=bookTradeDraft(option,index),key=bookTradeKey(option,index);
   const selected=(value,current)=>value===current?' selected':'';
-  return `<section class="book-trade" data-key="${esc(key)}" aria-label="Торговля по выбранному диапазону"><div class="book-trade-heading"><div><b>Торговля · ${esc(option.label)}</b><small>Отдельный черновик для этого диапазона</small></div><button type="button" class="book-trade-refresh button secondary">Обновить позиции</button></div><div class="book-trade-positions"></div><div class="book-trade-fields"><label>Исход<select data-field="token"><option value="yes"${selected('yes',d.token)}>YES · ДА</option><option value="no"${selected('no',d.token)}>NO · НЕТ</option></select></label><label>Действие<select data-field="action"><option value="BUY"${selected('BUY',d.action)}>Купить</option><option value="SELL"${selected('SELL',d.action)}>Продать</option></select></label><label>Тип<select data-field="type"><option value="GTC"${selected('GTC',d.type)}>Лимитный GTC</option><option value="FAK"${selected('FAK',d.type)}>Рыночный FAK</option></select></label><label><span class="book-trade-price-label">Цена, ¢</span><input data-field="price" type="number" min="0.01" max="99.99" step="any" value="${esc(d.price)}" placeholder="Цена"></label><label><span class="book-trade-size-label">Количество долей</span><input data-field="size" type="number" min="0" step="any" value="${esc(d.size)}" placeholder="Количество"></label></div><div class="book-trade-estimate"></div><div class="book-trade-footer"><div class="book-trade-status" role="status">${esc(d.status)}</div><button type="button" class="book-trade-submit button primary" disabled>Торговля выключена</button></div></section>`;
+  return `<section class="book-trade" data-key="${esc(key)}" aria-label="Торговля по выбранному диапазону"><div class="book-trade-heading"><div><b>Торговля · ${esc(option.label)}</b><small>Отдельный черновик для этого диапазона</small></div><button type="button" class="book-trade-refresh button secondary">Обновить позиции</button></div><div class="book-trade-positions"></div><div class="book-trade-fields"><label>Исход<select data-field="token"><option value="yes"${selected('yes',d.token)}>YES · ДА</option><option value="no"${selected('no',d.token)}>NO · НЕТ</option></select></label><label>Действие<select data-field="action"><option value="BUY"${selected('BUY',d.action)}>Купить</option><option value="SELL"${selected('SELL',d.action)}>Продать</option></select></label><label>Тип<select data-field="type"><option value="GTC"${selected('GTC',d.type)}>Лимитный GTC</option><option value="FAK"${selected('FAK',d.type)}>Рыночный FAK</option></select></label><label><span class="book-trade-price-label">Цена, ¢</span><input data-field="price" type="number" min="0.01" max="99.99" step="any" value="${esc(d.price)}" placeholder="Цена"></label><label><span class="book-trade-size-label">Количество долей</span><input data-field="size" type="number" min="0" step="any" value="${esc(d.size)}" placeholder="Количество"></label></div><label class="book-auto-sell">Автопродажа выше среднего входа, ¢ <input data-field="auto_sell_cents" type="number" min="0.01" max="99.99" step="0.01" value="${esc(d.auto_sell_cents||'')}" placeholder="Пусто — выключена"><small>Только при покупке: фоновая служба выставит SELL после подтверждения долей. Не гарантирует исполнение.</small></label><div class="book-trade-estimate"></div><div class="book-trade-footer"><div class="book-trade-status" role="status">${esc(d.status)}</div><button type="button" class="book-trade-submit button primary" disabled>Торговля выключена</button></div></section>`;
 }
 function updateBookTrade(panel,option,index){
   if(!panel||panel.dataset.key!==bookTradeKey(option,index))return;

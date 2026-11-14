@@ -27,8 +27,15 @@ def enabled():
 
 
 def set_enabled(on):
-    with db.get_db() as conn:
-        conn.execute('UPDATE web_trading_control SET enabled=? WHERE id=1',(1 if on else 0,))
+    # Wait for any in-flight auto side effect before returning from OFF.
+    from web import auto_sell
+    fd=auto_sell.execution_lock()
+    try:
+        with db.get_db() as conn:
+            conn.execute('UPDATE web_trading_control SET enabled=? WHERE id=1',(1 if on else 0,))
+            if not on:
+                conn.execute("UPDATE web_auto_sell_plans SET state='paused',reason='Торговля выключена; требуется ручное возобновление.',updated=? WHERE state='active'",(time.time(),))
+    finally: os.close(fd)
 
 
 def parse_decimal(value):
@@ -84,9 +91,17 @@ def _reserve(data, wallet):
         acknowledged=data.get('acknowledged_unknown',[])
         if unknown and not set(unknown).issubset(set(acknowledged)):
             raise UnknownOrders(unknown)
+        if data.get('auto_offset') is not None:
+            beat=conn.execute('SELECT checked_at FROM web_auto_sell_heartbeat WHERE id=1').fetchone()
+            from web import auto_sell
+            if not beat or not -5 <= now-beat['checked_at'] <= 30 or not auto_sell.worker_running():
+                raise TradeError('Служба автопродажи не работает или устарела. Покупка не отправлена.')
         conn.execute('''INSERT INTO web_order_intents(nonce,wallet,slug,asset,side,price,size,order_type,state,created,updated,purpose,execution_mode,acknowledged_unknown)
                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                      (data['nonce'],wallet,data['slug'],data['asset'],data['side'],str(data['price']),str(data['size']),data['order_type'],'pending',now,now,data['purpose'],data['execution_mode'],json.dumps(unknown)))
+        if data.get('auto_offset') is not None:
+            conn.execute('''INSERT INTO web_auto_sell_plans(buy_nonce,wallet,asset,offset,created,slug,selection,fingerprint,state,reason,updated)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(data['nonce'],wallet.lower(),data['asset'],str(data['auto_offset']),now,data['slug'],data['selection'],data['fingerprint'],'active','Ожидание исполнения покупки.',now))
     return None,True
 
 
@@ -167,6 +182,12 @@ def submit(body, event):
     acknowledged=body.get('acknowledged_unknown',[])
     if not isinstance(acknowledged,list) or len(acknowledged)>1000 or any(not isinstance(x,str) or not re.fullmatch(r'[0-9a-f]{32}',x) for x in acknowledged):
         raise TradeError('Неверное подтверждение неизвестных заявок.')
+    auto_offset=None
+    if body.get('auto_sell_cents') not in (None,''):
+        if side!='BUY': raise TradeError('Автопродажа задаётся только при покупке.')
+        cents=parse_decimal(body['auto_sell_cents'])
+        if not 0<cents<100 or cents != cents.quantize(Decimal('.01')): raise TradeError('Автопродажа: укажите от 0 до 100 центов с точностью 0,01.')
+        auto_offset=cents/100
     price,size=parse_decimal(body.get('price')),parse_decimal(body.get('size'))
     if not 0<price<1 or not 0<size<=1000000 or size != size.quantize(Decimal('.01')):
         raise TradeError('Цена должна быть от 0 до 1, сумма или количество — положительным с точностью до 0,01.')
@@ -174,7 +195,7 @@ def submit(body, event):
     c=trading_account.load()
     if not c: raise TradeError('Сначала настройте аккаунт Polymarket.')
     wallet=c['funder'] or c['signer']
-    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind,'purpose':'manual','execution_mode':'market' if kind=='FAK' else 'limit','acknowledged_unknown':acknowledged}
+    data={'nonce':nonce,'slug':slug,'asset':asset,'side':side,'price':price,'size':size,'order_type':kind,'purpose':'manual','execution_mode':'market' if kind=='FAK' else 'limit','acknowledged_unknown':acknowledged,'auto_offset':auto_offset,'selection':selection,'fingerprint':reconciliation.fingerprint(c)}
     client=trading_account.build_client(c)
     try:
         book=client.get_order_book(asset)

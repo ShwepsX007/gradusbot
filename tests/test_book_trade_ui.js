@@ -13,7 +13,7 @@ w.fetch=async(url,o={})=>{calls.push([url,o]);let data;
  else if(url==='/api/security-info')data={tunnel:true,trading_enabled:tradeEnabled};else if(url==='/api/trading/account-config')data={configured:true};
  else if(url==='/api/trading/account')data={wallet:'0x111',collateral_balance:'10',orders:[],positions,positions_maybe_partial:false,errors:[]};
  else if(url==='/api/trading/control'){tradeEnabled=JSON.parse(o.body).enabled;data={enabled:tradeEnabled}}
- else if(url==='/api/trading/monitor')data={status:'ok'};else if(url.startsWith('/api/trading/intents?'))data={intents:[]};
+ else if(url==='/api/trading/monitor')data={status:'ok'};else if(url==='/api/trading/auto-sell')data={running:true,plans:[]};else if(url.startsWith('/api/trading/intents?'))data={intents:[]};
  else if(url==='/api/stations')data=stations;
  else if(url.match(/^\/api\/stations\/\d+\/weather\?view=1$/)){const s=stations.find(s=>s.id===Number(url.split('/')[3]));data={station:s,forecast:{},metar:{}}}
  else if(url.match(/^\/api\/stations\/\d+\/bindings$/))data=[{id:1,market_slug:'first',market_name:'First'},{id:2,market_slug:'second',market_name:'Second'}];
@@ -51,8 +51,8 @@ function set(field,value){const input=get(`.book-trade [data-field="${field}"]`)
  get('.book-toggle[data-index="0"]').click();assert.equal(get('.book-trade [data-field="price"]').value,'44');assert.equal(get('.book-trade [data-field="size"]').value,'3');
  // Quote click in the expanded book fills local and existing top draft but never submits.
  get('.book-details .quote-pick[data-token="yes"][data-side="ask"]').click();assert.equal(get('.book-trade [data-field="token"]').value,'yes');assert.equal(get('.book-trade [data-field="price"]').value,'45');assert.equal(get('.book-trade [data-field="size"]').value,'');assert.equal(get('#trade-price').value,'45');assert.equal(posts().length,0);
- set('size','3');mode='defer';get('.book-trade-submit').click();await tick();assert(release);assert(get('.book-trade-submit').disabled);assert(get('#trade-submit').disabled);get('.book-trade-submit').click();assert.equal(posts().length,1);
- const body=JSON.parse(posts()[0][1].body);assert.equal(body.asset,'101');assert.equal(body.slug,'first');assert.equal(body.side,'BUY');assert.equal(body.selection,'yes');assert.equal(body.price,'0.450000');assert.equal(body.size,'3');assert.equal(body.order_type,'GTC');assert(messages[0].includes('20°C'));
+ set('size','3');set('auto_sell_cents','5');mode='defer';get('.book-trade-submit').click();await tick();assert(release);assert(get('.book-trade-submit').disabled);assert(get('#trade-submit').disabled);get('.book-trade-submit').click();assert.equal(posts().length,1);
+ const body=JSON.parse(posts()[0][1].body);assert.equal(body.asset,'101');assert.equal(body.slug,'first');assert.equal(body.side,'BUY');assert.equal(body.selection,'yes');assert.equal(body.price,'0.450000');assert.equal(body.size,'3');assert.equal(body.order_type,'GTC');assert.equal(body.auto_sell_cents,'5');assert(messages[0].includes('20°C'));assert(messages[0].includes('АВТОМАТИЧЕСКАЯ ПРОДАЖА'));assert(get('#auto-sell-status').textContent.includes('СЛУЖБА РАБОТАЕТ'));
  release();await tick();await tick();assert(get('.book-trade-status').textContent.includes('не подтверждение исполнения'));
  // Explicit unknown warning remains mandatory for local requests.
  unknown=true;get('.book-trade-submit').click();await tick();await tick();assert(messages.some(m=>m.includes('ВНИМАНИЕ')&&m.includes('20°C')));assert(JSON.parse(posts().at(-1)[1].body).acknowledged_unknown);unknown=false;

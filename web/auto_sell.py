@@ -1,4 +1,4 @@
-"""Conservative planning for a future auto-sell service; this module never trades.
+"""Conservative auto-sell planning and durable journal; this module never trades.
 
 All decisions are pure and are made from already identity-checked CLOB order and
 trade observations. Unknown/missing observations are not evidence of zero fills.
@@ -113,11 +113,17 @@ def decide(*, buy, prior_sold, current_sell, offset, tick, minimum, enabled=True
 
 
 def init_journal():
-    """Create a prototype journal; it is not attached to any live service."""
+    """Initialize the durable auto-sell journal."""
     with db.get_db() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS web_auto_sell_plans (
             buy_nonce TEXT PRIMARY KEY, wallet TEXT NOT NULL, asset TEXT NOT NULL,
             offset TEXT NOT NULL, created REAL NOT NULL)''')
+        cols={r['name'] for r in conn.execute('PRAGMA table_info(web_auto_sell_plans)')}
+        for name, declaration in (('slug', 'TEXT'), ('selection', 'TEXT'), ('fingerprint', 'TEXT'),
+                                  ('state', "TEXT NOT NULL DEFAULT 'active'"), ('reason', 'TEXT'), ('updated', 'REAL')):
+            if name not in cols: conn.execute(f'ALTER TABLE web_auto_sell_plans ADD COLUMN {name} {declaration}')
+        conn.execute('''CREATE TABLE IF NOT EXISTS web_auto_sell_heartbeat (
+            id INTEGER PRIMARY KEY CHECK(id=1), checked_at REAL NOT NULL)''')
         conn.execute('''CREATE TABLE IF NOT EXISTS web_auto_sell_actions (
             action_nonce TEXT PRIMARY KEY, buy_nonce TEXT NOT NULL, kind TEXT NOT NULL,
             target_order TEXT, price TEXT, size TEXT, state TEXT NOT NULL,
@@ -140,16 +146,15 @@ def add_plan(buy_nonce, wallet, asset, offset):
     offset=number(offset)
     if not 0<offset<1: raise EvidenceError('invalid offset')
     with db.get_db() as conn:
-        conn.execute('INSERT INTO web_auto_sell_plans VALUES(?,?,?,?,?)',
+        conn.execute('INSERT INTO web_auto_sell_plans (buy_nonce,wallet,asset,offset,created) VALUES(?,?,?,?,?)',
                      (buy_nonce,wallet.lower(),asset,str(offset),time.time()))
 
 
 def reserve_action(buy_nonce, action_nonce, decision, target_order=None):
     """Persist exactly one unresolved action BEFORE any eventual side effect.
 
-    The journal is only groundwork: calling this function never sends an order
-    or cancellation, and it alone does not authorize one. A real adapter must
-    also serialize workers and inspect credentials, balances, and exchange state.
+    This journal never itself sends an order or cancellation. The worker must
+    serialize side effects and check credentials, balances, and exchange state.
     """
     if not isinstance(action_nonce,str) or not re.fullmatch(r'[0-9a-f]{32}',action_nonce):
         raise EvidenceError('invalid action nonce')
@@ -187,7 +192,7 @@ def record_resolution(action_nonce, resolution):
 
     'proved' means the caller has separately verified the exact order or cancel;
     'not_sent' requires positive local proof that no network submission occurred.
-    A future live adapter must never infer either outcome from a 404 or timeout.
+    The live adapter must never infer either outcome from a 404 or timeout.
     """
     if resolution not in ('unknown','proved','not_sent'): raise EvidenceError('invalid resolution')
     with db.get_db() as conn:
@@ -228,3 +233,49 @@ def confirmed_sold(buy_nonce):
     with db.get_db() as conn:
         rows=conn.execute('SELECT confirmed_sold FROM web_auto_sell_retired WHERE buy_nonce=?',(buy_nonce,)).fetchall()
     return sum((number(row['confirmed_sold']) for row in rows),Decimal(0))
+
+
+def execution_lock(nonblocking=False):
+    """Process-shared switch/side-effect barrier; never unlink this file."""
+    import fcntl, os, stat
+    from web import trading_account
+    directory=trading_account._private_directory(create=True)
+    fd=os.open(os.path.join(directory,'auto-sell-execution.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o077 or info.st_nlink!=1:
+            raise OSError('unsafe auto-sell lock')
+        fcntl.flock(fd,fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def worker_lock():
+    """Acquire the lifetime singleton lock; the file is never unlinked."""
+    import fcntl, os, stat
+    from web import trading_account
+    path=os.path.join(trading_account._private_directory(create=True),'auto-sell-worker.lock')
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        st=os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.geteuid() or st.st_mode&0o077 or st.st_nlink!=1: raise OSError('unsafe lock')
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def worker_running():
+    """A fresh heartbeat is insufficient if its process has exited."""
+    import os
+    try:
+        fd=worker_lock()
+    except BlockingIOError:
+        return True
+    except (OSError,ValueError):
+        return False
+    os.close(fd)
+    return False

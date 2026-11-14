@@ -98,6 +98,8 @@ def init_web_db():
     forecast_history.init_db()
     ai_forecast.init_db()
     book_history.init_db()
+    from web import auto_sell
+    auto_sell.init_journal()
 
 
 
@@ -487,6 +489,45 @@ def trading_intents():
             trading_orders.annotate_order_statuses(rows,c)
         return jsonify(intents=rows)
     except Exception: return jsonify(error='Не удалось получить журнал заявок.'),503
+
+
+@app.get('/api/trading/auto-sell')
+def auto_sell_status():
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    from web import trading_account, auto_sell
+    try:
+        credentials=trading_account.load()
+        wallet=(credentials['funder'] or credentials['signer']).lower() if credentials else ''
+        with db.get_db() as conn:
+            beat=conn.execute('SELECT checked_at FROM web_auto_sell_heartbeat WHERE id=1').fetchone()
+            rows=conn.execute("SELECT buy_nonce,slug,asset,offset,state,reason,updated FROM web_auto_sell_plans WHERE lower(wallet)=? ORDER BY CASE WHEN state IN ('active','paused','halt') THEN 0 ELSE 1 END, created DESC LIMIT 100",(wallet,)).fetchall()
+        running=bool(beat and -5<=time.time()-beat['checked_at']<=30 and auto_sell.worker_running())
+        return jsonify(running=running,plans=[dict(r) for r in rows])
+    except Exception:return jsonify(error='Не удалось получить состояние автопродажи.'),503
+
+
+@app.post('/api/trading/auto-sell/<command>')
+def auto_sell_control(command):
+    if not trusted_ssh_tunnel(): return jsonify(error='Требуется SSH-туннель.'),403
+    if command not in ('pause','resume'): return jsonify(error='Неизвестная команда.'),404
+    from web import trading_account, trading_orders, order_reconciliation, auto_sell
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or data.get('confirm') is not True or not isinstance(data.get('nonce'),str) or not re.fullmatch(r'[0-9a-f]{32}',data['nonce']):
+        return jsonify(error='Требуется подтверждение.'),400
+    fd=None
+    try:
+        fd=auto_sell.execution_lock()
+        cred=trading_account.load()
+        if not cred or (command=='resume' and not trading_orders.enabled()):return jsonify(error='Торговля выключена или аккаунт не настроен.'),400
+        old,new=('active','paused') if command=='pause' else ('paused','active')
+        reason='На паузе; выставленный SELL остаётся на бирже.' if command=='pause' else 'Возобновлено; ожидаем сверку.'
+        with db.get_db() as conn:
+            cur=conn.execute("UPDATE web_auto_sell_plans SET state=?,reason=?,updated=? WHERE buy_nonce=? AND wallet=? AND fingerprint=? AND state=?",(new,reason,time.time(),data['nonce'],(cred['funder'] or cred['signer']).lower(),order_reconciliation.fingerprint(cred),old))
+            if not cur.rowcount:return jsonify(error='План недоступен или его состояние изменилось.'),409
+        return jsonify(ok=True)
+    except Exception:return jsonify(error='Не удалось изменить состояние автопродажи.'),503
+    finally:
+        if fd is not None:os.close(fd)
 
 
 @app.post('/api/trading/orders')
