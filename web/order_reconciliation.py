@@ -7,7 +7,7 @@ from importlib.metadata import version
 import json
 import re
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import database as db
 from py_clob_client_v2.config import get_contract_config
@@ -104,7 +104,8 @@ def record_hash(nonce, expected_id, credentials):
 
 def _amount(v):
     if isinstance(v,bool) or not isinstance(v,(str,int,float)) or len(str(v))>40: raise ValueError('amount')
-    n=Decimal(str(v))
+    try: n=Decimal(str(v))
+    except InvalidOperation: raise ValueError('amount') from None
     if not n.is_finite() or n<0 or n>Decimal('10000000000'): raise ValueError('amount')
     return n
 
@@ -113,12 +114,15 @@ def _same(a,b):
     return isinstance(a,str) and isinstance(b,str) and a.lower()==b.lower()
 
 
-def inspect_order(client, row, credentials, order_id):
+def inspect_order(client, row, credentials, order_id, *, include_buy_prices=False):
     """Return a conservative settlement assessment for an exact order ID.
 
     Unknown/unavailable data, missing trades, inconsistencies and nonterminal
     settlement never authorize another order. A 404 is not proof of absence.
+    Optional BUY price evidence is fee-exclusive and is not authorization to sell.
     """
+    if include_buy_prices and row.get('side') != 'BUY':
+        raise ValueError('price evidence is only supported for BUY')
     raw=client.get_order(order_id)
     if not isinstance(raw,dict) or not _same(raw.get('id'),order_id): raise ValueError('identity')
     if str(raw.get('asset_id',''))!=row['asset'] or str(raw.get('side','')).upper()!=row['side']: raise ValueError('asset/side')
@@ -134,7 +138,7 @@ def inspect_order(client, row, credentials, order_id):
     ids=raw.get('associate_trades')
     if not isinstance(ids,list) or len(ids)>100 or any(not isinstance(x,str) or not x or len(x)>128 for x in ids) or len(set(ids))!=len(ids):
         raise ValueError('trade list')
-    confirmed=failed=accounted=Decimal(0);unsettled=False
+    confirmed=failed=accounted=Decimal(0);confirmed_notional=Decimal(0);unsettled=False
     for trade_id in ids:
         trades=client.get_trades(TradeParams(id=trade_id),only_first_page=True)
         if not isinstance(trades,list) or len(trades)!=1 or not isinstance(trades[0],dict): raise ValueError('trade missing')
@@ -143,6 +147,7 @@ def inspect_order(client, row, credentials, order_id):
         if _same(trade.get('taker_order_id'),order_id):
             if str(trade.get('asset_id',''))!=row['asset'] or str(trade.get('side','')).upper()!=row['side'] or not _same(trade.get('owner'),credentials['api_key']): raise ValueError('taker identity')
             quantity=_amount(trade.get('size'))
+            execution_price=trade.get('price')
         else:
             makers=trade.get('maker_orders')
             if not isinstance(makers,list): raise ValueError('maker list')
@@ -151,9 +156,25 @@ def inspect_order(client, row, credentials, order_id):
             maker=matches[0]
             if str(maker.get('asset_id',''))!=row['asset'] or str(maker.get('side','')).upper()!=row['side'] or not _same(maker.get('owner'),credentials['api_key']) or not _same(maker.get('maker_address'),row['wallet']): raise ValueError('maker identity')
             quantity=_amount(maker.get('matched_amount'))
+            execution_price=maker.get('price')
         if quantity<=0: raise ValueError('trade amount')
         state=str(trade.get('status','')).upper().removeprefix('TRADE_STATUS_')
-        if state=='CONFIRMED': confirmed+=quantity
+        if state=='CONFIRMED':
+            if include_buy_prices:
+                # The maker leg's price belongs to our order; the top-level
+                # trade can belong to the opposite token and must not be used.
+                price=_amount(execution_price)
+                limit=_amount(row['signed_price'] if row.get('execution_mode')=='market' else row['price'])
+                if not 0 < price < 1 or price > limit: raise ValueError('untrusted execution price')
+                # CLOB shares and token prices have bounded decimal precision.
+                # Reject unexpected values rather than silently rounding a basis.
+                try:
+                    if quantity != quantity.quantize(Decimal('0.000001')) or price != price.quantize(Decimal('0.000001')):
+                        raise ValueError('execution precision')
+                except InvalidOperation:
+                    raise ValueError('execution precision') from None
+                confirmed_notional += quantity * price
+            confirmed+=quantity
         elif state=='FAILED': failed+=quantity
         elif state in ('MATCHED','MATCHED_NOT_BROADCASTED','MINED','RETRYING'): unsettled=True
         else: raise ValueError('trade status')
@@ -161,9 +182,14 @@ def inspect_order(client, row, credentials, order_id):
     if accounted!=matched: raise ValueError('incomplete trade data')
     terminal_order=status in ('CANCELED','CANCELLED') or (status=='MATCHED' and (row['order_type']=='FAK' or matched==orig))
     final=terminal_order and not unsettled
-    return {'assessment':'terminal' if final else 'active', 'order_status':status,
+    evidence={'assessment':'terminal' if final else 'active', 'order_status':status,
             'size_matched':str(matched),'confirmed_size':str(confirmed),'failed_size':str(failed),
             'reason':'Сделки подтверждены или завершились ошибкой; сверяйте позицию.' if final else 'Ордер открыт или расчёт сделок ещё не завершён.'}
+    if include_buy_prices:
+        # Exact numerator and denominator are retained; do not round the average
+        # here. Prices and notional exclude fees and cannot authorize a SELL.
+        evidence['confirmed_notional']=str(confirmed_notional)
+    return evidence
 
 
 def reconcile_one(row, credentials, client=None):
