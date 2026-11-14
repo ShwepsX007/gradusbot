@@ -1373,7 +1373,7 @@ $('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.por
 
 // Auto Scalping is currently a demo-only public-data simulator.
 let scalpGeneration=0,scalpDirty=false,scalpBusy=false,scalpLoaded=false,scalpEnabled=false,scalpEditVersion=0;
-let scalpPositionsKey=null,scalpJournalKey=null,scalpReadPromise=null,scalpReadController=null;
+let scalpPositionsKey=null,scalpJournalKey=null,scalpEnsembleKey=null,scalpReadPromise=null,scalpReadController=null;
 const scalpFormatter=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4});
 function scalpNumber(x){return x===null||x===undefined||!Number.isFinite(Number(x))?'—':scalpFormatter.format(Number(x))}
 function scalpControls(){
@@ -1394,6 +1394,29 @@ function scalpForecastDetail(info){
   const sources=Array.isArray(info.sources)?info.sources.join(' + '):'источник неизвестен';
   const single=Number(info.single_hours)||0,oneSource=single?` · один источник в ${single} ч. из ${info.hours}`:'';
   return `Прогноз ${kind}: ${scalpNumber(c)}°C / ${scalpNumber(f)}°F · ${info.station||'станция неизвестна'} · ${info.day||'дата неизвестна'} · ${sources} в точке экстремума${oneSource} · отступ ${scalpNumber(info.distance)}°${info.distance_units||'?'} (порог ${scalpNumber(info.required_gap)}°${info.distance_units||'?'}, запас границы ${info.bucket_margin||'—'}) · получен ${copyTime(info.fetched_at)}. Это не оценка вероятности.`;
+}
+function scalpEnsembleModel(m,observed,quote){
+  if(m.no==null||!Number.isFinite(Number(m.no)))return `<small>${esc(m.name)}: ${esc(m.reason||'нет данных')}</small>`;
+  const begun=Number(m.local_start)*1000<=Date.now();
+  let edge='';
+  if(!observed.stale&&!begun&&quote&&Date.now()/1000-Number(quote.fetched_at)<=120&&Date.now()/1000>=Number(quote.fetched_at)&&Number.isFinite(Number(m.gross_edge))&&Number.isFinite(Number(m.net_hold_edge)))
+    edge=` · к ASK ${esc(scalpNumber(Number(m.gross_edge)*100))} п.п. до комиссии / ${esc(scalpNumber(Number(m.net_hold_edge)*100))} п.п. с оценкой комиссии входа, при удержании до разрешения`;
+  return `<small>${esc(m.name)}: YES ${esc(scalpNumber(Number(m.yes)*100))}% (${esc(m.yes_count)}/${esc(m.members)}), NO ${esc(scalpNumber(Number(m.no)*100))}% (${esc(m.no_count)}/${esc(m.members)})${edge} · получено ${esc(copyTime(m.fetched_at))}${begun?' · сутки начались: только историческая оценка':''}</small>`;
+}
+function scalpEnsembleRender(observation){
+  const control=observation.control||{},rows=Array.isArray(observation.results)?observation.results:[],last=control.last_run;
+  $('#scalp-ensemble-status').textContent=observation.error||control.last_error||(!last?'Ожидание отдельного фонового наблюдателя. Данные появятся после обновления службы.':`Последний проход: ${copyTime(last)}${Date.now()/1000-last>360?' · давно не обновлялся':''}${control.blocked_until>Date.now()/1000?' · провайдер временно ограничил запросы':''}`);
+  $('#scalp-ensemble').innerHTML=rows.length?rows.map(row=>{
+    const q=row.quote,quote=q?`ASK NO ${scalpNumber(q.ask)} pUSD · ${scalpNumber(q.size)} долей · снимок ${copyTime(q.fetched_at)}${Date.now()/1000-Number(q.fetched_at)>120?' · котировка устарела':''} · оценочная комиссия входа ${scalpNumber(q.fee_per_share)} pUSD/долю`: 'Свежий ASK NO не получен; разница не рассчитана.';
+    const models=Array.isArray(row.models)?row.models:[];
+    return `<article class="scalp-row"><b>${esc(row.title||'Рынок')} · ${esc(row.label||'—')} · NO ${row.position_id?'· демо-позиция':'· кандидат'}</b><small>${esc(row.station||'Станция неизвестна')} · ${esc(row.date||'дата неизвестна')} · ${esc(row.timezone||'часовой пояс неизвестен')} · ${esc(copyTime(row.observed_at))}</small>${row.stale?'<small class="scalp-warning">Снимок устарел; значения не использовать как текущие.</small>':''}<small>${esc(row.reason||quote)}</small>${models.map(m=>scalpEnsembleModel(m,row,q)).join('')}<small>Границы расширены на 0,5° единицы рынка как приближение; часовые значения могут быть интерполированы. Это не проверенное преимущество и не гарантия результата.</small>${copyEventLink(row.event_slug)} ${quickOpenButton(row.event_slug,row.token,row.condition_id)}</article>`;
+  }).join(''):'Пока нет подходящих открытых демо-позиций или кандидатов с данными наблюдателя.';
+}
+function scalpEntrySnapshot(info){
+  if(!info)return '';
+  const models=Array.isArray(info.models)?info.models:[];
+  const exact=info.snapshot_kind==='at_entry',stamp=info.captured_at||info.observed_at;
+  return `<small>${exact?'Снимок, доступный на момент демо-входа':'Первый доступный снимок после входа (не оценка на момент покупки)'}: ${esc(copyTime(stamp))} · модель получена ранее.</small>${models.map(m=>scalpEnsembleModel(m,{stale:true},null)).join('')}`;
 }
 function scalpChart(journal){
   const sells=journal.filter(x=>x.kind==='SELL'&&x.pnl!==null&&Number.isFinite(Number(x.pnl))).slice().reverse();
@@ -1416,8 +1439,9 @@ function loadScalp(){
     $('#scalp-status').textContent=`Служба: ${service[cfg.service]||'неизвестно'} · новые входы: ${cfg.enabled?'включены':'остановлены'} · ${cfg.message||'ожидание'}${cfg.scan_at?' · проверка '+copyTime(cfg.scan_at):''}`;
     const opened=positions.filter(p=>!p.closed),exposure=opened.reduce((n,p)=>n+Number(p.remaining)*Number(p.entry_price),0);
     $('#scalp-stats').innerHTML=`<div><small>ДЕМО · СВОБОДНО</small><strong>${esc(scalpNumber(cfg.balance))} pUSD</strong></div><div><small>ОТКРЫТО ПОЗИЦИЙ</small><strong>${opened.length}</strong></div><div><small>СТОИМОСТЬ ВХОДА ОСТАТКА</small><strong>≈ ${esc(scalpNumber(exposure))} pUSD</strong></div>`;
-    const positionsKey=JSON.stringify(positions);
-    if(positionsKey!==scalpPositionsKey){scalpPositionsKey=positionsKey;$('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small><small class="${p.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(p.forecast_info))}</small>${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';}
+    const observation=data.ensemble_observation||{},positionsKey=JSON.stringify([positions,observation.snapshots]);
+    const ensembleKey=JSON.stringify(observation);if(ensembleKey!==scalpEnsembleKey){scalpEnsembleKey=ensembleKey;scalpEnsembleRender(observation)}
+    if(positionsKey!==scalpPositionsKey){scalpPositionsKey=positionsKey;$('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small><small class="${p.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(p.forecast_info))}</small>${scalpEntrySnapshot(observation.snapshots?.[String(p.id)])}${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';}
     const byId=new Map(positions.map(p=>[p.id,p]));
     const journalKey=JSON.stringify([journal,positions]);
     if(journalKey!==scalpJournalKey){scalpJournalKey=journalKey;$('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||x.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||x.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small><small class="${x.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(x.forecast_info))}</small>${quickOpenButton((byId.get(x.position_id)||x).event_slug,(byId.get(x.position_id)||x).token,(byId.get(x.position_id)||x).condition_id)}</div></article>`).join(''):'Виртуальных сделок пока нет.';

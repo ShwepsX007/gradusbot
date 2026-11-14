@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 import requests
 import database as db
-from web import orderbook, temperature_scan, trading_account, opportunity_scan, market_station, scalp_forecast
+from web import orderbook, temperature_scan, trading_account, opportunity_scan, market_station, scalp_forecast, scalp_ensemble
 
 D=Decimal
 DEFAULT={'initial_balance':'1000','trade_cap':'50','total_cap':'500','min_shares':'5',
@@ -57,6 +57,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_demo_book_usage (
             token TEXT NOT NULL, side TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(token,side,digest))''')
     scalp_forecast.init_db()
+    scalp_ensemble.init_db()
 
 
 def _number(value,low,high,precision=6):
@@ -122,7 +123,9 @@ def status():
         except (ValueError,TypeError):row['forecast_info']=None
     age=time.time()-cfg['heartbeat'] if cfg['heartbeat'] else None
     cfg['service']='running' if age is not None and -10<=age<=max(90,3*cfg['settings']['interval_seconds']) else 'stale' if age is not None else 'not_running'
-    return {'config':cfg,'positions':positions,'journal':logs,'real_available':False}
+    try:observation=scalp_ensemble.status()
+    except Exception:observation={'error':'Наблюдение ансамблей временно недоступно','results':[],'snapshots':{}}
+    return {'config':cfg,'positions':positions,'journal':logs,'real_available':False,'ensemble_observation':observation}
 
 
 def _gamma_events():
@@ -200,7 +203,7 @@ def prepare_forecasts(items,settings,now=None):
     settings={**DEFAULT,**settings}
     stats={'forecast':0,'fallback':0,'excluded':0}
     if settings['forecast_mode']=='off':
-        return [{**item,'forecast_info':{'mode':'off'}} for item in items],stats
+        return [{**item,'forecast_info':{'mode':'off','station':item.get('station'),'day':item.get('date'),'kind':item.get('extreme')}} for item in items],stats
     result=[];station_cache={};day_cache={};budget=FORECAST_FETCHES_PER_PASS;reasons={}
     for item in items:
         code=item.get('station');key=(code,item.get('date'),item.get('extreme'))
@@ -364,6 +367,8 @@ def poll_once():
                 forecast_stats['forecast']-=1;forecast_stats['fallback']+=1
                 reasons=forecast_stats.setdefault('reasons',{});reason='Прогноз устарел во время проверки';reasons[reason]=reasons.get(reason,0)+1
         if filtered:process_books(filtered,books,now,expected_revision=cfg['revision'])
+        try:scalp_ensemble.offer_candidates(window,books)
+        except Exception:pass  # Strictly observational; never alter demo decisions.
         unavailable=sum(1 for t in tokens if books.get(t) is None)
         with db.get_db() as c:c.execute("UPDATE web_scalp_config SET heartbeat=?,scan_at=?,status=?,message=? WHERE id=1",
             (now,now,'partial' if unavailable or discovery_error or forecast_stats['fallback'] or (_discovery and _discovery[2]) else 'ok',f'Кандидатов: {len(all_items)}; проверено: {len(window)}; недоступных стаканов: {unavailable}.'+(f" Прогноз: прошли {forecast_stats['forecast']}, исключены {forecast_stats['excluded']}, без прогноза / только цена {forecast_stats['fallback']}."+(' Причины: '+', '.join(f'{k}: {v}' for k,v in forecast_stats.get('reasons',{}).items())+'.' if forecast_stats.get('reasons') else '') if settings['forecast_mode']=='forecast' else ' Погодный фильтр выключен.')+(' Достигнут лимит открытых позиций; проверяются только виртуальные выходы.' if cfg['enabled'] and positions_full else '')+(' Каталог недоступен; новые входы пропущены.' if discovery_error else ' Каталог ограничен.' if _discovery and _discovery[2] else '')))
@@ -387,6 +392,7 @@ def main():
     except (OSError,RuntimeError):print('Демо-скальпер уже запущен или файл блокировки небезопасен.',flush=True);return 1
     stopped=threading.Event()
     signal.signal(signal.SIGTERM,lambda *_:stopped.set());signal.signal(signal.SIGINT,lambda *_:stopped.set())
+    threading.Thread(target=scalp_ensemble.worker,args=(stopped,),daemon=True,name='ensemble-observer').start()
     try:
         while not stopped.is_set():
             start=time.monotonic();poll_once()
