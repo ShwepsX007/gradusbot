@@ -1372,8 +1372,19 @@ $('#portfolio-refresh').onclick=loadPortfolio;
 $('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.portfolio-open');if(b)portfolioOpen(b.dataset.slug)});
 
 // Auto Scalping is currently a demo-only public-data simulator.
-let scalpGeneration=0,scalpDirty=false,scalpBusy=false;
-function scalpNumber(x){return x===null||x===undefined||!Number.isFinite(Number(x))?'—':new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(Number(x))}
+let scalpGeneration=0,scalpDirty=false,scalpBusy=false,scalpLoaded=false,scalpEnabled=false,scalpEditVersion=0;
+let scalpPositionsKey=null,scalpJournalKey=null,scalpReadPromise=null,scalpReadController=null;
+const scalpFormatter=new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4});
+function scalpNumber(x){return x===null||x===undefined||!Number.isFinite(Number(x))?'—':scalpFormatter.format(Number(x))}
+function scalpControls(){
+  $('#scalp-form').querySelector('button[type=submit]').disabled=!scalpLoaded||scalpEnabled||scalpBusy;
+  $('#scalp-start').disabled=!scalpLoaded||scalpEnabled||scalpBusy||scalpDirty;
+  $('#scalp-stop').disabled=!scalpLoaded||!scalpEnabled||scalpBusy;
+}
+function scalpSetForm(settings){
+  const form=$('#scalp-form');for(const name of Object.keys(settings||{}))if(form.elements[name])form.elements[name].value=settings[name];
+}
+
 function scalpForecastDetail(info){
   if(!info)return 'Прогноз для этой записи не сохранён.';
   if(info.mode==='off')return 'Погодный фильтр выключен; вход только по цене.';
@@ -1391,35 +1402,61 @@ function scalpChart(journal){
   const coords=points.map((p,i)=>`${10+380*i/(points.length-1)},${85-70*(p-min)/span}`);
   return `<div class="scalp-graph-title">Реализованный результат в последних 200 записях: ${esc(scalpNumber(total))} pUSD</div><svg viewBox="0 0 400 100" preserveAspectRatio="none" role="img" aria-label="График виртуального реализованного результата"><line x1="10" y1="85" x2="390" y2="85" stroke="#34463b"/><polyline points="${coords.join(' ')}" fill="none" stroke="#89d9ab" stroke-width="2"/></svg><small>Только показанный журнал, без открытых позиций и результата разрешения.</small>`;
 }
-async function loadScalp(){
-  const generation=++scalpGeneration;
-  try{const data=await api('/api/auto-scalp');if(generation!==scalpGeneration)return;
+function loadScalp(){
+  if(scalpBusy)return Promise.resolve();
+  if(scalpReadPromise)return scalpReadPromise;
+  const generation=++scalpGeneration,controller=new AbortController();scalpReadController=controller;
+  const timer=setTimeout(()=>controller.abort(),20000);
+  const pending=(async()=>{
+  try{const data=await api('/api/auto-scalp',{signal:controller.signal});if(generation!==scalpGeneration)return;
     const cfg=data.config||{},settings=cfg.settings||{},positions=Array.isArray(data.positions)?data.positions:[],journal=Array.isArray(data.journal)?data.journal:[];
-    const form=$('#scalp-form');if(!scalpDirty)for(const name of Object.keys(settings))if(form.elements[name])form.elements[name].value=settings[name];
-    form.querySelector('button[type=submit]').disabled=!!cfg.enabled||scalpBusy;
-    $('#scalp-start').disabled=!!cfg.enabled||scalpBusy;$('#scalp-stop').disabled=!cfg.enabled||scalpBusy;
+    scalpLoaded=true;scalpEnabled=!!cfg.enabled;if(!scalpDirty&&!scalpBusy)scalpSetForm(settings);scalpControls();
     const service={running:'работает',stale:'давно не отвечала',not_running:'не запущена'};
     $('#scalp-status').classList.toggle('scalp-warning',/без прогноза \/ только цена [1-9]/.test(cfg.message||''));
     $('#scalp-status').textContent=`Служба: ${service[cfg.service]||'неизвестно'} · новые входы: ${cfg.enabled?'включены':'остановлены'} · ${cfg.message||'ожидание'}${cfg.scan_at?' · проверка '+copyTime(cfg.scan_at):''}`;
     const opened=positions.filter(p=>!p.closed),exposure=opened.reduce((n,p)=>n+Number(p.remaining)*Number(p.entry_price),0);
     $('#scalp-stats').innerHTML=`<div><small>ДЕМО · СВОБОДНО</small><strong>${esc(scalpNumber(cfg.balance))} pUSD</strong></div><div><small>ОТКРЫТО ПОЗИЦИЙ</small><strong>${opened.length}</strong></div><div><small>СТОИМОСТЬ ВХОДА ОСТАТКА</small><strong>≈ ${esc(scalpNumber(exposure))} pUSD</strong></div>`;
-    $('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small><small class="${p.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(p.forecast_info))}</small>${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';
+    const positionsKey=JSON.stringify(positions);
+    if(positionsKey!==scalpPositionsKey){scalpPositionsKey=positionsKey;$('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small><small class="${p.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(p.forecast_info))}</small>${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';}
     const byId=new Map(positions.map(p=>[p.id,p]));
-    $('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||x.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||x.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small><small class="${x.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(x.forecast_info))}</small>${quickOpenButton((byId.get(x.position_id)||x).event_slug,(byId.get(x.position_id)||x).token,(byId.get(x.position_id)||x).condition_id)}</div></article>`).join(''):'Виртуальных сделок пока нет.';
-    $('#scalp-chart').innerHTML=scalpChart(journal);
-  }catch(e){if(generation===scalpGeneration)$('#scalp-status').textContent='Демо-скальпер недоступен: '+e.message}
+    const journalKey=JSON.stringify([journal,positions]);
+    if(journalKey!==scalpJournalKey){scalpJournalKey=journalKey;$('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||x.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||x.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small><small class="${x.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(x.forecast_info))}</small>${quickOpenButton((byId.get(x.position_id)||x).event_slug,(byId.get(x.position_id)||x).token,(byId.get(x.position_id)||x).condition_id)}</div></article>`).join(''):'Виртуальных сделок пока нет.';
+    $('#scalp-chart').innerHTML=scalpChart(journal);}
+  }catch(e){if(generation===scalpGeneration){scalpLoaded=false;scalpControls();$('#scalp-status').textContent='Демо-скальпер недоступен: '+(e.name==='AbortError'?'превышено время ожидания':e.message)}}
+  })();
+  scalpReadPromise=pending;
+  return pending.finally(()=>{clearTimeout(timer);if(scalpReadPromise===pending){scalpReadPromise=null;scalpReadController=null}});
 }
-$('#scalp-form').addEventListener('input',()=>{scalpDirty=true});
-$('#scalp-refresh').onclick=()=>loadScalp();
+function scalpMarkDirty(){
+  scalpDirty=true;scalpEditVersion++;$('#scalp-form-status').textContent='Есть несохранённые изменения. Сохраните настройки перед запуском.';scalpControls();
+}
+$('#scalp-form').addEventListener('input',scalpMarkDirty);
+$('#scalp-form').addEventListener('change',scalpMarkDirty);
+$('#scalp-form').addEventListener('invalid',e=>{
+  const label=e.target.closest('label')?.childNodes[0]?.textContent?.trim()||'поле';
+  const message=`Проверьте «${label}»: ${e.target.validationMessage||'неверное значение'}`;
+  $('#scalp-form-status').textContent=message;toast(message);
+},true);
+$('#scalp-refresh').onclick=()=>{if(!scalpBusy)loadScalp()};
 async function scalpAction(action,settings){
-  if(scalpBusy)return;
+  if(scalpBusy||!scalpLoaded)return;
+  if(action==='start'&&scalpDirty){$('#scalp-form-status').textContent='Сначала сохраните изменения настроек.';return}
   if(!confirm(action==='start'?'Запустить только демо? Реальные заявки не отправляются.':action==='stop'?'Остановить новые демо-входы? Виртуальные выходы продолжат наблюдаться.':'Сохранить настройки демо?'))return;
-  scalpBusy=true;$('#scalp-form-status').textContent='Выполняется…';
-  try{await api('/api/auto-scalp',{method:'POST',body:JSON.stringify({mode:'demo',action,settings,confirm:true})});if(action==='settings')scalpDirty=false;$('#scalp-form-status').textContent='Готово.';await loadScalp()}
-  catch(e){$('#scalp-form-status').textContent=e.message}finally{scalpBusy=false;await loadScalp()}
+  const editVersion=scalpEditVersion;
+  scalpBusy=true;scalpGeneration++;if(scalpReadController)scalpReadController.abort();scalpReadPromise=null;scalpReadController=null;scalpControls();$('#scalp-form-status').textContent='Выполняется…';
+  try{
+    const result=await api('/api/auto-scalp',{method:'POST',body:JSON.stringify({mode:'demo',action,settings,confirm:true})});
+    if(action==='settings'){
+      if(!result.settings||typeof result.settings!=='object')throw Error('Сервер не подтвердил сохранённые настройки. Обновите страницу и проверьте их.');
+      if(editVersion===scalpEditVersion){scalpDirty=false;scalpSetForm(result.settings);$('#scalp-form-status').textContent='Настройки сохранены на сервере.'}
+      else $('#scalp-form-status').textContent='Настройки сохранены, но после отправки вы изменили поля. Сохраните их ещё раз.';
+    }else $('#scalp-form-status').textContent=action==='start'?'Новые демо-входы запущены.':'Новые демо-входы остановлены.';
+  }catch(e){$('#scalp-form-status').textContent='Не удалось подтвердить действие: '+e.message+' Проверьте сохранённые настройки после обновления страницы.'}
+  finally{scalpBusy=false;await loadScalp()}
 }
 $('#scalp-form').onsubmit=e=>{e.preventDefault();const form=e.currentTarget,settings=Object.fromEntries(new FormData(form));settings.max_positions=Number(settings.max_positions);settings.interval_seconds=Number(settings.interval_seconds);scalpAction('settings',settings)};
 $('#scalp-start').onclick=()=>scalpAction('start');$('#scalp-stop').onclick=()=>scalpAction('stop');
-setInterval(()=>{if(!document.hidden&&!$('#scalp-page').classList.contains('hidden'))loadScalp()},15000);
+scalpControls();
+setInterval(()=>{if(!scalpBusy&&!document.hidden&&!$('#scalp-page').classList.contains('hidden'))loadScalp()},15000);
 
 setInterval(()=>{if(historyVisible()&&historyKey())syncBookHistory(true)},60000);

@@ -107,23 +107,39 @@ init_web_db()
 from web import copy_observer, auto_scalp, orderbook, price_history
 copy_observer.init_db()
 auto_scalp.init_db()
-_lock = threading.RLock()
+_lock = threading.Lock()
 _cache = {}
+_cache_inflight = {}
 
 
 def cached(key, ttl, loader):
-    # One in-flight request per process; failures are cached too to avoid retry storms.
+    """Coalesce the same key, but never hold the global cache lock over I/O."""
     with _lock:
-        now = time.time()
-        if key in _cache and now - _cache[key][0] < ttl:
+        now=time.time()
+        if key in _cache and now-_cache[key][0]<ttl:
             return _cache[key][1]
-        try:
-            value = loader()
-        except Exception:
-            app.logger.warning('Upstream request failed: %s', key, exc_info=True)
-            value = None
-        _cache[key] = (now, value)
-        return value
+        pending=_cache_inflight.get(key)
+        owner=pending is None
+        if owner:
+            pending=threading.Event()
+            _cache_inflight[key]=pending
+    if not owner:
+        # Slow upstreams must not indefinitely consume all request threads.
+        if not pending.wait(12):return None
+        with _lock:
+            entry=_cache.get(key)
+            return entry[1] if entry else None
+    value=None
+    try:
+        value=loader()
+    except Exception:
+        app.logger.warning('Upstream request failed: %s', key, exc_info=True)
+    finally:
+        with _lock:
+            _cache[key]=(time.time(),value)
+            if _cache_inflight.get(key) is pending:del _cache_inflight[key]
+            pending.set()
+    return value
 
 
 def upstream(url, params=None):
@@ -376,12 +392,16 @@ def auto_scalp_api():
     try:
         if data.get('mode')!='demo': raise auto_scalp.ScalpError('Реальная автоматическая торговля ещё не реализована.')
         action=data.get('action')
-        if action=='settings':auto_scalp.set_settings(data.get('settings'))
+        if action=='settings':
+            saved=auto_scalp.set_settings(data.get('settings'))
+            return jsonify(ok=True,settings=saved)
         elif action=='start':auto_scalp.set_enabled(True)
         elif action=='stop':auto_scalp.set_enabled(False)
         else:raise auto_scalp.ScalpError('Неизвестное действие.')
     except auto_scalp.ScalpError as exc:return jsonify(error=str(exc)),400
-    except Exception:return jsonify(error='Не удалось изменить настройки демо.'),503
+    except Exception:
+        app.logger.exception('Auto-scalp operation failed')
+        return jsonify(error='Не удалось изменить настройки демо. Проверьте журнал службы gradus-web.'),503
     return jsonify(ok=True)
 
 

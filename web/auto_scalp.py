@@ -48,10 +48,12 @@ def init_db():
             entry_fee TEXT NOT NULL, target TEXT NOT NULL, realized TEXT NOT NULL DEFAULT '0', closed REAL)''')
         cols={r['name'] for r in c.execute('PRAGMA table_info(web_scalp_demo_positions)')}
         if 'forecast_info' not in cols:c.execute('ALTER TABLE web_scalp_demo_positions ADD COLUMN forecast_info TEXT')
+        c.execute('CREATE INDEX IF NOT EXISTS web_scalp_open_positions ON web_scalp_demo_positions(id) WHERE closed IS NULL')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_demo_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, position_id INTEGER,
             kind TEXT NOT NULL, size TEXT NOT NULL, price TEXT NOT NULL, fee TEXT NOT NULL,
             pnl TEXT, note TEXT NOT NULL)''')
+        c.execute("CREATE INDEX IF NOT EXISTS web_scalp_sell_timestamp ON web_scalp_demo_log(timestamp) WHERE kind='SELL'")
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_demo_book_usage (
             token TEXT NOT NULL, side TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(token,side,digest))''')
     scalp_forecast.init_db()
@@ -98,6 +100,7 @@ def set_settings(data):
             if c.execute('SELECT 1 FROM web_scalp_demo_positions LIMIT 1').fetchone(): raise ScalpError('Начальный баланс нельзя менять после первой демо-сделки.')
             c.execute('UPDATE web_scalp_config SET balance=? WHERE id=1',(settings['initial_balance'],))
         c.execute('UPDATE web_scalp_config SET settings=?,revision=revision+1 WHERE id=1',(json.dumps(settings),))
+    return settings
 
 
 def set_enabled(value):
@@ -333,15 +336,18 @@ def poll_once():
             for i in range(0,min(len(active),BOOK_LIMIT),BATCH_SIZE):
                 exit_books.update(orderbook.fetch_batch(active[i:i+BATCH_SIZE]))
             process_books([],exit_books,time.time(),expected_revision=cfg['revision'])
+            with db.get_db() as c:
+                active=[r['token'] for r in c.execute('SELECT token FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id')]
+        positions_full=len(active)>=settings['max_positions']
         discovery_error=False
-        if cfg['enabled'] and (not _discovery or now-_discovery[0]>=DISCOVERY_INTERVAL):
+        if cfg['enabled'] and not positions_full and (not _discovery or now-_discovery[0]>=DISCOVERY_INTERVAL):
             try:
                 events,incomplete=_gamma_events();items,truncated=candidates(events,now)
                 _discovery=(now,items,incomplete or truncated)
             except Exception:
                 # Stop entries when discovery cannot be refreshed, but still monitor open exits.
                 discovery_error=True
-        all_items=_discovery[1] if cfg['enabled'] and not discovery_error and _discovery and 0<=now-_discovery[0]<=DISCOVERY_INTERVAL*2 else []
+        all_items=_discovery[1] if cfg['enabled'] and not positions_full and not discovery_error and _discovery and 0<=now-_discovery[0]<=DISCOVERY_INTERVAL*2 else []
         capacity=max(0,BOOK_LIMIT-len(set(active)))
         if all_items and capacity:
             offset=_cursor%len(all_items);window=(all_items+all_items)[offset:offset+min(capacity,len(all_items))];_cursor=(offset+len(window))%len(all_items)
@@ -357,10 +363,10 @@ def poll_once():
                 item['forecast_info']={'mode':'fallback','reason':'Прогноз устарел во время проверки','station':item.get('station'),'day':item.get('date')}
                 forecast_stats['forecast']-=1;forecast_stats['fallback']+=1
                 reasons=forecast_stats.setdefault('reasons',{});reason='Прогноз устарел во время проверки';reasons[reason]=reasons.get(reason,0)+1
-        process_books(filtered,books,now,expected_revision=cfg['revision'])
+        if filtered:process_books(filtered,books,now,expected_revision=cfg['revision'])
         unavailable=sum(1 for t in tokens if books.get(t) is None)
         with db.get_db() as c:c.execute("UPDATE web_scalp_config SET heartbeat=?,scan_at=?,status=?,message=? WHERE id=1",
-            (now,now,'partial' if unavailable or discovery_error or forecast_stats['fallback'] or (_discovery and _discovery[2]) else 'ok',f'Кандидатов: {len(all_items)}; проверено: {len(window)}; недоступных стаканов: {unavailable}.'+(f" Прогноз: прошли {forecast_stats['forecast']}, исключены {forecast_stats['excluded']}, без прогноза / только цена {forecast_stats['fallback']}."+(' Причины: '+', '.join(f'{k}: {v}' for k,v in forecast_stats.get('reasons',{}).items())+'.' if forecast_stats.get('reasons') else '') if settings['forecast_mode']=='forecast' else ' Погодный фильтр выключен.')+(' Каталог недоступен; новые входы пропущены.' if discovery_error else ' Каталог ограничен.' if _discovery and _discovery[2] else '')))
+            (now,now,'partial' if unavailable or discovery_error or forecast_stats['fallback'] or (_discovery and _discovery[2]) else 'ok',f'Кандидатов: {len(all_items)}; проверено: {len(window)}; недоступных стаканов: {unavailable}.'+(f" Прогноз: прошли {forecast_stats['forecast']}, исключены {forecast_stats['excluded']}, без прогноза / только цена {forecast_stats['fallback']}."+(' Причины: '+', '.join(f'{k}: {v}' for k,v in forecast_stats.get('reasons',{}).items())+'.' if forecast_stats.get('reasons') else '') if settings['forecast_mode']=='forecast' else ' Погодный фильтр выключен.')+(' Достигнут лимит открытых позиций; проверяются только виртуальные выходы.' if cfg['enabled'] and positions_full else '')+(' Каталог недоступен; новые входы пропущены.' if discovery_error else ' Каталог ограничен.' if _discovery and _discovery[2] else '')))
     except Exception:
         with db.get_db() as c:c.execute("UPDATE web_scalp_config SET heartbeat=?,status='error',message='Не удалось получить или обработать публичные данные.' WHERE id=1",(time.time(),))
 

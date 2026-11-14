@@ -21,6 +21,14 @@ class ScalpDemoTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.old=db.DB_FILE;db.DB_FILE=os.path.join(self.tmp.name,'test.db');scalp.init_db()
         self.now=time.time();self.items=scalp.candidates([market(self.now)],self.now)[0]
     def tearDown(self):db.DB_FILE=self.old;self.tmp.cleanup();scalp._discovery=None;scalp._cursor=0
+    def test_long_lived_demo_has_indexes_for_active_positions_and_daily_pnl(self):
+        with db.get_db() as c:
+            queries=[('SELECT * FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id','web_scalp_open_positions'),
+                     ("SELECT pnl FROM web_scalp_demo_log WHERE timestamp>=? AND kind='SELL' AND pnl IS NOT NULL",'web_scalp_sell_timestamp')]
+            for query,index in queries:
+                plan=c.execute('EXPLAIN QUERY PLAN '+query,(0,) if '?' in query else ()).fetchall()
+                self.assertIn(index,' '.join(str(row['detail']) for row in plan))
+
     def test_candidate_mapping_exact_ranges_and_date(self):
         self.assertEqual(self.items[0]['token'],T)
         m=market(self.now);m['markets'][0]['groupItemTitle']='20°C or below';self.assertEqual(scalp.candidates([m],self.now)[0][0]['temperature_range'],(None,20.0))
@@ -113,6 +121,18 @@ class ScalpDemoTests(unittest.TestCase):
         self.assertIn('без прогноза / только цена 1',state['config']['message']);self.assertIn('Станция',state['config']['message'])
         self.assertEqual(state['positions'][0]['forecast_info']['mode'],'fallback')
 
+    def test_full_position_limit_skips_scan_but_monitors_exit(self):
+        settings=dict(scalp.DEFAULT,max_positions=1)
+        scalp.set_settings(settings);scalp.set_enabled(True);scalp.process_books(self.items,{T:book(self.now)},self.now)
+        with patch.object(scalp,'_gamma_events') as gamma,patch.object(scalp,'prepare_forecasts',wraps=scalp.prepare_forecasts) as forecasts,patch.object(scalp.orderbook,'fetch_batch',side_effect=lambda tokens:{T:book(time.time())}):
+            scalp.poll_once()
+        gamma.assert_not_called();self.assertEqual(forecasts.call_args[0][0],[])
+        self.assertIn('лимит открытых позиций',scalp.status()['config']['message'])
+        # A virtual exit frees the slot in the same pass and scanning resumes.
+        with patch.object(scalp,'_gamma_events',return_value=([],False)) as gamma,patch.object(scalp.orderbook,'fetch_batch',side_effect=lambda tokens:{T:book(time.time(),bid='0.95')}):
+            scalp.poll_once()
+        gamma.assert_called_once();self.assertEqual(scalp.status()['positions'][0]['remaining'],'0.00')
+
     def test_validation_and_balance_immutability(self):
         for patching in [{'fee_rate':'NaN'},{'min_price':'0.99','max_price':'0.9'},{'interval_seconds':True},{'total_cap':'10','trade_cap':'20'}]:
             with self.assertRaises(scalp.ScalpError):scalp.validate_settings(dict(scalp.DEFAULT,**patching))
@@ -144,6 +164,19 @@ class ScalpDemoTests(unittest.TestCase):
             self.assertEqual(c.get('/api/auto-scalp',base_url=base).status_code,401)
             with c.session_transaction(base_url=base) as sess:sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='token'
             self.assertEqual(c.get('/api/auto-scalp',base_url=base,environ_overrides={'SERVER_NAME':'0.0.0.0'}).status_code,403)
+            data=dict(scalp.DEFAULT,forecast_mode='forecast',forecast_gap='7',forecast_gap_units='F',target_cents='6')
+            save={'mode':'demo','action':'settings','settings':data,'confirm':True}
+            response=c.post('/api/auto-scalp',base_url=base,json=save,headers={'X-CSRF-Token':'token'})
+            self.assertEqual(response.status_code,200);self.assertEqual(response.get_json()['settings']['forecast_gap_units'],'F')
+            # A new request and a reopened SQLite connection must see saved values.
+            persisted=c.get('/api/auto-scalp',base_url=base).get_json()['config']['settings']
+            for key in ('forecast_mode','forecast_gap','forecast_gap_units','target_cents'):self.assertEqual(persisted[key],data[key])
+            with db.get_db() as conn:
+                import json
+                self.assertEqual(json.loads(conn.execute('SELECT settings FROM web_scalp_config WHERE id=1').fetchone()['settings'])['forecast_gap'],'7')
+            invalid={**save,'settings':dict(data,forecast_gap='0')}
+            self.assertEqual(c.post('/api/auto-scalp',base_url=base,json=invalid,headers={'X-CSRF-Token':'token'}).status_code,400)
+            self.assertEqual(c.get('/api/auto-scalp',base_url=base).get_json()['config']['settings']['forecast_gap'],'7')
             body={'mode':'demo','action':'start','confirm':True}
             self.assertEqual(c.post('/api/auto-scalp',base_url=base,json=body).status_code,403)
             self.assertEqual(c.post('/api/auto-scalp',base_url=base,json={**body,'mode':'real'},headers={'X-CSRF-Token':'token'}).status_code,400)
