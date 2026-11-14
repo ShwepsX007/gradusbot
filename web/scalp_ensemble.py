@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import database as db
-from web import scalp_forecast, opportunity_scan, temperature_scan, orderbook
+from web import scalp_forecast, opportunity_scan, temperature_scan, orderbook, market_station
 
 MODELS={'ECMWF IFS':('ecmwf_ifs025',51),'GEFS':('gfs025',31)}
 URL='https://ensemble-api.open-meteo.com/v1/ensemble'
@@ -22,6 +22,7 @@ RETRY=30*60
 INTERVAL=120
 MAX_BYTES=1024*1024
 MAX_ITEMS=50
+VIEW_LEASE=150
 RETAIN=8*86400
 _lock=threading.Lock()
 _candidates=[]
@@ -35,6 +36,11 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_cache (
           station TEXT NOT NULL, model TEXT NOT NULL, payload TEXT, fetched REAL, lat TEXT, lon TEXT,
           next_attempt REAL NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY(station,model))''')
+        cols={x['name'] for x in c.execute('PRAGMA table_info(web_scalp_ensemble_cache)')}
+        for col in ('lat','lon'):
+            if col not in cols:c.execute(f'ALTER TABLE web_scalp_ensemble_cache ADD COLUMN {col} TEXT')
+        c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_views (
+          slug TEXT PRIMARY KEY, station TEXT NOT NULL, day TEXT NOT NULL, touched REAL NOT NULL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_results (
           token TEXT PRIMARY KEY, payload TEXT NOT NULL, updated REAL NOT NULL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_snapshots (
@@ -238,7 +244,7 @@ def _evaluate(item,coords,reason,now,fee_rate,model_cache=None):
             if not row.get('payload') or not row.get('fetched') or (row.get('lat'),row.get('lon'))!=tuple(coords[:2]) or not 0<=now-row['fetched']<=TTL:
                 entry['reason']=row.get('error') or 'Ожидается обновление модели'
             else:
-                distribution,error=model_distribution(json.loads(row['payload']),day,coords[2],kind,item.get('label'),expected,now)
+                distribution,error=model_distribution(row['payload'] if isinstance(row['payload'],dict) else json.loads(row['payload']),day,coords[2],kind,item.get('label'),expected,now)
                 if error:entry['reason']=error
                 else:
                     entry.update(distribution)
@@ -281,7 +287,75 @@ def capture_entry(connection,position_id,item):
         (position_id,json.dumps(value,ensure_ascii=True,allow_nan=False,separators=(',',':')),now))
 
 
+def overview(event,now=None):
+    """Queue only a verified event; compute all ranges from local cache, no I/O.
+
+    Views are separate from demo results/snapshots and cannot change a trade.
+    """
+    now=time.time() if now is None else now
+    slug=event.get('slug','') if isinstance(event,dict) else ''
+    day=temperature_scan.observation_date(slug) if isinstance(slug,str) else None
+    kind='max' if slug.startswith('highest-temperature-in-') else 'min' if slug.startswith('lowest-temperature-in-') else None
+    resolved=market_station.identify_station(event)
+    candidate=resolved.get('candidate') or {}
+    station=candidate.get('code') if resolved.get('status')=='found' and candidate.get('kind')!='site в правилах' and not temperature_scan.is_hong_kong_observatory(event) else None
+    reason=None
+    if not kind or not day:reason='Дата или тип температурного рынка не распознаны'
+    elif not station:reason='Станция разрешения неизвестна или неоднозначна'
+    else:
+        today=datetime.fromtimestamp(now,ZoneInfo('UTC')).date()
+        if not today-timedelta(days=1)<=date.fromisoformat(day)<=today+timedelta(days=3):
+            reason='Дата вне горизонта доступного прогноза'
+    if reason:return {'slug':slug,'station':station,'date':day,'reason':reason,'outcomes':[]}
+    with db.get_db() as c:
+        c.execute('DELETE FROM web_scalp_ensemble_views WHERE touched<? OR touched>?',(now-VIEW_LEASE,now+30))
+        c.execute('''INSERT INTO web_scalp_ensemble_views VALUES(?,?,?,?) ON CONFLICT(slug)
+           DO UPDATE SET station=excluded.station,day=excluded.day,touched=excluded.touched''',(slug,station,day,now))
+        c.execute('DELETE FROM web_scalp_ensemble_views WHERE slug NOT IN (SELECT slug FROM web_scalp_ensemble_views ORDER BY touched DESC LIMIT 20)')
+        location=c.execute('SELECT lat,lon,payload,station_expires FROM web_scalp_forecast_cache WHERE code=?',(station,)).fetchone()
+        rows=c.execute('SELECT * FROM web_scalp_ensemble_cache WHERE station=?',(station,)).fetchall()
+        control=c.execute('SELECT last_run,blocked_until FROM web_scalp_ensemble_control WHERE id=1').fetchone()
+    coords=None
+    try:
+        zone=json.loads(location['payload'] or '{}')['open']['timezone'] if location and location['station_expires']>now else None
+        if location and location['lat'] and location['lon'] and scalp_forecast.forecast_ensemble.valid_timezone(zone):coords=(location['lat'],location['lon'],zone)
+    except (KeyError,ValueError,TypeError):pass
+    cache={}
+    for r in rows:
+        entry=dict(r)
+        try:
+            if entry.get('payload'):entry['payload']=json.loads(entry['payload'])
+        except (ValueError,TypeError):entry['payload']=None;entry['error']='Некорректные данные модели'
+        cache[(entry['station'],entry['model'])]=entry
+    started=False
+    if coords:
+        try:started=_day_bounds(day,coords[2])[0]<=now
+        except (ValueError,TypeError,OverflowError):pass
+    outcomes=[];seen=set();markets=event.get('markets',[])
+    if not isinstance(markets,list):markets=[]
+    for market in markets[:100]:
+        if not isinstance(market,dict):continue
+        label=market.get('groupItemTitle');pair=orderbook.event_tokens({'markets':[market]})
+        if not isinstance(label,str) or len(label)>200 or not pair or pair[0]['no'] in seen:continue
+        seen.add(pair[0]['no'])
+        item={'token':pair[0]['no'],'station':station,'date':day,'extreme':kind,'label':label}
+        result=_evaluate(item,coords,'Ожидание координат и часового пояса станции',now,0,cache)
+        result['token_yes']=pair[0]['yes']
+        if started:
+            result['models']=[{'name':name,'reason':'Местные сутки уже начались; наблюдения дня не учтены'} for name in MODELS]
+        outcomes.append(result)
+    # A token appearing twice is ambiguous; never attach its estimate to a row.
+    counts={}
+    for m in markets[:100]:
+        for pair in orderbook.event_tokens({'markets':[m]}):
+            for token in (pair['no'],pair['yes']):counts[token]=counts.get(token,0)+1
+    outcomes=[x for x in outcomes if counts.get(x['token'])==1 and counts.get(x['token_yes'])==1]
+    return {'slug':slug,'station':station,'date':day,'timezone':coords[2] if coords else None,
+            'outcomes':outcomes,'control':dict(control) if control else {}}
+
+
 def _prune(connection,now):
+    connection.execute('DELETE FROM web_scalp_ensemble_views WHERE touched<?',(now-VIEW_LEASE,))
     connection.execute('DELETE FROM web_scalp_ensemble_results WHERE updated<?',(now-RETAIN,))
     connection.execute('DELETE FROM web_scalp_ensemble_snapshots WHERE captured<?',(now-RETAIN,))
     connection.execute('DELETE FROM web_scalp_ensemble_cache WHERE COALESCE(fetched,next_attempt,0)<?',(now-RETAIN,))
@@ -313,7 +387,9 @@ def run_once(now=None):
     for item in items:
         if item.get('token') and item['token'] not in dedup:dedup[item['token']]=item
     items=list(dedup.values())[:MAX_ITEMS]
-    if not items:
+    with db.get_db() as c:
+        views=[dict(r) for r in c.execute('SELECT station,day FROM web_scalp_ensemble_views WHERE touched BETWEEN ? AND ? ORDER BY touched DESC LIMIT 20',(now-VIEW_LEASE,now+30))]
+    if not items and not views:
         if now-_last_cleanup>=3600 or now<_last_cleanup:
             with db.get_db() as c:_prune(c,now)
             _last_cleanup=now
@@ -326,7 +402,8 @@ def run_once(now=None):
     for item in positions:item['book']=books.get(item['token'])
     try:rate=json.loads(cfg['settings']).get('fee_rate','0.05')
     except (TypeError,ValueError):rate='0.05'
-    stations=list(dict.fromkeys(x.get('station') for x in items if isinstance(x.get('station'),str) and re.fullmatch(r'[A-Z][A-Z0-9]{3}',x['station'])))
+    station_items=items+[{'station':v['station'],'date':v['day']} for v in views]
+    stations=list(dict.fromkeys(x.get('station') for x in station_items if isinstance(x.get('station'),str) and re.fullmatch(r'[A-Z][A-Z0-9]{3}',x['station'])))
     coords_by_station={};reasons={};model_cache={}
     if stations:
         # One read transaction instead of hundreds of connections when many
@@ -348,7 +425,7 @@ def run_once(now=None):
             i=(_cursor+offset)%len(stations);code=stations[i];coords=coords_by_station.get(code)
             if coords:
                 future=False
-                for item in items:
+                for item in station_items:
                     if item.get('station')!=code:continue
                     try:future=future or _day_bounds(item.get('date'),coords[2])[0]>now
                     except (ValueError,TypeError,OverflowError):pass
@@ -358,7 +435,7 @@ def run_once(now=None):
     if chosen:
         with db.get_db() as c:blocked=c.execute('SELECT blocked_until FROM web_scalp_ensemble_control WHERE id=1').fetchone()[0]
         if now>=blocked:
-            try:coords_by_station[chosen],reasons[chosen]=_refresh_station(chosen,now,[x.get('date') for x in items if x.get('station')==chosen])
+            try:coords_by_station[chosen],reasons[chosen]=_refresh_station(chosen,now,[x.get('date') for x in station_items if x.get('station')==chosen])
             except Exception:coords_by_station[chosen]=None;reasons[chosen]='Не удалось обновить ансамбль'
             with db.get_db() as c:updated=c.execute('SELECT * FROM web_scalp_ensemble_cache WHERE station=?',(chosen,)).fetchall()
             for row in updated:model_cache[(chosen,row['model'])]=dict(row)

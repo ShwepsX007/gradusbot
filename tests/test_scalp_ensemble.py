@@ -97,6 +97,76 @@ class EnsembleTests(unittest.TestCase):
         scalp.process_books([item],{'999':book},now)
         with patch.object(ens,'capture_entry',side_effect=RuntimeError('offline')),patch.object(ens.orderbook,'fetch_batch',return_value={'999':book}):ens.run_once()
         self.assertEqual(scalp.status()['positions'][0]['token'],'999')
+    def overview_event(self):
+        dt=datetime.fromisoformat(self.day)
+        slug='highest-temperature-in-london-on-'+dt.strftime('%B').lower()+'-'+str(dt.day)+'-'+str(dt.year)
+        return {'slug':slug,'title':'London', 'resolutionSource':'https://aviationweather.gov/api/data/metar?ids=EGLL',
+                'markets':[{'groupItemTitle':'33°C','outcomes':['Yes','No'],'clobTokenIds':['111','112']},
+                           {'groupItemTitle':'30°C','outcomes':['No','Yes'],'clobTokenIds':['212','211']}]}
+
+    def test_overview_uses_worker_shared_cache_for_all_ranges_without_trading(self):
+        event=self.overview_event();before=scalp.status()
+        with db.get_db() as c:c.execute('INSERT INTO web_scalp_forecast_cache(code,lat,lon,station_expires,payload) VALUES(?,?,?,?,?)',('EGLL','51','0',self.now+1000,json.dumps({'open':{'timezone':'UTC'}})))
+        with patch.object(ens,'fetch_model',side_effect=AssertionError('overview must not fetch')):
+            first=ens.overview(event,self.now)
+        self.assertEqual(first['station'],'EGLL');self.assertEqual(len(first['outcomes']),2)
+        self.assertIn('Ожидается',first['outcomes'][0]['models'][0]['reason'])
+        with patch.object(ens,'fetch_model',side_effect=lambda lat,lon,model:(self.ec if model=='ecmwf_ifs025' else self.gf,None,False)) as fetch:
+            ens.run_once()
+            self.assertEqual(fetch.call_count,2)
+            result=ens.overview(event)
+            self.assertEqual([m['yes_count'] for m in result['outcomes'][0]['models']],[10,5])
+            self.assertEqual([m['yes_count'] for m in result['outcomes'][1]['models']],[41,26])
+            ens.run_once();self.assertEqual(fetch.call_count,2)
+        after=scalp.status();self.assertEqual(after['positions'],before['positions']);self.assertEqual(after['journal'],before['journal'])
+        self.assertEqual(after['ensemble_observation']['results'],[]);self.assertEqual(after['ensemble_observation']['snapshots'],{})
+
+    def test_overview_rejects_ambiguous_station_and_duplicate_tokens(self):
+        event=self.overview_event();event['description']='ICAO LFPG'
+        result=ens.overview(event,self.now);self.assertIn('неизвестна',result['reason'])
+        with db.get_db() as c:self.assertEqual(c.execute('SELECT count(*) FROM web_scalp_ensemble_views').fetchone()[0],0)
+        del event['description'];event['markets'].append(dict(event['markets'][0]))
+        self.assertEqual([o['token'] for o in ens.overview(event,self.now)['outcomes']],['212'])
+
+    def test_view_lease_expiry_and_started_day_dont_request_models(self):
+        event=self.overview_event()
+        ens.overview(event,self.now)
+        with patch.object(ens,'fetch_model',side_effect=AssertionError('expired')):
+            ens.run_once(self.now+ens.VIEW_LEASE+1)
+        with db.get_db() as c:
+            c.execute('INSERT INTO web_scalp_forecast_cache(code,lat,lon,station_expires,payload) VALUES(?,?,?,?,?)',('EGLL','51','0',self.start+5000,json.dumps({'open':{'timezone':'UTC'}})))
+        ens.overview(event,self.start+1)
+        with patch.object(ens,'fetch_model',side_effect=AssertionError('day started')):
+            ens.run_once(self.start+1)
+        result=ens.overview(event,self.start+1)
+        self.assertTrue(all('сутки уже начались' in m['reason'] and 'yes' not in m for r in result['outcomes'] for m in r['models']))
+
+    def test_overview_endpoint_auth_csrf_and_server_side_event(self):
+        from web import app as web
+        from werkzeug.security import generate_password_hash
+        old=dict(web.app.config)
+        db.init_db();web.init_web_db()
+        try:
+            web.app.config.update(WEB_AUTH_CONFIGURED=True,WEB_USERNAME='test',WEB_PASSWORD_HASH=generate_password_hash('password long enough'),SECRET_KEY='a'*48,SESSION_COOKIE_SECURE=False,WEB_TUNNEL_ONLY=False,TESTING=True)
+            client=web.app.test_client();event=self.overview_event();url='/api/market/'+event['slug']+'/ensemble'
+            self.assertEqual(client.post(url,json={}).status_code,401)
+            with client.session_transaction() as sess:sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='token'
+            self.assertEqual(client.post(url,json={}).status_code,403)
+            with patch.object(web,'event_for_station',return_value=event),patch.object(ens,'fetch_model',side_effect=AssertionError('no network')):
+                response=client.post(url,json={'station':'LFPG'},headers={'X-CSRF-Token':'token'})
+                self.assertEqual(response.status_code,200);self.assertEqual(response.get_json()['station'],'EGLL')
+            with patch.object(web,'event_for_station',return_value={**event,'slug':'different'}):
+                self.assertEqual(client.post(url,json={},headers={'X-CSRF-Token':'token'}).status_code,502)
+        finally:web.app.config.clear();web.app.config.update(old)
+
+    def test_migrate_old_cache_schema(self):
+        with db.get_db() as c:
+            c.execute('DROP TABLE web_scalp_ensemble_cache')
+            c.execute('CREATE TABLE web_scalp_ensemble_cache(station TEXT, model TEXT, payload TEXT, fetched REAL, next_attempt REAL NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY(station,model))')
+        ens.init_db();ens.init_db()
+        with db.get_db() as c:cols={r['name'] for r in c.execute('PRAGMA table_info(web_scalp_ensemble_cache)')}
+        self.assertTrue({'lat','lon'}<=cols)
+
     def test_cleanup_even_when_no_positions_and_no_candidates(self):
         with db.get_db() as c:
             c.execute('INSERT INTO web_scalp_ensemble_results VALUES(?,?,?)',('old','{}',self.now-ens.RETAIN-1))

@@ -1342,6 +1342,18 @@ def market(slug):
     return jsonify(market=data, history=db.get_market_history(m['id']) if m else [], positions=[{k: p.get(k) for k in ('id','is_demo','slug','side','size','sl','tp','entry_price','question','outcome')} for p in db.get_positions() if p.get('slug') == slug])
 
 
+@app.post('/api/market/<slug>/ensemble')
+def market_ensemble(slug):
+    if not valid_slug(slug): return jsonify(error='Некорректный slug'), 400
+    try:
+        event=event_for_station(slug)
+        if not event or event.get('slug')!=slug:return jsonify(error='Не удалось проверить правила события'),502
+        return jsonify(auto_scalp.scalp_ensemble.overview(event))
+    except Exception:
+        app.logger.warning('Ensemble overview unavailable for %s',slug,exc_info=True)
+        return jsonify(error='Наблюдение ансамблей временно недоступно'),503
+
+
 # Keep CLOB network waits independent of weather/market caches and cap cache size.
 _books_lock = threading.Lock()
 _books_cache = OrderedDict()

@@ -309,13 +309,14 @@ function renderMarketTabs(){
   $$('.market-tab').forEach(btn=>btn.onclick=()=>{state.market=btn.dataset.slug;renderMarketTabs();loadMarket()});
 }
 let bookSlug=null,bookData=null,bookMessage='',bookChoice=null,marketData=null;
+let overviewEnsemble=null,ensembleSeq=0,ensembleLoading=false,ensembleLastAttempt=0;
 const bookInFlight=new Set();
 async function loadMarket(){
-  if(!state.market){bookSlug=null;bookData=null;marketData=null;renderMarket(null);return}
-  if(bookSlug!==state.market){bookSlug=state.market;bookData=null;bookChoice=null;marketData=null;bookMessage='Загрузка стакана…';renderMarket(null,'Загрузка события…')}
+  if(!state.market){bookSlug=null;bookData=null;marketData=null;overviewEnsemble=null;ensembleSeq++;renderMarket(null);return}
+  if(bookSlug!==state.market){overviewEnsemble=null;ensembleSeq++;ensembleLoading=false;ensembleLastAttempt=0;bookSlug=state.market;bookData=null;bookChoice=null;marketData=null;bookMessage='Загрузка стакана…';renderMarket(null,'Загрузка события…')}
   if(state.demo){bookMessage='Демо: реальные заявки стакана не отображаются.';marketData={market:{title:state.market==='demo'?'Максимальная температура в Нью-Йорке':'Максимальная температура в Нью-Йорке · завтра',options:demoOptions,closed:false},positions:[]};renderMarket(marketData);return}
   const slug=state.market;
-  try{let m=await api('/api/market/'+encodeURIComponent(slug));if(slug!==state.market)return;marketData=m;renderMarket(m);loadOrderBooks()}
+  try{let m=await api('/api/market/'+encodeURIComponent(slug));if(slug!==state.market)return;marketData=m;renderMarket(m);loadOrderBooks();loadOverviewEnsemble()}
   catch(e){if(slug===state.market){marketData=null;renderMarket(null,e.message)}}
 }
 async function loadOrderBooks(){
@@ -330,6 +331,41 @@ async function loadOrderBooks(){
   }catch(e){if(slug!==state.market)return;bookData=null;bookMessage='Стакан временно недоступен: '+e.message}
   finally{bookInFlight.delete(slug);if(slug===state.market&&marketData)renderMarket(marketData)}
 }
+async function loadOverviewEnsemble(){
+  const slug=state.market;if(!slug||!overviewActive()||ensembleLoading||Date.now()-ensembleLastAttempt<25000)return;
+  const seq=ensembleSeq,viewEpoch=weatherViewEpoch;ensembleLoading=true;ensembleLastAttempt=Date.now();
+  try{
+    const data=await api('/api/market/'+encodeURIComponent(slug)+'/ensemble',{method:'POST',body:'{}'});
+    if(seq!==ensembleSeq||viewEpoch!==weatherViewEpoch||slug!==state.market||!overviewActive()||data.slug!==slug)return;
+    overviewEnsemble=data;
+  }catch(e){if(seq!==ensembleSeq||viewEpoch!==weatherViewEpoch||slug!==state.market||!overviewActive())return;overviewEnsemble={slug,error:e.message}}
+  finally{if(seq===ensembleSeq){ensembleLoading=false;if(slug===state.market&&overviewActive())renderOverviewEnsemble()}}
+}
+function renderOverviewEnsemble(){
+  const data=overviewEnsemble?.slug===state.market?overviewEnsemble:null,now=Date.now()/1000;
+  let status=data?.error||data?.reason||(!data?'ожидание данных':`${data.station||'станция неизвестна'} · ${data.date||'дата неизвестна'} · ${data.timezone||'часовой пояс ожидается'}`);
+  if(data?.control){if(data.control.blocked_until>now)status+=' · провайдер ограничил запросы';if(!data.control.last_run||now-data.control.last_run>360)status+=' · служба наблюдателя не отвечает или обновляется';}
+  $('#market-ensemble-status').textContent=' · '+status;
+  const rows=Array.isArray(data?.outcomes)?data.outcomes:[];
+  $$('#market-options .market-ensemble-row').forEach(slot=>{
+    const row=rows.find(x=>x.token===slot.dataset.token&&x.token_yes===slot.dataset.yes&&x.label===slot.dataset.label);
+    const messages=[];
+    if(row?.reason)messages.push(row.reason);
+    else if(row&&Array.isArray(row.models)&&row.models.length){
+      for(const m of row.models){
+        const stamp=Number(m.fetched_at),start=Number(m.local_start);
+        if(m.reason)messages.push(`${m.name}: ${m.reason}`);
+        else if(!Number.isFinite(stamp)||!Number.isFinite(start)||now<stamp||now-stamp>21600||start<=now)messages.push(`${m.name}: данные устарели или сутки начались`);
+        else if(Number.isInteger(m.members)&&m.members>0&&Number.isInteger(m.yes_count)&&Number.isInteger(m.no_count)&&m.yes_count+m.no_count===m.members){
+          const pct=v=>new Intl.NumberFormat('ru-RU',{maximumFractionDigits:1}).format(v*100)+'%';
+          messages.push(`${m.name}: YES ${pct(m.yes_count/m.members)} (${m.yes_count}/${m.members}), NO ${pct(m.no_count/m.members)} (${m.no_count}/${m.members}) · ${new Date(stamp*1000).toLocaleString('ru-RU')}`);
+        }else messages.push(`${m.name}: данные недоступны`);
+      }
+    }else messages.push(data?.error||data?.reason||(!data?'Ожидание ансамблей':'Для этого исхода оценка недоступна'));
+    slot.textContent=messages.join('\n');
+  });
+}
+
 function bookFor(option,side){
   if(!bookData||!option.token_yes||!option.token_no)return null;
   const pair=(bookData.pairs||[]).find(p=>p.yes===option.token_yes&&p.no===option.token_no);
@@ -772,8 +808,9 @@ function renderMarketOptions(m=marketData?.market){
     let n=typeof o.prob==='number'?Math.max(0,Math.min(100,o.prob)):null,yes=bookFor(o,'yes'),no=bookFor(o,'no');
     const mine=[...ordersForBook(i,'yes',groups),...ordersForBook(i,'no',groups)];
     const badge=mine.length?`<small class="book-own-badge">Мои открытые: ${mine.length} · откройте стакан</small>`:'';
-    return `<div class="option-row book-option"><span class="option-name">${esc(o.label)}${badge}</span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span>${quote(yes,i,'yes')}${quote(no,i,'no')}<button class="book-toggle" data-index="${i}" aria-expanded="${bookChoice===i}">${bookChoice===i?'Скрыть':'Стакан'} ↕</button></div>${bookChoice===i?`<div class="book-details">${bookHistory(o)}${bookSide('YES · ДА',yes,i,'yes',groups)}${bookSide('NO · НЕТ',no,i,'no',groups)}<p class="book-disclaimer">До 5 лучших цен на каждой стороне. Мои ордера — отдельный снимок первой страницы CLOB${Array.isArray(accountSnapshot?.orders)?` на ${esc(new Date(accountSnapshotAt).toLocaleTimeString('ru-RU'))}${Date.now()-accountSnapshotAt>65000?' · УСТАРЕЛ':''}`:' · недоступен'}; совпадение цены не подтверждает наличие ордера в публичном стакане; объёмы не складываются. Другие ключи могут быть не видны. YES и NO могут отражать общую ликвидность; не суммируйте их.</p>${bookTradePanel(o,i)}</div>`:''}`
+    return `<div class="option-row book-option"><span class="option-name">${esc(o.label)}${badge}<span class="market-ensemble-row" data-token="${esc(o.token_no||'')}" data-yes="${esc(o.token_yes||'')}" data-label="${esc(o.label)}"></span></span><span class="option-prob"><span class="bar"><i style="width:${n??0}%"></i></span> ${n==null?'—':n+'%'}</span>${quote(yes,i,'yes')}${quote(no,i,'no')}<button class="book-toggle" data-index="${i}" aria-expanded="${bookChoice===i}">${bookChoice===i?'Скрыть':'Стакан'} ↕</button></div>${bookChoice===i?`<div class="book-details">${bookHistory(o)}${bookSide('YES · ДА',yes,i,'yes',groups)}${bookSide('NO · НЕТ',no,i,'no',groups)}<p class="book-disclaimer">До 5 лучших цен на каждой стороне. Мои ордера — отдельный снимок первой страницы CLOB${Array.isArray(accountSnapshot?.orders)?` на ${esc(new Date(accountSnapshotAt).toLocaleTimeString('ru-RU'))}${Date.now()-accountSnapshotAt>65000?' · УСТАРЕЛ':''}`:' · недоступен'}; совпадение цены не подтверждает наличие ордера в публичном стакане; объёмы не складываются. Другие ключи могут быть не видны. YES и NO могут отражать общую ликвидность; не суммируйте их.</p>${bookTradePanel(o,i)}</div>`:''}`
   }).join(''):'<div class="empty-state">Выберите или добавьте рынок</div>';
+  renderOverviewEnsemble();
   let panel=$('.book-trade');
   if(panel&&oldPanel&&panel.dataset.key===oldPanel.dataset.key){panel.replaceWith(oldPanel);panel=oldPanel;if(focused?.isConnected)focused.focus()}
   if(panel&&m?.options?.[bookChoice])updateBookTrade(panel,m.options[bookChoice],bookChoice);
@@ -1272,7 +1309,7 @@ $('#copy-form').onsubmit=async e=>{e.preventDefault();if(copyBusy)return;const f
   }catch(err){$('#copy-form-status').textContent=err.message}finally{copyBusy=false;button.disabled=false}
 };
 setInterval(()=>{if(!document.hidden){pollCopyNotice();if(!$('#copy-page').classList.contains('hidden'))loadCopyObserver()}},15000);
-$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(overviewActive())loadOrderBooks()},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
+$('#refresh').onclick=()=>loadStations();$('#today-label').textContent=new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(new Date()).toUpperCase();setInterval(updateClock,30000);setInterval(()=>{if(overviewActive()){loadOrderBooks();loadOverviewEnsemble();renderOverviewEnsemble()}},30000);setInterval(()=>{if(overviewActive())loadStation(true)},60000);$('#logout').onclick=async()=>{try{await api('/api/logout',{method:'POST',body:'{}'});location.assign('/login')}catch(e){toast(e.message)}};api('/api/session').then(data=>{csrfToken=data.csrf;api('/api/security-info').then(async s=>{setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel&&state.selected&&!state.demo)loadAiLatest(state.selected);tradeEnabled=!!s.trading_enabled;updateTradingControls();if(s.tunnel){const c=await api('/api/trading/account-config');if(c.configured)await loadAccountSnapshot()}}).catch(()=>{});return loadSettings()}).then(()=>loadStations()).catch(e=>toast(e.message));
 
 // Portfolio is read-only. Never infer a station from a title or market name.
 let portfolioGeneration=0;
