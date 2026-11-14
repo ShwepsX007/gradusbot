@@ -28,6 +28,9 @@
     <label>Общий лимит открытых позиций, pUSD<input name="total_cap" type="number" min="1" step="0.01" required></label>
     <label>Минимум долей<input name="min_shares" type="number" min="0.01" step="0.01" required></label>
     <div class="scalp-pair"><label>Мин. цена NO<input name="min_price" type="number" min="0.01" max="0.999" step="0.001" required></label><label>Макс. цена NO<input name="max_price" type="number" min="0.01" max="0.999" step="0.001" required></label></div>
+    <label>Погодный фильтр<select name="forecast_mode"><option value="off">Выключен · только цена</option><option value="forecast">Включён · прогноз + цена</option></select><small>Если прогноз недоступен, используется только ценовой фильтр с предупреждением.</small></label>
+    <div class="scalp-pair"><label>Отступ от прогноза N<input name="forecast_gap" type="number" min="0.1" max="50" step="0.01" value="3" required></label><label>Единицы отступа<select name="forecast_gap_units"><option value="C">°C</option><option value="F">°F</option></select></label></div>
+    <small>Сравниваются максимум или минимум ансамбля за местные сутки станции. Далёкий исход не означает доказанную малую вероятность.</small>
     <label>Цель от входа, центов<input name="target_cents" type="number" min="0.1" max="99" step="0.1" required><small>Например: покупка 90¢ + 5¢ = цель 95¢. Шаг цены биржи в демо не проверяется.</small></label>
     <label>Мин. расчётная прибыль, pUSD<input name="min_profit" type="number" min="0" step="0.01" required></label>
     <label>Оценочная ставка комиссии taker (0,05 = 5%)<input name="fee_rate" type="number" min="0" max="0.2" step="0.001" required><small>Приближённый расчёт на входе и выходе; реальные комиссии и их единицы могут отличаться.</small></label>

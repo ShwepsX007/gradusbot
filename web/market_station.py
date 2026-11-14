@@ -75,11 +75,31 @@ def awc_evidence(text):
             continue
 
 
+def noaa_evidence(text):
+    """Accept NOAA timeseries station IDs, including lower-case query values."""
+    for match in URL_RE.finditer(html.unescape(text)):
+        url=match.group(0).rstrip('.,);]')
+        try:
+            parsed=urlparse(url)
+            if (parsed.scheme.lower() not in ('http','https') or
+                parsed.hostname not in ('weather.gov','www.weather.gov') or
+                parsed.username or parsed.password or parsed.port not in (None,80,443) or
+                parsed.path.rstrip('/').lower()!='/wrh/timeseries'):
+                continue
+            values=parse_qs(parsed.query,keep_blank_values=True).get('site',[])
+            if len(values)!=1:continue
+            code=values[0].strip().upper()
+            if re.fullmatch(r'[A-Z][A-Z0-9]{3}',code):yield code,url
+        except ValueError:
+            continue
+
+
 def identify_station(event):
     found = {}
     for field, text in resolution_fields(event):
         evidence = [(code, 'Aviation Weather Center', url) for code, url in awc_evidence(text)]
         evidence += [(code, 'Weather Underground', url) for code, url in wu_evidence(text)]
+        evidence += [(code, 'NOAA Weather.gov', url) for code, url in noaa_evidence(text)]
         evidence += [(m.group(1), 'ICAO в правилах', None) for m in ICAO_RE.finditer(text)]
         evidence += [(m.group(1), 'site в правилах', None) for m in SITE_RE.finditer(text)]
         for code, kind, url in evidence:

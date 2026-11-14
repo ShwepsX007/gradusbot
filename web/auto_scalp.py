@@ -17,22 +17,25 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 import requests
 import database as db
-from web import orderbook, temperature_scan, trading_account
+from web import orderbook, temperature_scan, trading_account, opportunity_scan, market_station, scalp_forecast
 
 D=Decimal
 DEFAULT={'initial_balance':'1000','trade_cap':'50','total_cap':'500','min_shares':'5',
          'min_price':'0.85','max_price':'0.985','target_cents':'5','min_profit':'0.03',
-         'max_positions':5,'daily_loss':'5','interval_seconds':30,'fee_rate':'0.05'}
+         'max_positions':5,'daily_loss':'5','interval_seconds':30,'fee_rate':'0.05',
+         'forecast_mode':'off','forecast_gap':'3','forecast_gap_units':'C'}
 DISCOVERY_INTERVAL=120
 MAX_CANDIDATES=500
 BATCH_SIZE=50
 BOOK_LIMIT=100
+FORECAST_FETCHES_PER_PASS=2
 
 class ScalpError(Exception): pass
 
 
 def init_db():
     with db.get_db() as c:
+        c.execute('BEGIN IMMEDIATE')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_config (
             id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 0,
             revision INTEGER NOT NULL DEFAULT 1, settings TEXT NOT NULL, balance TEXT NOT NULL,
@@ -43,12 +46,15 @@ def init_db():
             event_slug TEXT NOT NULL, title TEXT NOT NULL, label TEXT NOT NULL, opened REAL NOT NULL,
             original TEXT NOT NULL, remaining TEXT NOT NULL, entry_price TEXT NOT NULL,
             entry_fee TEXT NOT NULL, target TEXT NOT NULL, realized TEXT NOT NULL DEFAULT '0', closed REAL)''')
+        cols={r['name'] for r in c.execute('PRAGMA table_info(web_scalp_demo_positions)')}
+        if 'forecast_info' not in cols:c.execute('ALTER TABLE web_scalp_demo_positions ADD COLUMN forecast_info TEXT')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_demo_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, position_id INTEGER,
             kind TEXT NOT NULL, size TEXT NOT NULL, price TEXT NOT NULL, fee TEXT NOT NULL,
             pnl TEXT, note TEXT NOT NULL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_demo_book_usage (
             token TEXT NOT NULL, side TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(token,side,digest))''')
+    scalp_forecast.init_db()
 
 
 def _number(value,low,high,precision=6):
@@ -67,6 +73,11 @@ def validate_settings(data):
            'target_cents':(D('0.1'),D('99')),'min_profit':(D('0'),D('100000')),
            'daily_loss':(D('0.01'),D('100000')),'fee_rate':(D('0'),D('0.2'))}
     result={key:str(_number(data.get(key),*bounds)) for key,bounds in rules.items()}
+    result['forecast_gap']=str(_number(data.get('forecast_gap',DEFAULT['forecast_gap']),D('0.1'),D('50'),precision=2))
+    result['forecast_mode']=data.get('forecast_mode',DEFAULT['forecast_mode'])
+    result['forecast_gap_units']=data.get('forecast_gap_units',DEFAULT['forecast_gap_units'])
+    if result['forecast_mode'] not in ('off','forecast') or result['forecast_gap_units'] not in ('C','F'):
+        raise ScalpError('Неверный режим прогноза или единицы отступа.')
     for key,low,high in [('max_positions',1,50),('interval_seconds',15,300)]:
         v=data.get(key)
         if type(v) is not int or not low<=v<=high: raise ScalpError('Неверный интервал или число позиций.')
@@ -97,12 +108,15 @@ def set_enabled(value):
 
 def status():
     with db.get_db() as c:
-        cfg=dict(c.execute('SELECT * FROM web_scalp_config WHERE id=1').fetchone());cfg['settings']=json.loads(cfg['settings'])
+        cfg=dict(c.execute('SELECT * FROM web_scalp_config WHERE id=1').fetchone());cfg['settings']={**DEFAULT,**json.loads(cfg['settings'])}
         positions=[dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id DESC')]
         positions.extend(dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NOT NULL ORDER BY id DESC LIMIT 100'))
-        logs=[dict(x) for x in c.execute('''SELECT l.*,p.token,p.condition_id,p.event_slug,p.title,p.label
+        logs=[dict(x) for x in c.execute('''SELECT l.*,p.token,p.condition_id,p.event_slug,p.title,p.label,p.forecast_info
             FROM web_scalp_demo_log l LEFT JOIN web_scalp_demo_positions p ON p.id=l.position_id
             ORDER BY l.id DESC LIMIT 200''')]
+    for row in positions+logs:
+        try:row['forecast_info']=json.loads(row['forecast_info']) if row.get('forecast_info') else None
+        except (ValueError,TypeError):row['forecast_info']=None
     age=time.time()-cfg['heartbeat'] if cfg['heartbeat'] else None
     cfg['service']='running' if age is not None and -10<=age<=max(90,3*cfg['settings']['interval_seconds']) else 'stale' if age is not None else 'not_running'
     return {'config':cfg,'positions':positions,'journal':logs,'real_available':False}
@@ -127,21 +141,30 @@ def candidates(events,now):
     today=datetime.fromtimestamp(now,timezone.utc).date();out=[];seen=set()
     for event in events:
         if not isinstance(event,dict) or event.get('active') is not True or event.get('closed') is not False: continue
-        slug=event.get('slug');day=temperature_scan.observation_date(slug)
-        if not day or date.fromisoformat(day) not in (today,today+timedelta(days=1)):continue
-        if not re.fullmatch(r'[a-z0-9-]{1,200}',slug):continue
+        slug=event.get('slug')
+        if not isinstance(slug,str) or not re.fullmatch(r'[a-z0-9-]{1,200}',slug):continue
+        day=temperature_scan.observation_date(slug)
+        if not day or not today-timedelta(days=1)<=date.fromisoformat(day)<=today+timedelta(days=2):continue
         try:
             # Gamma endDate is a declared market date, NOT a guarantee of resolution time.
             end=datetime.fromisoformat(str(event.get('endDate','')).replace('Z','+00:00'))
             if end.tzinfo is None or not 0<=end.timestamp()-now<=48*3600:continue
         except (ValueError,OverflowError,TypeError):continue
+        resolved=market_station.identify_station(event)
+        evidence=resolved.get('candidate') or {}
+        station=evidence.get('code') if resolved.get('status')=='found' and evidence.get('kind')!='site в правилах' and not temperature_scan.is_hong_kong_observatory(event) else None
+        kind='max' if slug.startswith('highest-') else 'min' if slug.startswith('lowest-') else None
         markets=event.get('markets')
         if not isinstance(markets,list):continue
         for market in markets[:100]:
             if not isinstance(market,dict) or market.get('active') is not True or market.get('closed') is not False or market.get('acceptingOrders') is not True:continue
             if str(market.get('version','')).lower() in ('v2','2') or market.get('positionIds'):continue
             label=market.get('groupItemTitle')
-            if not isinstance(label,str) or not re.fullmatch(r'\s*-?\d+(?:\.\d+)?\s*°\s*C\s*',label,re.I):continue
+            temp_range=opportunity_scan.temperature_range(label)
+            if temp_range is None:continue
+            unit_match=re.search(r'[°º]\s*([CF])',label,re.I)
+            if not unit_match:continue
+            unit=unit_match.group(1).upper()
             pair=orderbook.event_tokens({'markets':[market]})
             names=orderbook._list(market.get('outcomes'));prices=orderbook._list(market.get('outcomePrices'))
             try:
@@ -157,9 +180,64 @@ def candidates(events,now):
             seen.add(token)
             out.append({'token':token,'condition_id':condition.lower(),'event_slug':slug,
                         'title':str(event.get('title') or '')[:200],'label':label.strip()[:100],
-                        'end':end.timestamp()})
+                        'end':end.timestamp(),'temperature_range':temp_range,'unit':unit,
+                        'station':station,'station_reason':('Конфликт станций в правилах' if resolved.get('status')=='conflict' else 'Станция разрешения не определена однозначно') if not station else None,'date':day,'extreme':kind})
             if len(out)>=MAX_CANDIDATES:return out,True
     return out,False
+
+
+def prepare_forecasts(items,settings,now=None):
+    """Apply forecast gap, or clearly labelled price-only fallback on missing data.
+
+    A two-station fetch budget bounds latency and public provider traffic. Existing
+    cached forecasts don't consume that budget. Forecast distance is a heuristic,
+    not a probability, and a half-degree margin guards bucket rounding.
+    """
+    now=time.time() if now is None else now
+    settings={**DEFAULT,**settings}
+    stats={'forecast':0,'fallback':0,'excluded':0}
+    if settings['forecast_mode']=='off':
+        return [{**item,'forecast_info':{'mode':'off'}} for item in items],stats
+    result=[];station_cache={};day_cache={};budget=FORECAST_FETCHES_PER_PASS;reasons={}
+    for item in items:
+        code=item.get('station');key=(code,item.get('date'),item.get('extreme'))
+        if not code:
+            forecast=None;reason=item.get('station_reason') or 'Станция разрешения не определена однозначно'
+        else:
+            if code not in station_cache:
+                data,reason=scalp_forecast.get(code,permit_fetch=False,now=now)
+                if data is None and reason=='Лимит запросов прогноза за проход' and budget>0:
+                    budget-=1;data,reason=scalp_forecast.get(code,permit_fetch=True,now=now)
+                station_cache[code]=(data,reason)
+            data,reason=station_cache[code]
+            if key not in day_cache:
+                day_cache[key]=scalp_forecast.extreme(data,item.get('date'),item.get('extreme')) if data else None
+            forecast=day_cache[key]
+            if data and not forecast:reason='Прогноз на местные сутки неполон или недоступен'
+        if not forecast:
+            stats['fallback']+=1
+            reasons[reason or 'Прогноз недоступен']=reasons.get(reason or 'Прогноз недоступен',0)+1
+            result.append({**item,'forecast_info':{'mode':'fallback','reason':reason or 'Прогноз недоступен',
+                'station':code,'day':item.get('date')}})
+            continue
+        low,high=item['temperature_range']
+        # Polymarket commonly resolves integer degree buckets by rounding;
+        # widen all finite bounds by half a degree in the market's own units.
+        margin=.5 if item['unit']=='C' else 5/18
+        expanded=(None if low is None else low-margin,None if high is None else high+margin)
+        gap=opportunity_scan.range_gap((forecast['value_c'],forecast['value_c']),expanded)
+        gap_display=gap*(1.8 if settings['forecast_gap_units']=='F' else 1)
+        if gap_display+1e-9<float(settings['forecast_gap']):
+            stats['excluded']+=1;continue
+        stats['forecast']+=1
+        info={'mode':'forecast',**forecast,'distance':gap_display,'distance_units':settings['forecast_gap_units'],
+              'required_gap':settings['forecast_gap'],'bucket_margin':f"0.5 °{item['unit']}"}
+        result.append({**item,'forecast_info':info})
+    if reasons:stats['reasons']=reasons
+    # A large forecast gap is only a ranking heuristic; missing forecasts last.
+    result.sort(key=lambda item:(item['forecast_info']['mode']!='forecast',
+                               -item['forecast_info'].get('distance',0)))
+    return result,stats
 
 
 def _fee(size,price,rate):
@@ -180,12 +258,12 @@ def _seen(c,token,side,digest):
     return c.execute('SELECT 1 FROM web_scalp_demo_book_usage WHERE token=? AND side=? AND digest=?',(token,side,digest)).fetchone() is not None
 
 
-def process_books(market_list,books,now=None):
+def process_books(market_list,books,now=None,expected_revision=None):
     """Atomic demo ledger; repeats of the same snapshot cannot refill the same side."""
     now=time.time() if now is None else now
     with db.get_db() as c:
         c.execute('BEGIN IMMEDIATE')
-        cfg=c.execute('SELECT * FROM web_scalp_config WHERE id=1').fetchone();settings=json.loads(cfg['settings'])
+        cfg=c.execute('SELECT * FROM web_scalp_config WHERE id=1').fetchone();settings={**DEFAULT,**json.loads(cfg['settings'])}
         balance=D(cfg['balance']);rate=D(settings['fee_rate'])
         opened=[dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id')]
         # Always monitor hypothetical exits, even after stopping new entries.
@@ -207,12 +285,13 @@ def process_books(market_list,books,now=None):
                       (str(remaining),str(D(p['realized'])+pnl),now if remaining==0 else None,p['id']))
             c.execute('INSERT INTO web_scalp_demo_book_usage VALUES(?,?,?)',(p['token'],'SELL',digest))
             _record(c,'SELL',p['id'],sold,cost/sold,fees,pnl,'Виртуальная продажа по отображённым BID; не реальное исполнение.',now)
-        if cfg['enabled']:
+        if cfg['enabled'] and (expected_revision is None or cfg['revision']==expected_revision):
             opened=[dict(x) for x in c.execute('SELECT * FROM web_scalp_demo_positions WHERE closed IS NULL')]
             risk=sum((D(p['remaining'])*D(p['entry_price'])+D(p['entry_fee'])*D(p['remaining'])/D(p['original']) for p in opened),D(0))
             day_start=datetime.fromtimestamp(now,timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
             day_pnl=sum((D(x['pnl']) for x in c.execute("SELECT pnl FROM web_scalp_demo_log WHERE timestamp>=? AND kind='SELL' AND pnl IS NOT NULL",(day_start,))),D(0))
             for item in market_list:
+                if settings['forecast_mode']=='forecast' and (not isinstance(item.get('forecast_info'),dict) or item['forecast_info'].get('mode') not in ('forecast','fallback')):continue
                 if len(opened)>=settings['max_positions'] or day_pnl<=-D(settings['daily_loss']):break
                 if item['end']<=now or any(p['token']==item['token'] for p in opened):continue
                 book=books.get(item['token']);stamp=book.get('fetched_at') if isinstance(book,dict) else None
@@ -227,8 +306,8 @@ def process_books(market_list,books,now=None):
                 fee=_fee(size,ask,rate);profit=size*(target-ask)-fee-_fee(size,target,rate)
                 if size<D(settings['min_shares']) or profit<D(settings['min_profit']):continue
                 value=size*ask+fee
-                result=c.execute('''INSERT INTO web_scalp_demo_positions(token,condition_id,event_slug,title,label,opened,original,remaining,entry_price,entry_fee,target)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(item['token'],item['condition_id'],item['event_slug'],item['title'],item['label'],now,str(size),str(size),str(ask),str(fee),str(target)))
+                result=c.execute('''INSERT INTO web_scalp_demo_positions(token,condition_id,event_slug,title,label,opened,original,remaining,entry_price,entry_fee,target,forecast_info)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(item['token'],item['condition_id'],item['event_slug'],item['title'],item['label'],now,str(size),str(size),str(ask),str(fee),str(target),json.dumps(item.get('forecast_info'),ensure_ascii=True,allow_nan=False) if item.get('forecast_info') else None))
                 pid=result.lastrowid;balance-=value;risk+=value
                 opened.append({'token':item['token']})
                 c.execute('INSERT INTO web_scalp_demo_book_usage VALUES(?,?,?)',(item['token'],'BUY',digest))
@@ -247,6 +326,13 @@ def poll_once():
         active=[r['token'] for r in c.execute('SELECT token FROM web_scalp_demo_positions WHERE closed IS NULL ORDER BY id')]
         c.execute("UPDATE web_scalp_config SET heartbeat=?,status='checking',message='' WHERE id=1",(now,))
     try:
+        settings={**DEFAULT,**json.loads(cfg['settings'])}
+        # Do not delay monitoring existing virtual exits behind forecast requests.
+        if active:
+            exit_books={}
+            for i in range(0,min(len(active),BOOK_LIMIT),BATCH_SIZE):
+                exit_books.update(orderbook.fetch_batch(active[i:i+BATCH_SIZE]))
+            process_books([],exit_books,time.time(),expected_revision=cfg['revision'])
         discovery_error=False
         if cfg['enabled'] and (not _discovery or now-_discovery[0]>=DISCOVERY_INTERVAL):
             try:
@@ -260,12 +346,21 @@ def poll_once():
         if all_items and capacity:
             offset=_cursor%len(all_items);window=(all_items+all_items)[offset:offset+min(capacity,len(all_items))];_cursor=(offset+len(window))%len(all_items)
         else:window=[]
-        tokens=list(dict.fromkeys(active+[m['token'] for m in window]))[:BOOK_LIMIT];books={}
+        filtered,forecast_stats=prepare_forecasts(window,settings,now)
+        tokens=list(dict.fromkeys(m['token'] for m in filtered))[:capacity];books={}
         for i in range(0,len(tokens),BATCH_SIZE):books.update(orderbook.fetch_batch(tokens[i:i+BATCH_SIZE]))
-        now=time.time();process_books(window,books,now)
+        now=time.time()
+        # A long network pass must not use a stale snapshot as a fresh forecast.
+        for item in filtered:
+            info=item.get('forecast_info') or {}
+            if info.get('mode')=='forecast' and not 0<=now-info.get('fetched_at',0)<=scalp_forecast.FORECAST_TTL:
+                item['forecast_info']={'mode':'fallback','reason':'Прогноз устарел во время проверки','station':item.get('station'),'day':item.get('date')}
+                forecast_stats['forecast']-=1;forecast_stats['fallback']+=1
+                reasons=forecast_stats.setdefault('reasons',{});reason='Прогноз устарел во время проверки';reasons[reason]=reasons.get(reason,0)+1
+        process_books(filtered,books,now,expected_revision=cfg['revision'])
         unavailable=sum(1 for t in tokens if books.get(t) is None)
         with db.get_db() as c:c.execute("UPDATE web_scalp_config SET heartbeat=?,scan_at=?,status=?,message=? WHERE id=1",
-            (now,now,'partial' if unavailable or discovery_error or (_discovery and _discovery[2]) else 'ok',f'Кандидатов: {len(all_items)}; проверено: {len(window)}; недоступных стаканов: {unavailable}.'+(' Каталог недоступен; новые входы пропущены.' if discovery_error else ' Каталог ограничен.' if _discovery and _discovery[2] else '')))
+            (now,now,'partial' if unavailable or discovery_error or forecast_stats['fallback'] or (_discovery and _discovery[2]) else 'ok',f'Кандидатов: {len(all_items)}; проверено: {len(window)}; недоступных стаканов: {unavailable}.'+(f" Прогноз: прошли {forecast_stats['forecast']}, исключены {forecast_stats['excluded']}, без прогноза / только цена {forecast_stats['fallback']}."+(' Причины: '+', '.join(f'{k}: {v}' for k,v in forecast_stats.get('reasons',{}).items())+'.' if forecast_stats.get('reasons') else '') if settings['forecast_mode']=='forecast' else ' Погодный фильтр выключен.')+(' Каталог недоступен; новые входы пропущены.' if discovery_error else ' Каталог ограничен.' if _discovery and _discovery[2] else '')))
     except Exception:
         with db.get_db() as c:c.execute("UPDATE web_scalp_config SET heartbeat=?,status='error',message='Не удалось получить или обработать публичные данные.' WHERE id=1",(time.time(),))
 

@@ -1374,6 +1374,16 @@ $('#portfolio-page').addEventListener('click',e=>{const b=e.target.closest('.por
 // Auto Scalping is currently a demo-only public-data simulator.
 let scalpGeneration=0,scalpDirty=false,scalpBusy=false;
 function scalpNumber(x){return x===null||x===undefined||!Number.isFinite(Number(x))?'—':new Intl.NumberFormat('ru-RU',{maximumFractionDigits:4}).format(Number(x))}
+function scalpForecastDetail(info){
+  if(!info)return 'Прогноз для этой записи не сохранён.';
+  if(info.mode==='off')return 'Погодный фильтр выключен; вход только по цене.';
+  if(info.mode==='fallback')return `⚠ Без прогноза: ${info.reason||'нет данных'}; вход только по цене.`;
+  if(info.mode!=='forecast'||info.value_c==null||!Number.isFinite(Number(info.value_c)))return 'Прогноз недоступен.';
+  const c=Number(info.value_c),f=c*9/5+32,kind=info.kind==='max'?'максимум':'минимум';
+  const sources=Array.isArray(info.sources)?info.sources.join(' + '):'источник неизвестен';
+  const single=Number(info.single_hours)||0,oneSource=single?` · один источник в ${single} ч. из ${info.hours}`:'';
+  return `Прогноз ${kind}: ${scalpNumber(c)}°C / ${scalpNumber(f)}°F · ${info.station||'станция неизвестна'} · ${info.day||'дата неизвестна'} · ${sources} в точке экстремума${oneSource} · отступ ${scalpNumber(info.distance)}°${info.distance_units||'?'} (порог ${scalpNumber(info.required_gap)}°${info.distance_units||'?'}, запас границы ${info.bucket_margin||'—'}) · получен ${copyTime(info.fetched_at)}. Это не оценка вероятности.`;
+}
 function scalpChart(journal){
   const sells=journal.filter(x=>x.kind==='SELL'&&x.pnl!==null&&Number.isFinite(Number(x.pnl))).slice().reverse();
   if(!sells.length)return '<p>Для графика нужна хотя бы одна виртуальная продажа.</p>';
@@ -1389,12 +1399,13 @@ async function loadScalp(){
     form.querySelector('button[type=submit]').disabled=!!cfg.enabled||scalpBusy;
     $('#scalp-start').disabled=!!cfg.enabled||scalpBusy;$('#scalp-stop').disabled=!cfg.enabled||scalpBusy;
     const service={running:'работает',stale:'давно не отвечала',not_running:'не запущена'};
+    $('#scalp-status').classList.toggle('scalp-warning',/без прогноза \/ только цена [1-9]/.test(cfg.message||''));
     $('#scalp-status').textContent=`Служба: ${service[cfg.service]||'неизвестно'} · новые входы: ${cfg.enabled?'включены':'остановлены'} · ${cfg.message||'ожидание'}${cfg.scan_at?' · проверка '+copyTime(cfg.scan_at):''}`;
     const opened=positions.filter(p=>!p.closed),exposure=opened.reduce((n,p)=>n+Number(p.remaining)*Number(p.entry_price),0);
     $('#scalp-stats').innerHTML=`<div><small>ДЕМО · СВОБОДНО</small><strong>${esc(scalpNumber(cfg.balance))} pUSD</strong></div><div><small>ОТКРЫТО ПОЗИЦИЙ</small><strong>${opened.length}</strong></div><div><small>СТОИМОСТЬ ВХОДА ОСТАТКА</small><strong>≈ ${esc(scalpNumber(exposure))} pUSD</strong></div>`;
-    $('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small>${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';
+    $('#scalp-positions').innerHTML=positions.length?positions.map(p=>`<article class="scalp-row"><div><b>${esc(p.title||'Рынок')} · ${esc(p.label)} · NO</b><small>${p.closed?'Закрыта в демо':'Открыта в демо'} · вход ${esc(copyTime(p.opened))}</small><small>Вход ${esc(scalpNumber(p.entry_price))} pUSD · цель ${esc(scalpNumber(p.target))} pUSD · остаток ${esc(scalpNumber(p.remaining))} из ${esc(scalpNumber(p.original))} долей</small><small>Реализованный результат: ${esc(scalpNumber(p.realized))} pUSD · нереализованный не рассчитывается.</small><small class="${p.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(p.forecast_info))}</small>${copyEventLink(p.event_slug)} ${quickOpenButton(p.event_slug,p.token,p.condition_id)}</div></article>`).join(''):'Демо-позиций пока нет.';
     const byId=new Map(positions.map(p=>[p.id,p]));
-    $('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||x.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||x.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small>${quickOpenButton((byId.get(x.position_id)||x).event_slug,(byId.get(x.position_id)||x).token,(byId.get(x.position_id)||x).condition_id)}</div></article>`).join(''):'Виртуальных сделок пока нет.';
+    $('#scalp-journal').innerHTML=journal.length?journal.map(x=>`<article class="scalp-row"><div><b>${x.kind==='BUY'?'ВИРТУАЛЬНАЯ ПОКУПКА':'ВИРТУАЛЬНАЯ ПРОДАЖА'} · ${esc(copyTime(x.timestamp))}</b><small>${esc(byId.get(x.position_id)?.title||x.title||'Позиция #'+x.position_id)} · ${esc(byId.get(x.position_id)?.label||x.label||'')}</small><small>${esc(scalpNumber(x.size))} долей × ${esc(scalpNumber(x.price))} pUSD · оценка комиссии ${esc(scalpNumber(x.fee))} pUSD${x.pnl!==null?' · результат '+esc(scalpNumber(x.pnl))+' pUSD':''}</small><small>${esc(x.note)}</small><small class="${x.forecast_info?.mode==='fallback'?'scalp-warning':''}">${esc(scalpForecastDetail(x.forecast_info))}</small>${quickOpenButton((byId.get(x.position_id)||x).event_slug,(byId.get(x.position_id)||x).token,(byId.get(x.position_id)||x).condition_id)}</div></article>`).join(''):'Виртуальных сделок пока нет.';
     $('#scalp-chart').innerHTML=scalpChart(journal);
   }catch(e){if(generation===scalpGeneration)$('#scalp-status').textContent='Демо-скальпер недоступен: '+e.message}
 }

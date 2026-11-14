@@ -3,6 +3,17 @@ from web.market_station import identify_station
 
 
 class ResolutionParsingTests(unittest.TestCase):
+    def test_noaa_lowercase_timeseries_station_and_conflicts(self):
+        url='https://www.weather.gov/wrh/timeseries?site=kord'
+        result=identify_station({'resolutionSource':url})
+        self.assertEqual(result['status'],'found');self.assertEqual(result['candidate']['code'],'KORD')
+        self.assertEqual(result['candidate']['kind'],'NOAA Weather.gov')
+        result=identify_station({'resolutionSource':url,'description':'ICAO: KLGA'})
+        self.assertEqual(result['status'],'conflict')
+        for bad in ('https://evil-weather.gov/wrh/timeseries?site=kord','https://www.weather.gov/other?site=kord',
+                    'https://www.weather.gov/wrh/timeseries?site=kord&site=klga'):
+            self.assertEqual(identify_station({'resolutionSource':bad})['status'],'unknown')
+
     def test_resolution_source_link_and_date_suffix(self):
         url = 'https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA/date/2026-11-1'
         data = identify_station({'resolutionSource': url, 'description': f'Information at {url}.', 'markets': []})

@@ -152,3 +152,5 @@ select{display:block;width:100%;background:#10181b;color:#e8f0e9;border:1px soli
 .market-position-note{font-size:10px;color:#a6b1c2;margin:-3px 0 10px;line-height:1.45}
 .book-auto-sell{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0;font-size:11px;color:#b9c8e3}.book-auto-sell input{width:125px}.book-auto-sell small{flex-basis:100%;color:#9ca8bb;line-height:1.45}
 .book-auto-sell input{height:36px;padding:7px;border:1px solid #42546a;border-radius:5px;background:#111a25;color:#e4ecf7}
+
+#scalp-page .scalp-warning{color:#ffd08a;font-weight:700;background:#3a2b19;border-left:3px solid #e1a44b;padding:7px 9px;margin-top:6px}
