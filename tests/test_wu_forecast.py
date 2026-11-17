@@ -31,6 +31,7 @@ class WUForecastTests(unittest.TestCase):
         config.BASE_DIR = self.temp.name
         with wu._LOCK:
             wu._CACHE.clear()
+            wu._NEXT_KEY.clear()
             wu._BUSY = False
             wu._BLOCKED_UNTIL = 0
             wu._NEXT_REQUEST = 0
@@ -80,21 +81,36 @@ class WUForecastTests(unittest.TestCase):
         self.assertTrue(wu.remaining_complete(points, date(2026,11,1), 'America/New_York', start))
         self.assertFalse(wu.remaining_complete(points[:2]+points[3:], date(2026,11,1), 'America/New_York', start))
 
-    def test_http_rejection_tries_second_but_429_does_not(self):
+    def test_http_single_request_and_global_retry_spacing(self):
         now = int(time.time())
         data = {'validTimeUtc':[now+3600], 'temperature':[12]}
-        with patch.object(wu.requests,'get',side_effect=[Response(403),Response(200,data)]) as get:
-            status, points, _ = wu._fetch('EFHK',[K1,K2])
+        with patch.object(wu.requests,'get',return_value=Response(200,data)) as get:
+            status, points, _ = wu._fetch('EFHK',K1)
         self.assertEqual(status,'ok');self.assertEqual(points[0]['temp'],12)
-        self.assertEqual(get.call_count,2)
+        self.assertEqual(get.call_count,1)
         self.assertFalse(get.call_args.kwargs['allow_redirects'])
+        self.assertEqual(get.call_args.kwargs['params']['language'],'ru-RU')
         with patch.object(wu.requests,'get',return_value=Response(429,headers={'Retry-After':'3600'})) as get:
-            status, points, until = wu._fetch('EFHK',[K1,K2])
+            status, points, until = wu._fetch('EFHK',K1)
         self.assertEqual(status,'throttled');self.assertEqual(get.call_count,1)
         self.assertGreater(until,time.time()+3500)
         with patch.object(wu.requests,'get',side_effect=RuntimeError('secret '+K1)) as get:
-            self.assertEqual(wu._fetch('EFHK',[K1,K2])[0],'unavailable')
+            self.assertEqual(wu._fetch('EFHK',K1)[0],'unavailable')
             self.assertEqual(get.call_count,1)
+        self.add(K1); self.add(K2)
+        with patch.object(wu,'_fetch',return_value=('access_denied',[],0)) as fetch:
+            wu._BUSY=True;wu._load(('EFHK','UTC'),[K1,K2],wu._GENERATION,0)
+            self.assertEqual(fetch.call_args.args,('EFHK',K1))
+        self.assertEqual(wu._NEXT_KEY[('EFHK','UTC')],1)
+        with patch.object(wu.time,'time',return_value=now),patch.object(wu.time,'monotonic',return_value=now),patch.object(wu.threading,'Thread') as thread:
+            wu._NEXT_REQUEST=now+60
+            self.assertEqual(wu.get('EFHK','UTC')['status'],'waiting')
+            self.assertEqual(wu.get('KMIA','UTC')['status'],'waiting')
+            thread.assert_not_called()
+        with patch.object(wu.time,'time',return_value=now+60),patch.object(wu.time,'monotonic',return_value=now+60),patch.object(wu.threading,'Thread') as thread:
+            self.assertEqual(wu.get('EFHK','UTC')['status'],'loading')
+            self.assertEqual(thread.call_args.kwargs['args'][-1],1)
+            self.assertEqual(wu.get('KMIA','UTC')['status'],'loading')
 
     def test_invalid_no_key_and_disabled_no_network(self):
         with patch.object(wu.requests,'get') as request:

@@ -197,10 +197,13 @@ function renderArcExtrema(extrema,sunrise,sunset,current){
   if(!extrema){summary.innerHTML='<span class="arc-model-empty">Нет почасовых данных модели на эту дату</span>';return []}
   const source=extrema.remaining?'WU · ОСТАВШИЕСЯ ЧАСЫ':current?'ПРОГНОЗ · МОДЕЛИ':'МОДЕЛЬ ЗА ДАТУ';
   summary.innerHTML=[['min','МИНИМУМ',extrema.min],['max','МАКСИМУМ',extrema.max]].map(([kind,label,p])=>`<span class="arc-model-item ${kind}"><i></i><span><small>${source} · ${label}</small><b>${esc(tempText(p.temp))} <em>в ${esc(p.time)}</em></b></span></span>`).join('');
-  const marks=[['min','МИН',extrema.min],['max','МАКС',extrema.max]].map(([kind,label,p])=>({kind,label,forecast:p,point:curvePoint(p.seconds,sunrise,sunset)})).filter(x=>x.point);
+  const sameTime=extrema.min.seconds===extrema.max.seconds && extrema.min.temp===extrema.max.temp && (extrema.min.ms==null || extrema.max.ms==null || extrema.min.ms===extrema.max.ms);
+  if(sameTime)summary.insertAdjacentHTML('beforeend','<span class="arc-model-empty">При совпадении значений указан первый час.</span>');
+  const entries=sameTime?[['both','МИН = МАКС',extrema.min]]:[['min','МИН',extrema.min],['max','МАКС',extrema.max]];
+  const marks=entries.map(([kind,label,p])=>({kind,label,forecast:p,point:curvePoint(p.seconds,sunrise,sunset)})).filter(x=>x.point);
   group.innerHTML=marks.map(({kind,label,forecast:p,point})=>{
     const x=point.x,y=point.y,labelX=Math.max(70,Math.min(730,x)),labelY=kind==='min'?Math.min(213,y+29):Math.max(14,y-29);
-    return `<g class="arc-extreme ${kind}" tabindex="0" aria-label="${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)}"><title>${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)} · ${esc(Object.keys(p.sources||{}).join(' + ')||'Open-Meteo')}${p.interpolated?' (интерполяция)':''}, почасовая модель</title><line x1="${x}" y1="${y}" x2="${labelX}" y2="${kind==='min'?labelY-8:labelY+5}"/><circle cx="${x}" cy="${y}" r="${kind==='min'?5.5:3.7}"/><text x="${labelX}" y="${labelY}" text-anchor="middle">${label}</text></g>`;
+    return `<g class="arc-extreme ${kind}" tabindex="0" aria-label="${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)}"><title>${source} ${label}: ${esc(tempText(p.temp))}, ${esc(p.time)} · ${esc(Object.keys(p.sources||{}).join(' + ')||'Open-Meteo')}${p.interpolated?' (интерполяция)':''}, почасовая модель</title><line x1="${x}" y1="${y}" x2="${labelX}" y2="${kind==='min'?labelY-8:labelY+5}"/><circle cx="${x}" cy="${y}" r="${kind==='min'?5.5:kind==='both'?5:3.7}"/><text x="${labelX}" y="${labelY}" text-anchor="middle">${label}</text></g>`;
   }).join('');
   return marks;
 }
@@ -369,6 +372,19 @@ function ensembleCurrent(m,row,now){
   const obs=row?.observation,at=Number(row?.observed_at),fetched=Number(obs?.fetched_at),last=Number(obs?.last_observation);
   return end!==null&&!!obs&&Number.isFinite(at)&&start<=at&&at<=now&&now-at<=360&&Number.isFinite(fetched)&&0<=now-fetched&&now-fetched<=900&&Number.isFinite(last)&&0<=now-last&&now-last<=7200;
 }
+function wuMarketText(data,row,now){
+  const wu=row?.wu,station=state.weather?.station?.station_code;
+  if(!wu||!station||data?.station!==station||row.station!==station||row.date!==data.date)return '';
+  const fetched=Number(wu.fetched_at),start=Number(wu.local_start),end=Number(wu.local_end);
+  if(!Number.isFinite(fetched)||now<fetched||now-fetched>=1800||!Number.isFinite(start)||!Number.isFinite(end)||now>=end||!Number.isFinite(wu.temp))return '';
+  if(now>=start){
+    const obs=row.observation,observed=Number(row.observed_at),at=Number(obs?.fetched_at),last=Number(obs?.last_observation);
+    if(!wu.with_metar||!obs||!Number.isFinite(observed)||now-observed<0||now-observed>360||!Number.isFinite(at)||now-at<0||now-at>900||!Number.isFinite(last)||now-last<0||now-last>7200)return '';
+  }
+  const kind=wu.kind==='min'?'минимум':wu.kind==='max'?'максимум':null;if(!kind)return '';
+  const match=wu.match===true?'в этом диапазоне':wu.match===false?'вне этого диапазона':'граница не определена';
+  return `WU${wu.with_metar?' + METAR':''}: ${kind} ${tempText(wu.temp)} · ${match} · не вероятность`;
+}
 function renderOverviewEnsemble(){
   const data=overviewEnsemble?.slug===state.market?overviewEnsemble:null,now=Date.now()/1000;
   let status=data?.error||data?.reason||(!data?'ожидание данных':`${data.station||'станция неизвестна'} · ${data.date||'дата неизвестна'} · ${data.timezone||'часовой пояс ожидается'}`);
@@ -391,7 +407,8 @@ function renderOverviewEnsemble(){
         }else messages.push(`${m.name}: данные недоступны`);
       }
     }else messages.push(data?.error||data?.reason||(!data?'Ожидание ансамблей':'Для этого исхода оценка недоступна'));
-    slot.textContent=messages.join('\n');
+    const wuText=wuMarketText(data,row,now);slot.textContent=messages.join('\n');
+    if(wuText){const marker=document.createElement('span');marker.className='market-wu-marker '+(row.wu.match===true?'match':row.wu.match===false?'nonmatch':'boundary');marker.textContent=wuText;slot.append(marker)}
   });
 }
 

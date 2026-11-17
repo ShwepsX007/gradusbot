@@ -20,7 +20,7 @@ w.fetch=async(url,o={})=>{calls.push([url,o]);let data;
  else if(url.match(/^\/api\/stations\/\d+\/weather\?view=1$/)){const s=stations.find(s=>s.id===Number(url.split('/')[3]));data={station:s,forecast:{},metar:{}}}
  else if(url.match(/^\/api\/stations\/\d+\/bindings$/))data=[{id:1,market_slug:'first',market_name:'First'},{id:2,market_slug:'second',market_name:'Second'}];
  else if(url==='/api/market/first/ensemble'){await new Promise(r=>releaseEnsemble=r);data={slug:'first',station:'EGLL',date:'2030-01-01',timezone:'UTC',control:{last_run:now},outcomes:[{token:'102',token_yes:'101',label:'20°C',models:[model('ECMWF IFS',0,51),model('GEFS',1,31)]}]};}
- else if(url==='/api/market/second/ensemble')data={slug:'second',station:'LFPG',date:'2030-01-01',timezone:'UTC',control:{last_run:now},outcomes:[{token:'302',token_yes:'301',label:'Other',observed_at:now,observation,models:[model('ECMWF IFS',0,51),model('GEFS <img id=bad>',2,31)]}]};
+ else if(url==='/api/market/second/ensemble')data={slug:'second',station:'EGLL',date:'2030-01-01',timezone:'UTC',control:{last_run:now},outcomes:[{token:'302',token_yes:'301',label:'Other',station:'EGLL',date:'2030-01-01',observed_at:now,observation,wu:{kind:'max',temp:31,match:true,with_metar:true,fetched_at:now,local_start:now-3600,local_end:now+3600},models:[model('ECMWF IFS',0,51),model('GEFS <img id=bad>',2,31)]}]};
  else if(url.includes('/price-history?'))data={history:[],quotes:[],fidelity_minutes:15};
  else if(url.endsWith('/books'))data={pairs:url.includes('first')?[{yes:'101',no:'102'},{yes:'201',no:'202'}]:[{yes:'301',no:'302'}],books:{'101':book,'102':book,'201':book,'202':book,'301':book,'302':book},requested_at:Date.now()/1000};
  else if(url==='/api/market/first')data={market:{title:'First',closed:false,options:opts},positions:[]};
@@ -40,10 +40,10 @@ function set(field,value){const input=get(`.book-trade [data-field="${field}"]`)
  // Switch markets before the first response; it must not overwrite the new one.
  all('.market-tab')[1].click();await tick();await tick();
  let slot=get('.market-ensemble-row');assert(slot.textContent.includes('ECMWF IFS: YES 0% (0/51), NO 100% (51/51)'));
- assert(slot.textContent.includes('METAR · максимум 31°C / 87.8°F'));assert(slot.textContent.includes('GEFS <img id=bad>'));assert(!get('#bad'));
+ assert(slot.textContent.includes('METAR · максимум 31°C / 87.8°F'));assert(slot.textContent.includes('GEFS <img id=bad>'));assert(!get('#bad'));assert(slot.textContent.includes('WU + METAR: максимум 31°C · в этом диапазоне · не вероятность'));assert(slot.querySelector('.market-wu-marker.match'));
  releaseEnsemble();await tick();assert(get('.market-ensemble-row').textContent.includes('GEFS <img id=bad>'));
  // Stale or already-started local day can no longer look like a current estimate.
- w.Date.now=()=>Date.now()+3601000;w.renderOverviewEnsemble();assert(get('.market-ensemble-row').textContent.includes('сутки закончились'));
+ w.Date.now=()=>Date.now()+3601000;w.renderOverviewEnsemble();assert(get('.market-ensemble-row').textContent.includes('сутки закончились'));assert(!get('.market-ensemble-row').textContent.includes('WU + METAR:'));
  w.Date.now=()=>Date.now()+21601000;w.renderOverviewEnsemble();assert(get('.market-ensemble-row').textContent.includes('устарели'));
  assert.equal(posts().length,0);assert(get('#market-ensemble-note').textContent.includes('0% не означает невозможность'));
  console.log('Market ensemble UI: display, stale data, escaping, race and read-only safety OK');w.close();

@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history, wu_forecast, wu_config
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history, wu_forecast, wu_config, wu_market
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -1377,7 +1377,7 @@ def market_ensemble(slug):
     try:
         event=event_for_station(slug)
         if not event or event.get('slug')!=slug:return jsonify(error='Не удалось проверить правила события'),502
-        return jsonify(auto_scalp.scalp_ensemble.overview(event))
+        return jsonify(wu_market.attach(auto_scalp.scalp_ensemble.overview(event)))
     except Exception:
         app.logger.warning('Ensemble overview unavailable for %s',slug,exc_info=True)
         return jsonify(error='Наблюдение ансамблей временно недоступно'),503

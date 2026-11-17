@@ -157,3 +157,7 @@ select{display:block;width:100%;background:#10181b;color:#e8f0e9;border:1px soli
 
 /* Model frequencies are observational and distinct from market prices. */
 .market-ensemble-note{margin:18px 0 0;padding:10px 12px;border:1px solid #34435c;border-radius:7px;background:#192231;color:#aebed4;font-size:10px;line-height:1.5}.market-ensemble-note a{color:#bcd2ff}.market-ensemble-row{display:block;margin-top:6px;white-space:pre-line;overflow-wrap:anywhere;color:#b3c3db;font-size:10px;line-height:1.55;font-weight:400}.book-option .option-name{min-width:0}
+
+.arc-extreme.both circle{fill:#d9d0a0;stroke:#54768b;stroke-width:2.5}.arc-extreme.both text{fill:#dbdbba;stroke:#1a2925}.arc-extreme.both line{stroke:#dbdbba}
+
+.market-wu-marker{display:block;margin-top:3px;color:#a3b0ba}.market-wu-marker.match{color:#93d7a4;font-weight:700}.market-wu-marker.boundary{color:#eac48e}

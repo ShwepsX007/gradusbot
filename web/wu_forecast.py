@@ -18,6 +18,7 @@ import requests
 from web import wu_config
 
 _CACHE = {}
+_NEXT_KEY = {}
 _LOCK = threading.Lock()
 _BUSY = False
 _GENERATION = 0
@@ -36,6 +37,7 @@ def invalidate():
     with _LOCK:
         _GENERATION += 1
         _CACHE.clear()
+        _NEXT_KEY.clear()
 
 
 def parse_api(data, now):
@@ -76,51 +78,50 @@ def remaining_complete(points, day, tz, now):
     return now >= start and all(b-a == 3600 for a, b in zip(remaining, remaining[1:]))
 
 
-def _fetch(code, keys):
-    """No redirect or retry on 429/network errors; only rejected keys may fall back."""
-    for key in keys:
-        try:
-            with requests.get(_URL, params={'icaoCode': code, 'units': 'm', 'language': 'en-US', 'format': 'json', 'apiKey': key},
-                              timeout=(5, 15), allow_redirects=False, stream=True) as response:
-                status = response.status_code
-                if status == 429:
-                    now = time.time()
-                    raw = response.headers.get('Retry-After', '')
+def _fetch(code, key):
+    """Make exactly one request; never log a URL containing the key."""
+    try:
+        with requests.get(_URL, params={'icaoCode': code, 'units': 'm', 'language': 'ru-RU', 'format': 'json', 'apiKey': key},
+                          timeout=(5, 15), allow_redirects=False, stream=True) as response:
+            status = response.status_code
+            if status == 429:
+                now = time.time()
+                raw = response.headers.get('Retry-After', '')
+                try:
+                    until = now + max(0, int(raw))
+                except (ValueError, TypeError):
                     try:
-                        until = now + max(0, int(raw))
-                    except (ValueError, TypeError):
-                        try:
-                            date_value = parsedate_to_datetime(raw)
-                            until = date_value.timestamp() if date_value.tzinfo else 0
-                        except (ValueError, TypeError, OverflowError):
-                            until = 0
-                    return 'throttled', [], max(now + _TTL, until)
-                if status in (401, 403):
-                    continue
-                if status != 200:
-                    return 'unavailable', [], 0
-                chunks, size = [], 0
-                for chunk in response.iter_content(16384):
-                    size += len(chunk)
-                    if size > _MAX_BYTES:
-                        return 'invalid_response', [], 0
-                    chunks.append(chunk)
-                points = parse_api(json.loads(b''.join(chunks)), time.time())
-                return ('ok' if points else 'invalid_response'), points, 0
-        except Exception:
-            # requests exceptions include URLs containing API keys: do not log them.
-            return 'unavailable', [], 0
-    return 'access_denied', [], 0
+                        date_value = parsedate_to_datetime(raw)
+                        until = date_value.timestamp() if date_value.tzinfo else 0
+                    except (ValueError, TypeError, OverflowError):
+                        until = 0
+                return 'throttled', [], max(now + _TTL, until)
+            if status in (401, 403):
+                return 'access_denied', [], 0
+            if status != 200:
+                return 'unavailable', [], 0
+            chunks, size = [], 0
+            for chunk in response.iter_content(16384):
+                size += len(chunk)
+                if size > _MAX_BYTES:
+                    return 'invalid_response', [], 0
+                chunks.append(chunk)
+            points = parse_api(json.loads(b''.join(chunks)), time.time())
+            return ('ok' if points else 'invalid_response'), points, 0
+    except Exception:
+        # requests exceptions include URLs containing API keys: do not log them.
+        return 'unavailable', [], 0
 
-
-def _load(cache_key, keys, generation):
-    global _BUSY, _BLOCKED_UNTIL
+def _load(cache_key, keys, generation, key_index):
+    global _BUSY, _BLOCKED_UNTIL, _NEXT_REQUEST
     code, tz = cache_key
     result = {'status': 'unavailable', 'points': [], 'timezone': tz}
     blocked_until = 0
     try:
-        status, points, blocked_until = _fetch(code, keys)
-        result['status'] = status
+        with _LOCK:
+            _NEXT_REQUEST = time.monotonic() + 60
+        status, points, blocked_until = _fetch(code, keys[key_index])
+        result['status'] = 'waiting' if status == 'access_denied' and key_index + 1 < len(keys) else status
         if status == 'ok':
             now = time.time()
             day = datetime.fromtimestamp(now, ZoneInfo(tz)).date()
@@ -132,9 +133,15 @@ def _load(cache_key, keys, generation):
         with _LOCK:
             _BLOCKED_UNTIL = max(_BLOCKED_UNTIL, blocked_until)
             if generation == _GENERATION:
+                if result['status'] == 'waiting':
+                    _NEXT_KEY[cache_key] = key_index + 1
+                else:
+                    _NEXT_KEY.pop(cache_key, None)
                 _CACHE[cache_key] = (time.time(), result)
                 while len(_CACHE) > _MAX_ENTRIES:
-                    _CACHE.pop(next(iter(_CACHE)))
+                    expired_key = next(iter(_CACHE))
+                    _CACHE.pop(expired_key)
+                    _NEXT_KEY.pop(expired_key, None)
             _BUSY = False
 
 
@@ -159,17 +166,26 @@ def get(code, tz):
         if time.time() < _BLOCKED_UNTIL:
             return {'status': 'throttled', 'points': []}
         cached = _CACHE.get(cache_key)
-        if cached and time.time() - cached[0] < (_TTL if cached[1]['status'] == 'ok' else _RETRY):
+        if cached and cached[1]['status'] != 'waiting' and time.time() - cached[0] < (_TTL if cached[1]['status'] == 'ok' else _RETRY):
             return copy.deepcopy(cached[1])
         if _BUSY:
             return {'status': 'loading', 'points': []}
-        if time.time() < _NEXT_REQUEST:
+        if time.monotonic() < _NEXT_REQUEST:
             return {'status': 'waiting', 'points': []}
-        _NEXT_REQUEST = time.time() + 20
         _BUSY = True
         try:
-            threading.Thread(target=_load, args=(cache_key, keys, _GENERATION), daemon=True, name='wu-hourly').start()
+            threading.Thread(target=_load, args=(cache_key, keys, _GENERATION, min(_NEXT_KEY.get(cache_key, 0), len(keys)-1)), daemon=True, name='wu-hourly').start()
         except Exception:
             _BUSY = False
             return {'status': 'unavailable', 'points': []}
         return {'status': 'loading', 'points': []}
+
+
+def peek(code, tz, now=None):
+    """Return an already-fetched, fresh snapshot; never issue network requests."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        entry = _CACHE.get((code, tz))
+        if not entry or entry[1].get('status') != 'ok' or not 0 <= now-entry[0] < _TTL:
+            return None
+        return copy.deepcopy(entry[1])
