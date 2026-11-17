@@ -221,8 +221,8 @@ function renderHourlyStrip(w,now=Date.now()){
 }
 function renderWuStrip(w,now=Date.now()){
   const wu=w?.wu_forecast,list=$('#wu-strip-list'),scroll=list.scrollLeft;
-  const messages={loading:'Weather Underground загружается; пока используются модели.',unavailable:'Weather Underground недоступен или браузер не открыл страницу; используются модели.',browser_unavailable:'Chromium, chromedriver или Selenium недоступен; используются модели.',page_unrecognized:'Страница WU не совпадает со станцией или датой; используются модели.',disabled:'Weather Underground отключён; используются модели.',no_timezone:'Неизвестен часовой пояс станции; используются модели.',unsupported:'Некорректный ICAO; используются модели.'};
-  const points=(Array.isArray(wu?.points)?wu.points:[]).filter(p=>Number.isFinite(p.time)&&p.time*1000>=now&&Number.isFinite(p.temp)).slice(0,30);
+  const messages={loading:'Weather Underground загружается; пока используются модели.',unavailable:'API Weather Company недоступен; используются модели.',no_key:'Добавьте ключ WU в настройках через SSH-туннель; используются модели.',access_denied:'Ключи не имеют доступа к почасовому прогнозу 2 дня или отклонены; используются модели.',throttled:'Лимит WU исчерпан; запросы приостановлены, используются модели.',waiting:'Запрос WU отложен для ограничения частоты; используются модели.',invalid_response:'API WU вернул неполные или некорректные данные; используются модели.',config_error:'Настройки ключей WU недоступны; используются модели.',disabled:'Weather Underground отключён; используются модели.',no_timezone:'Неизвестен часовой пояс станции; используются модели.',unsupported:'Некорректный ICAO; используются модели.'};
+  const points=(Array.isArray(wu?.points)?wu.points:[]).filter(p=>Number.isFinite(p.time)&&p.time*1000>=now&&Number.isFinite(p.temp)).slice(0,48);
   list.replaceChildren();
   if(!points.length){list.textContent=messages[wu?.status]||'Нет доступных часов WU; используются модели.';}
   for(const p of points){
@@ -1149,10 +1149,28 @@ $('#ai-key-form').onsubmit=async e=>{e.preventDefault();if(!aiTunnel)return;cons
   if(!confirm('Сохранить ключ Gemini в незашифрованном защищённом файле на сервере?'))return;
   b.disabled=true;try{const data={action:'add_key',project:f.elements.project.value.trim(),key:f.elements.key.value,current_password:f.elements.current_password.value};renderAiConfig(await api('/api/ai/config',{method:'POST',body:JSON.stringify(data)}));f.reset();toast('Ключ добавлен')}catch(err){toast(err.message)}finally{b.disabled=!aiTunnel}
 };
+let wuTunnel=false;
+function setWuAccess(allowed){wuTunnel=!!allowed;$('#wu-key-form button').disabled=!wuTunnel;if(!wuTunnel){$('#wu-config-status').textContent='Ключи доступны только через SSH-туннель.';$('#wu-key-list').textContent='Ключи недоступны.'}}
+function renderWuConfig(data){
+  $('#wu-config-status').textContent=`SSH-туннель активен · ключей: ${(data.keys||[]).length}. Содержимое ключей не показывается.`;
+  const list=$('#wu-key-list');list.replaceChildren();
+  if(!data.keys?.length){list.textContent='Ключи не добавлены.';return}
+  data.keys.forEach((key,i)=>{
+    const row=document.createElement('div'),label=document.createElement('span'),button=document.createElement('button');row.className='ai-key-row';label.textContent=`Ключ ${i+1}`;button.type='button';button.className='button danger wu-key-delete';button.textContent='Удалить';button.disabled=!wuTunnel;
+    button.onclick=async()=>{const password=prompt('Введите текущий пароль терминала для удаления ключа:');if(password===null)return;if(!password){toast('Введите пароль');return}if(!confirm('Удалить ключ WU с сервера?'))return;button.disabled=true;try{renderWuConfig(await api('/api/wu/config',{method:'POST',body:JSON.stringify({action:'delete_key',id:key.id,current_password:password})}));toast('Ключ удалён')}catch(err){toast(err.message);button.disabled=false}};
+    row.append(label,button);list.append(row);
+  });
+}
+async function loadWuConfig(){if(!wuTunnel)return;try{renderWuConfig(await api('/api/wu/config'))}catch(err){$('#wu-config-status').textContent='Настройки WU недоступны: '+err.message}}
+$('#wu-key-form').onsubmit=async e=>{e.preventDefault();if(!wuTunnel)return;const form=e.currentTarget,button=form.querySelector('button');
+  if(!form.elements.authorized.checked){toast('Подтвердите разрешение на запросы.');return}
+  if(!confirm('Сохранить ключ WU на сервере и разрешить автоматические запросы? Они могут быть платными.'))return;
+  button.disabled=true;try{const data={action:'add_key',key:form.elements.key.value,authorized:true,current_password:form.elements.current_password.value};renderWuConfig(await api('/api/wu/config',{method:'POST',body:JSON.stringify(data)}));form.reset();toast('Ключ WU добавлен')}catch(err){toast(err.message)}finally{button.disabled=!wuTunnel}
+};
 async function loadSettings(){try{let s=await api('/api/settings');Object.entries(s).forEach(([k,v])=>{$(`#settings-form [name="${k}"]`).value=v});state.units=['C','F','B'].includes(s.units)?s.units:'C'}catch(e){toast(e.message)}}
 async function loadSecurityInfo(){
   const form=$('#password-form'),button=form.querySelector('button'),accountButton=$('#account-form button[type=submit]'),deleteButton=$('#account-delete'),controlButton=$('#trade-control-form button');button.disabled=true;accountButton.disabled=true;deleteButton.disabled=true;controlButton.disabled=true;
-  try{let s;try{s=await api('/api/security-info')}catch(e){setAiAccess(false);setCopyNoticeAccess(false);throw e}setAiAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel)loadAiConfig();button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;$('#monitor-interval-form button').disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
+  try{let s;try{s=await api('/api/security-info')}catch(e){setAiAccess(false);setWuAccess(false);setCopyNoticeAccess(false);throw e}setAiAccess(s.tunnel);setWuAccess(s.tunnel);setCopyNoticeAccess(s.tunnel);if(s.tunnel){loadAiConfig();loadWuConfig()}button.disabled=!s.tunnel;accountButton.disabled=!s.tunnel;deleteButton.disabled=!s.tunnel;controlButton.disabled=!s.tunnel;$('#monitor-interval-form button').disabled=!s.tunnel;tradeEnabled=!!s.trading_enabled;updateTradingControls();$('#trade-control-status').textContent=tradeEnabled?'Реальная торговля включена.':'Торговля выключена.';$('#password-status').textContent=s.tunnel?'SSH-туннель: защищённое подключение к серверу.':'Смена пароля недоступна: требуется настроенный SSH-туннель.';
     if(s.tunnel){try{const interval=await api('/api/trading/monitor-interval');$('#monitor-interval-form [name=interval_seconds]').value=interval.interval_seconds;$('#monitor-interval-status').textContent='Служба применит изменение при следующей проверке.'}catch(e){$('#monitor-interval-status').textContent='Интервал недоступен: '+e.message}const c=await api('/api/trading/account-config');$('#account-config-status').textContent=c.configured?`Настроен кошелёк ${c.wallet} · тип подписи ${c.signature_type}. Доступ к бирже ещё нужно проверить.`:'Аккаунт ещё не настроен.'}
     else {$('#account-config-status').textContent='Настройка доступна только через SSH-туннель.';$('#monitor-interval-status').textContent='Требуется SSH-туннель.';}
   }catch(e){$('#password-status').textContent='Не удалось проверить подключение: '+e.message;$('#account-config-status').textContent='Не удалось получить состояние аккаунта.'}

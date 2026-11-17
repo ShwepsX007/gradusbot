@@ -6,4 +6,3 @@ eth-account
 web3
 python-dotenv
 Flask>=3.0,<4
-selenium>=4.20,<5

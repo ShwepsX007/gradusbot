@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history, wu_forecast
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history, wu_forecast, wu_config
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -868,6 +868,31 @@ def weather(sid, active_view=False):
     result['forecast_history_status']='error' if history_error else 'ok'
     if not metar: result['message'] = 'METAR временно недоступен'
     return jsonify(result)
+
+
+@app.route('/api/wu/config', methods=['GET','POST'])
+def weather_underground_config():
+    if not trusted_ssh_tunnel():return jsonify(error='Настройки WU доступны только через SSH-туннель.'),403
+    if request.method=='GET':
+        try:return jsonify(wu_config.public_config())
+        except wu_config.ConfigError as exc:return jsonify(error=str(exc)),exc.status
+        except Exception:return jsonify(error='Не удалось прочитать защищённые настройки WU.'),503
+    name='wu-config:'+(request.remote_addr or 'unknown')
+    if not login_allowed(name):return jsonify(error='Слишком много попыток. Повторите через 15 минут.'),429
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict) or not isinstance(data.get('current_password'),str):return jsonify(error='Введите текущий пароль терминала.'),400
+    try:valid=len(data['current_password'])<=256 and check_password_hash(current_password_hash(),data['current_password'])
+    except (ValueError,TypeError):valid=False
+    if not valid:return jsonify(error='Неверный пароль терминала.'),400
+    with _login_lock:_login_attempts.pop(name,None)
+    try:
+        result=wu_config.update(data)
+        wu_forecast.invalidate()
+        return jsonify(result)
+    except wu_config.ConfigError as exc:return jsonify(error=str(exc)),exc.status
+    except Exception:
+        app.logger.error('Failed to save WU settings')
+        return jsonify(error='Не удалось безопасно сохранить настройки WU.'),503
 
 
 @app.route('/api/ai/config', methods=['GET','POST'])
