@@ -19,6 +19,7 @@ from web import wu_config
 
 _CACHE = {}
 _NEXT_KEY = {}
+_REQUESTED = {}
 _LOCK = threading.Lock()
 _BUSY = False
 _GENERATION = 0
@@ -38,6 +39,7 @@ def invalidate():
         _GENERATION += 1
         _CACHE.clear()
         _NEXT_KEY.clear()
+        _REQUESTED.clear()
 
 
 def parse_api(data, now):
@@ -119,7 +121,7 @@ def _load(cache_key, keys, generation, key_index):
     blocked_until = 0
     try:
         with _LOCK:
-            _NEXT_REQUEST = time.monotonic() + 60
+            _NEXT_REQUEST = time.monotonic() + 20
         status, points, blocked_until = _fetch(code, keys[key_index])
         result['status'] = 'waiting' if status == 'access_denied' and key_index + 1 < len(keys) else status
         if status == 'ok':
@@ -163,6 +165,9 @@ def get(code, tz):
             return {'status': 'config_error', 'points': []}
         if not keys:
             return {'status': 'no_key', 'points': []}
+        _REQUESTED[cache_key] = time.monotonic()
+        while len(_REQUESTED) > _MAX_ENTRIES:
+            _REQUESTED.pop(next(iter(_REQUESTED)))
         if time.time() < _BLOCKED_UNTIL:
             return {'status': 'throttled', 'points': []}
         cached = _CACHE.get(cache_key)
@@ -189,3 +194,12 @@ def peek(code, tz, now=None):
         if not entry or entry[1].get('status') != 'ok' or not 0 <= now-entry[0] < _TTL:
             return None
         return copy.deepcopy(entry[1])
+
+
+def poll_requested(code, tz):
+    """Only poll a station/zone previously requested by a valid overview."""
+    with _LOCK:
+        requested = _REQUESTED.get((code, tz))
+        if requested is None or not 0 <= time.monotonic()-requested <= 300:
+            return {'status': 'not_loaded', 'points': []}
+    return get(code, tz)

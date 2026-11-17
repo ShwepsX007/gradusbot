@@ -32,6 +32,7 @@ class WUForecastTests(unittest.TestCase):
         with wu._LOCK:
             wu._CACHE.clear()
             wu._NEXT_KEY.clear()
+            wu._REQUESTED.clear()
             wu._BUSY = False
             wu._BLOCKED_UNTIL = 0
             wu._NEXT_REQUEST = 0
@@ -98,19 +99,50 @@ class WUForecastTests(unittest.TestCase):
             self.assertEqual(wu._fetch('EFHK',K1)[0],'unavailable')
             self.assertEqual(get.call_count,1)
         self.add(K1); self.add(K2)
-        with patch.object(wu,'_fetch',return_value=('access_denied',[],0)) as fetch:
+        with patch.object(wu.time,'monotonic',return_value=now),patch.object(wu,'_fetch',return_value=('access_denied',[],0)) as fetch:
             wu._BUSY=True;wu._load(('EFHK','UTC'),[K1,K2],wu._GENERATION,0)
+            self.assertEqual(wu._NEXT_REQUEST,now+20)
             self.assertEqual(fetch.call_args.args,('EFHK',K1))
         self.assertEqual(wu._NEXT_KEY[('EFHK','UTC')],1)
         with patch.object(wu.time,'time',return_value=now),patch.object(wu.time,'monotonic',return_value=now),patch.object(wu.threading,'Thread') as thread:
-            wu._NEXT_REQUEST=now+60
+            wu._NEXT_REQUEST=now+20
             self.assertEqual(wu.get('EFHK','UTC')['status'],'waiting')
             self.assertEqual(wu.get('KMIA','UTC')['status'],'waiting')
             thread.assert_not_called()
-        with patch.object(wu.time,'time',return_value=now+60),patch.object(wu.time,'monotonic',return_value=now+60),patch.object(wu.threading,'Thread') as thread:
+        with patch.object(wu.time,'time',return_value=now+19.9),patch.object(wu.time,'monotonic',return_value=now+19.9),patch.object(wu.threading,'Thread') as thread:
+            self.assertEqual(wu.get('EFHK','UTC')['status'],'waiting')
+            self.assertEqual(wu.get('KMIA','UTC')['status'],'waiting')
+            thread.assert_not_called()
+        with patch.object(wu.time,'time',return_value=now+20),patch.object(wu.time,'monotonic',return_value=now+20),patch.object(wu.threading,'Thread') as thread:
             self.assertEqual(wu.get('EFHK','UTC')['status'],'loading')
             self.assertEqual(thread.call_args.kwargs['args'][-1],1)
             self.assertEqual(wu.get('KMIA','UTC')['status'],'loading')
+
+    def test_success_cache_and_429_pause_are_preserved(self):
+        self.add()
+        now=time.time()
+        wu._CACHE[('EFHK','UTC')]=(now,{'status':'ok','points':[{'time':now+3600,'temp':2}]})
+        with patch.object(wu.requests,'get') as request:
+            self.assertEqual(wu.get('EFHK','UTC')['status'],'ok')
+            self.assertEqual(wu.get('EFHK','UTC')['status'],'ok')
+            request.assert_not_called()
+            wu._BLOCKED_UNTIL=now+1800
+            self.assertEqual(wu.get('KMIA','UTC')['status'],'throttled')
+            request.assert_not_called()
+        self.assertEqual(wu._TTL,1800);self.assertEqual(wu._RETRY,600)
+
+    def test_poll_only_uses_previously_requested_station_and_zone(self):
+        self.add()
+        with patch.object(wu.threading,'Thread') as thread:
+            self.assertEqual(wu.poll_requested('EFHK','Europe/Helsinki')['status'],'not_loaded')
+            self.assertEqual(wu.get('EFHK','Europe/Helsinki')['status'],'loading')
+            thread.assert_called_once()
+            self.assertEqual(wu.poll_requested('EFHK','UTC')['status'],'not_loaded')
+            self.assertEqual(wu.poll_requested('KMIA','Europe/Helsinki')['status'],'not_loaded')
+            self.assertEqual(wu.poll_requested('EFHK','Europe/Helsinki')['status'],'loading')
+            thread.assert_called_once()
+        wu.invalidate()
+        self.assertEqual(wu.poll_requested('EFHK','Europe/Helsinki')['status'],'not_loaded')
 
     def test_invalid_no_key_and_disabled_no_network(self):
         with patch.object(wu.requests,'get') as request:

@@ -17,6 +17,17 @@ class WUConfigApiTests(unittest.TestCase):
         self.client.environ_base['HTTP_X_CSRF_TOKEN']='csrf'
     def tearDown(self):
         web.db.DB_FILE=self.old_db;web.app.config.clear();web.app.config.update(self.old_config);config.BASE_DIR=self.base;self.temp.cleanup()
+    def test_station_status_poll_checks_view_and_station(self):
+        sid=web.db.add_station('Helsinki','','','EFHK','metar')
+        with patch.object(wu_forecast,'poll_requested',return_value={'status':'loading','points':[]}) as poll:
+            self.assertEqual(self.client.get(f'/api/stations/{sid}/wu-forecast?tz=Europe/Helsinki').status_code,400)
+            self.assertEqual(self.client.get('/api/stations/99999/wu-forecast?view=1&tz=UTC').status_code,404)
+            self.assertEqual(self.client.get(f'/api/stations/{sid}/wu-forecast?view=1&tz=not-a-zone').get_json()['status'],'unsupported')
+            poll.assert_not_called()
+            response=self.client.get(f'/api/stations/{sid}/wu-forecast?view=1&tz=Europe/Helsinki')
+            self.assertEqual(response.get_json()['status'],'loading')
+            poll.assert_called_once_with('EFHK','Europe/Helsinki')
+
     def test_tunnel_password_csrf_and_no_key_leak(self):
         secret='WU_fake_token_123456789'
         payload={'action':'add_key','key':secret,'authorized':True,'current_password':'password'}

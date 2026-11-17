@@ -870,6 +870,18 @@ def weather(sid, active_view=False):
     return jsonify(result)
 
 
+@app.get('/api/stations/<int:sid>/wu-forecast')
+def station_wu_forecast(sid):
+    if request.args.get('view') != '1':return jsonify(error='Требуется открытый обзор.'),400
+    station=db.get_station(sid)
+    if not station:return jsonify(error='Станция не найдена'),404
+    code=str(station.get('station_code') or '').upper()
+    tz=request.args.get('tz','')
+    if station.get('station_type')!='metar' or not re.fullmatch(r'[A-Z0-9]{4}',code) or not forecast_ensemble.valid_timezone(tz):
+        return jsonify(status='unsupported',points=[])
+    return jsonify(wu_forecast.poll_requested(code,tz))
+
+
 @app.route('/api/wu/config', methods=['GET','POST'])
 def weather_underground_config():
     if not trusted_ssh_tunnel():return jsonify(error='Настройки WU доступны только через SSH-туннель.'),403

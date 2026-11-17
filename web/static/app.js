@@ -9,9 +9,9 @@ const demoToday=localDate('America/New_York');
 const demoWeather = {station:demoStation,metar:{temp:23,humidity:64,wind_speed:8,wind_ms:4.1,wind_dir:210,wx_phrase:'SCT',cloud:{description:'Переменная облачность',code:'SCT'},precipitation:{description:'Осадки не указаны'},raw_metar:'KLGA 151651Z 21008KT 10SM SCT045 23/16 A3012'},info:{name:'LaGuardia Airport'},forecast:{timezone:'America/New_York',daily:{sunrise:[-1,0,1].map(i=>shiftDate(demoToday,i)+'T05:24'),sunset:[-1,0,1].map(i=>shiftDate(demoToday,i)+'T20:30'),temperature_2m_max:[27,27,27],temperature_2m_min:[18,18,18]},hourly:{time:Array.from({length:48},(_,i)=>shiftDate(demoToday,Math.floor(i/24))+'T'+String(i%24).padStart(2,'0')+':00'),temperature_2m:Array.from({length:48},(_,i)=>Math.round(22+5*Math.sin(((i%24)-9)*Math.PI/12))),precipitation_probability:Array.from({length:48},(_,i)=>i%24>=15?65:20)}},history:[20,19,18,18,19,20,22,23,25,26,27,26,25,24,23].map((v,i)=>[Date.now()/1000-(14-i)*3600,v])};
 const demoOptions = [{label:'20°C или ниже',prob:4},{label:'21–22°C',prob:12},{label:'23–24°C',prob:28},{label:'25–26°C',prob:36},{label:'27°C или выше',prob:20}];
 let csrfToken = '';
-let toastTimer,weatherViewEpoch=0,weatherController=null,weatherLoadingSid=null,pageNavigationEpoch=0,quickOpenBusy=false;
+let toastTimer,weatherViewEpoch=0,weatherController=null,weatherLoadingSid=null,wuStatusTimer=null,wuStatusController=null,pageNavigationEpoch=0,quickOpenBusy=false;
 function overviewActive(){return !document.hidden&&!$('#weather-page').classList.contains('hidden')&&!state.demo&&!!state.selected}
-function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherController.abort();weatherController=null;weatherLoadingSid=null}
+function stopViewRequests(){weatherViewEpoch++;if(weatherController)weatherController.abort();if(wuStatusController)wuStatusController.abort();clearTimeout(wuStatusTimer);weatherController=null;weatherLoadingSid=null;wuStatusController=null;wuStatusTimer=null}
 function resumeOverview(){return loadStation(state.weather?.station?.id===state.selected)}
 function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500)}
 async function api(url, options={}){const r=await fetch(url,{...options,headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken,...(options.headers||{})}});if(r.status===401){location.assign('/login');throw Error('Сессия завершена')}let data;try{data=await r.json()}catch{throw Error('Ошибка ответа сервера')}if(!r.ok){const e=Error(data.error||'Ошибка запроса');e.code=data.code;e.nonces=data.nonces;throw e}return data}
@@ -36,6 +36,21 @@ $('#station-picker').addEventListener('toggle',()=>{if($('#station-picker').open
 document.addEventListener('click',event=>{if(!$('#station-picker').contains(event.target))$('#station-picker').open=false});
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('#station-picker').open){$('#station-picker').open=false;$('#station-picker summary').focus()}});
 
+function scheduleWuStatus(sid,seq,tz,attempt=0){
+  if(!tz||attempt>=30||!overviewActive()||state.selected!==sid||seq!==weatherViewEpoch||!['loading','waiting'].includes(state.weather?.wu_forecast?.status))return;
+  clearTimeout(wuStatusTimer);
+  wuStatusTimer=setTimeout(async()=>{
+    wuStatusTimer=null;if(!overviewActive()||state.selected!==sid||seq!==weatherViewEpoch)return;
+    const controller=new AbortController();wuStatusController=controller;
+    try{
+      const data=await api(`/api/stations/${sid}/wu-forecast?view=1&tz=${encodeURIComponent(tz)}`,{signal:controller.signal});
+      if(seq!==weatherViewEpoch||!overviewActive()||state.selected!==sid||state.weather?.station?.id!==sid)return;
+      state.weather.wu_forecast=data;renderWeather();
+      if(['loading','waiting'].includes(data.status))scheduleWuStatus(sid,seq,tz,attempt+1);
+    }catch(e){/* Regular overview refresh will retry; never restart a hidden view. */}
+    finally{if(wuStatusController===controller)wuStatusController=null}
+  },5000);
+}
 async function loadStation(background=false){
   if(!overviewActive())return;
   const sid=state.selected;
@@ -48,7 +63,7 @@ async function loadStation(background=false){
     const [w,b]=await Promise.all([api(`/api/stations/${sid}/weather?view=1`,{signal:controller.signal}),api(`/api/stations/${sid}/bindings`,{signal:controller.signal})]);
     if(seq!==weatherViewEpoch||!overviewActive()||state.selected!==sid||w.station.id!==sid)return;
     const stationIndex=state.stations.findIndex(x=>x.id===sid);if(stationIndex>=0)state.stations[stationIndex]={...state.stations[stationIndex],...w.station};
-    state.weather=w;state.bindings=b;const chosen=state.market||previousMarket;state.market=b.some(x=>x.market_slug===chosen)?chosen:(b[0]?.market_slug||null);renderWeather();renderMarketTabs();await loadMarket();
+    state.weather=w;state.bindings=b;const chosen=state.market||previousMarket;state.market=b.some(x=>x.market_slug===chosen)?chosen:(b[0]?.market_slug||null);renderWeather();scheduleWuStatus(sid,seq,w.forecast_ensemble?.timezone||(w.solar_days||[]).find(x=>x.timezone)?.timezone);renderMarketTabs();await loadMarket();
   }catch(e){if(seq===weatherViewEpoch&&e.name!=='AbortError')toast(e.message)}
   finally{if(seq===weatherViewEpoch){weatherController=null;weatherLoadingSid=null}}
 }
