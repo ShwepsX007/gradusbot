@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database as db
 import utils
 from web.weather import cloud_description, precipitation_description
-from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history
+from web import metar_archive, forecast_ensemble, forecast_history, ai_forecast, opportunity_scan, book_history, wu_forecast
 from web.market_station import identify_station
 from web.orderbook import fetch_event_books
 from web.temperature_scan import event_summary, apply_timezone_batch
@@ -859,6 +859,10 @@ def weather(sid, active_view=False):
             'met_norway_fetched_at':metno.get('fetched_at')}
     else:
         result['forecast_status']={'reason':'no_coordinates'}
+    # Only the visible overview requests WU; bot, AI and trading stay independent.
+    if request.args.get('view') == '1':
+        wu_tz = (result.get('forecast_ensemble') or {}).get('timezone') or next((s.get('timezone') for s in result['solar_days'] if forecast_ensemble.valid_timezone(s.get('timezone'))), None)
+        result['wu_forecast'] = wu_forecast.get(code, wu_tz)
     try:result['forecast_comparison']=forecast_history.compare(sid,metar)
     except Exception:app.logger.warning('Could not compare forecast snapshot');result['forecast_comparison']=None;history_error=True
     result['forecast_history_status']='error' if history_error else 'ok'

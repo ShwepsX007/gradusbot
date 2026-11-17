@@ -82,6 +82,21 @@ class ForecastTests(unittest.TestCase):
         with patch.object(fe.requests,'get') as request:
             result=fe.get_metno(1,2);request.assert_not_called()
         self.assertEqual(result['status'],'loading');self.assertIsNone(result['data'])
+    def test_wu_is_requested_only_for_visible_overview(self):
+        sid=web.db.add_station('x','','','EGLL','metar');web.db.update_station(sid,enabled=1)
+        web.app.config.update(WEB_AUTH_CONFIGURED=True,WEB_USERNAME='test',WEB_PASSWORD_HASH='hash')
+        client=web.app.test_client()
+        with client.session_transaction() as sess:
+            sess['auth_user']='test';sess['auth_version']=web.auth_version();sess['csrf']='csrf'
+        sample={'timezone':'Europe/London','hourly':{'epoch':[],'temperature_2m':[]}}
+        with patch.object(web.metar_archive,'refresh'),patch.object(web,'station_info',return_value={'lat':51.47,'lon':-0.45}),patch.object(web.utils,'fetch_metar',return_value=None),patch.object(web,'forecast',return_value=sample),patch.object(fe,'get_metno',return_value={'status':'unavailable','data':None}),patch.object(web.wu_forecast,'get',return_value={'status':'loading','points':[]}) as wu:
+            ordinary=client.get(f'/api/stations/{sid}/weather').get_json()
+            self.assertNotIn('wu_forecast',ordinary);wu.assert_not_called()
+            view=client.get(f'/api/stations/{sid}/weather?view=1').get_json()
+            self.assertEqual(view['wu_forecast']['status'],'loading')
+            wu.assert_called_once_with('EGLL','Europe/London')
+            self.assertNotIn('wu_forecast',view['forecast_ensemble'])
+
     def test_malformed_timezones_are_not_accepted(self):
         for name in (None,'','Not/AZone','../Europe/London'):
             self.assertFalse(fe.valid_timezone(name))

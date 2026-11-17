@@ -114,6 +114,16 @@
     points.sort((a,b)=>a.ms-b.ms);
     return {min:points.reduce((a,b)=>b.temp<a.temp?b:a),max:points.reduce((a,b)=>b.temp>a.temp?b:a),count:points.length};
   }
+  // WU page may omit past hours. Never label a partial remainder as a daily extreme.
+  function wuExtremaForDay(wu, day, now=Date.now()) {
+    if(wu?.status!=='ok'||!wu.complete_remaining||wu.day!==day||!wu.timezone||!Array.isArray(wu.points))return null;
+    const localNow=localClock(now,wu.timezone);if(!localNow||localNow.day!==day)return null;
+    const points=wu.points.filter(p=>typeof p.time==='number'&&Number.isFinite(p.time)&&p.time*1000>=now&&typeof p.temp==='number'&&Number.isFinite(p.temp)).map(p=>{
+      const local=localClock(p.time*1000,wu.timezone);return local?.day===day?{time:local.time,seconds:local.seconds,temp:p.temp,ms:p.time*1000,sources:{'Weather Underground':p.temp}}:null;
+    }).filter(Boolean).sort((a,b)=>a.ms-b.ms);
+    if(!points.length||points[0].ms-now>3600000||points.some((p,i)=>i&&p.ms-points[i-1].ms!==3600000))return null;
+    return {min:points.reduce((a,b)=>b.temp<a.temp?b:a),max:points.reduce((a,b)=>b.temp>a.temp?b:a),count:points.length,source:'Weather Underground',remaining:true};
+  }
   function metarIcon(metar, isDay=true) {
     if(!metar || typeof metar!=='object')return {kind:'unknown',label:'Нет данных METAR'};
     const precip=Array.isArray(metar.precipitation?.codes)?metar.precipitation.codes:[];
@@ -243,7 +253,7 @@
     return (Array.isArray(events)?events:[]).map(event=>({event,time:scanTimeInfo(event,deviceTz,now)}))
       .sort((a,b)=>a.time.rank-b.time.rank||a.time.seconds-b.time.seconds||(a.event.date||'').localeCompare(b.event.date||'')||String(a.event.title).localeCompare(String(b.event.title)));
   }
-  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, ensembleExtremaForDay, metarIcon, observationsForDay, layoutArcArrows, layoutArcTemperatures, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
+  const result = {zonedEpoch, precipitationForecast, localClock, shiftDay, solarSeconds, curvePoint, dailyPath, hourlyExtremaForDay, ensembleExtremaForDay, wuExtremaForDay, metarIcon, observationsForDay, layoutArcArrows, layoutArcTemperatures, metarChart, halfHourTicks, nearestChartPoint, zoneOffsetMinutes, scanTimeInfo, sortTemperatureMarkets, DAY_START_X, DAY_WIDTH, HORIZON};
   if (typeof module !== 'undefined' && module.exports) module.exports = result;
   else root.WeatherView = result;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
