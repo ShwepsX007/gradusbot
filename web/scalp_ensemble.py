@@ -1,9 +1,10 @@
 """Observational model distributions for the demo scalper; never submits trades.
 
-The background observer only handles a small bounded set of open demo positions
-and recent demo candidates. Its results cannot influence the demo ledger.
+The background observer handles a bounded set of demo positions, candidates and
+recently viewed markets. Its results cannot influence the demo ledger.
 """
 import json
+import bisect
 import math
 import re
 import threading
@@ -13,7 +14,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 import database as db
-from web import scalp_forecast, opportunity_scan, temperature_scan, orderbook, market_station
+import utils
+from web import scalp_forecast, opportunity_scan, temperature_scan, orderbook, market_station, metar_archive
 
 MODELS={'ECMWF IFS':('ecmwf_ifs025',51),'GEFS':('gfs025',31)}
 URL='https://ensemble-api.open-meteo.com/v1/ensemble'
@@ -23,6 +25,9 @@ INTERVAL=120
 MAX_BYTES=1024*1024
 MAX_ITEMS=50
 VIEW_LEASE=150
+METAR_REFRESH=300
+METAR_MAX_AGE=900
+METAR_GAP=7200
 RETAIN=8*86400
 _lock=threading.Lock()
 _candidates=[]
@@ -41,6 +46,8 @@ def init_db():
             if col not in cols:c.execute(f'ALTER TABLE web_scalp_ensemble_cache ADD COLUMN {col} TEXT')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_views (
           slug TEXT PRIMARY KEY, station TEXT NOT NULL, day TEXT NOT NULL, touched REAL NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_metar (
+          station TEXT PRIMARY KEY, payload TEXT, fetched REAL, next_attempt REAL NOT NULL DEFAULT 0, error TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_results (
           token TEXT PRIMARY KEY, payload TEXT NOT NULL, updated REAL NOT NULL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS web_scalp_ensemble_snapshots (
@@ -116,18 +123,29 @@ def _day_bounds(day,zone):
     return start,end
 
 
-def model_distribution(data,day,zone,kind,label,expected,now):
+def model_distribution(data,day,zone,kind,label,expected,now,observation=None):
     """Empirical member frequency; never calls it a calibrated probability."""
     try:
         start,end=_day_bounds(day,zone)
-        if start<=now:return None,'Местные сутки уже начались; наблюдения дня не учтены'
+        if now>=end:return None,'Местные сутки уже закончились'
+        if start<=now and observation is None:return None,'Наблюдения METAR за текущие сутки недоступны'
         h=data['hourly'];times=h['time'];unit=data.get('hourly_units',{}).get('temperature_2m')
         if unit not in ('°C','C','celsius'):return None,'Единицы модели не подтверждены'
         if kind not in ('max','min') or not isinstance(times,list) or not 1<=len(times)<=120:return None,'Некорректные часы модели'
         if any(type(t) not in (int,float) or not math.isfinite(t) for t in times):return None,'Некорректные часы модели'
-        indices=[i for i,t in enumerate(times) if start<=t<end]
-        ts=[times[i] for i in indices]
-        if len(ts)!=int((end-start)//3600) or any(b-a!=3600 for a,b in zip(ts,ts[1:])):return None,'Модель не покрывает все местные сутки'
+        if any(b-a!=3600 for a,b in zip(times,times[1:])):return None,'Некорректный шаг часов модели'
+        if start>now:
+            indices=[i for i,t in enumerate(times) if start<=t<end]
+            if len(indices)!=int((end-start)//3600):return None,'Модель не покрывает все местные сутки'
+            left=right=None
+        else:
+            # Include interpolated values at now and at the day boundary. Never
+            # use a model extreme from earlier in the day as a future forecast.
+            left=bisect.bisect_right(times,now)-1;right=bisect.bisect_left(times,end)
+            if left<0 or right>=len(times) or left>=right:return None,'Модель не покрывает остаток местных суток'
+            indices=list(range(left,right+1))
+            if not isinstance(observation,dict) or type(observation.get('temp')) not in (int,float) or not math.isfinite(observation['temp']):
+                return None,'Наблюдения METAR за текущие сутки недоступны'
         bounds=opportunity_scan.temperature_range(label)
         match=re.search(r'[°º]\s*([CF])',label or '',re.I)
         if bounds is None or not match:return None,'Границы исхода не распознаны'
@@ -146,6 +164,12 @@ def model_distribution(data,day,zone,kind,label,expected,now):
             if not isinstance(values,list) or len(values)!=len(times):continue
             selected=[values[i] for i in indices]
             if any(type(x) not in (int,float) or not math.isfinite(x) or not -150<=x<=150 for x in selected):continue
+            if left is not None:
+                def interpolate(t,a,b):
+                    return values[a]+(values[b]-values[a])*(t-times[a])/(times[b]-times[a])
+                at_now=values[left] if times[left]==now else interpolate(now,left,left+1)
+                at_end=values[right] if times[right]==end else interpolate(end,right-1,right)
+                selected=[at_now,at_end]+[values[i] for i in indices if now<times[i]<end]+[observation['temp']]
             complete.append((max if kind=='max' else min)(selected))
         # Missing members can bias tails; report failure rather than inventing certainty.
         if len(complete)<math.ceil(expected*.9):return None,f'Неполные участники модели: {len(complete)} из {expected}'
@@ -153,7 +177,7 @@ def model_distribution(data,day,zone,kind,label,expected,now):
         n=len(complete)
         return {'yes_count':hits,'no_count':n-hits,'members':n,'expected':expected,
                 'yes':hits/n,'no':(n-hits)/n,'min_c':min(complete),'max_c':max(complete),
-                'margin':f"0.5 °{match.group(1).upper()}", 'local_start':start},None
+                'margin':f"0.5 °{match.group(1).upper()}", 'local_start':start,'local_end':end},None
     except (KeyError,TypeError,ValueError,OverflowError,OSError):return None,'Некорректные данные модели или часовой пояс'
 
 
@@ -197,7 +221,7 @@ def _refresh_station(station,now,days=None):
     if days is not None:
         future=False
         for day in days:
-            try:future=future or _day_bounds(day,zone)[0]>now
+            try:future=future or _day_bounds(day,zone)[1]>now
             except (ValueError,TypeError,OverflowError):pass
         if not future:return coords,None
     for name,(model,expected) in MODELS.items():
@@ -218,7 +242,83 @@ def _refresh_station(station,now,days=None):
              (station,name,payload,current if payload else None,lat,lon,current+(TTL if payload else RETRY),error))
             if throttled:c.execute('UPDATE web_scalp_ensemble_control SET blocked_until=MAX(blocked_until,?) WHERE id=1',(current+RETRY,))
         if throttled:break
+    if days is not None:
+        for day in days:
+            try:
+                start,end=_day_bounds(day,zone)
+                if start<=now<end:
+                    _refresh_metar(station,now);break
+            except (ValueError,TypeError,OverflowError):pass
     return (lat,lon,zone),None
+
+
+def _refresh_metar(station,now):
+    """Fetch one station independently of saved stations or the trading ledger."""
+    with db.get_db() as c:row=c.execute('SELECT next_attempt FROM web_scalp_ensemble_metar WHERE station=?',(station,)).fetchone()
+    if row and now<row['next_attempt']:return
+    response=None;payload=None;error=None
+    try:
+        if time.time()<utils._AWC_STATE['blocked_until'] or not utils.AWC_LIMITER.allow():raise ValueError('rate limited')
+        response=utils.SESSION.get(metar_archive.URL,params={'ids':station,'format':'json','hours':48},
+            timeout=(3,8),headers=scalp_forecast.AGENT,stream=True)
+        if response.status_code in (403,429):utils._awc_penalty(response.status_code)
+        if response.status_code==204:data=[]
+        else:
+            response.raise_for_status();parts=[];size=0;started=time.monotonic()
+            for chunk in response.iter_content(65536):
+                size+=len(chunk)
+                if size>metar_archive.MAX_BYTES or time.monotonic()-started>12:raise ValueError('oversized or slow response')
+                parts.append(chunk)
+            data=json.loads(b''.join(parts))
+        if not isinstance(data,list) or len(data)>=metar_archive.PAGE_LIMIT:raise ValueError('incomplete METAR')
+        # Conflicting duplicates may be corrections; don't guess which is final.
+        seen={}
+        for item in data:
+            if not isinstance(item,dict) or str(item.get('icaoId','')).upper()!=station:continue
+            t=item.get('obsTime');v=item.get('temp')
+            if type(t) in (int,float) and type(v) in (int,float) and math.isfinite(t) and math.isfinite(v):
+                if t in seen and seen[t]!=v:raise ValueError('ambiguous METAR correction')
+                seen[t]=v
+        finished=time.time()
+        rows=metar_archive.parse_reports(data,station,finished)
+        points=[[r[1],r[2]] for r in rows if r[2] is not None]
+        if not points:raise ValueError('no METAR temperatures')
+        payload=json.dumps(points,separators=(',',':'),allow_nan=False)
+        utils._awc_ok()
+    except Exception:error='Наблюдения METAR недоступны или неполны'
+    finally:
+        if response is not None:response.close()
+    finished=time.time()
+    with db.get_db() as c:
+        c.execute('''INSERT INTO web_scalp_ensemble_metar(station,payload,fetched,next_attempt,error) VALUES(?,?,?,?,?)
+          ON CONFLICT(station) DO UPDATE SET payload=excluded.payload,fetched=excluded.fetched,
+          next_attempt=excluded.next_attempt,error=excluded.error''',
+          (station,payload,finished if payload else None,finished+METAR_REFRESH,error))
+
+
+def _metar_observation(row,start,end,now,kind):
+    """Validate timestamps and gaps before using intraday station observations."""
+    if not row or not row.get('payload') or not row.get('fetched'):
+        return None,(row or {}).get('error') or 'Ожидание наблюдений METAR'
+    fetched=row['fetched']
+    if type(fetched) not in (int,float) or not 0<=now-fetched<=METAR_MAX_AGE:
+        return None,'Наблюдения METAR устарели'
+    try:
+        data=json.loads(row['payload']) if isinstance(row['payload'],str) else row['payload']
+        points=[]
+        for entry in data:
+            t,v=entry
+            if type(t) not in (int,float) or type(v) not in (int,float) or not math.isfinite(t) or not math.isfinite(v) or not -150<=v<=150:continue
+            if start<=t<end and t<=now:points.append((t,v))
+        points.sort()
+        if not points:return None,'Нет наблюдений METAR с начала местных суток'
+        if points[0][0]-start>METAR_GAP or now-points[-1][0]>METAR_GAP or any(b[0]-a[0]>METAR_GAP for a,b in zip(points,points[1:])):
+            return None,'Наблюдения METAR неполны или давно не обновлялись'
+        point=(max if kind=='max' else min)(points,key=lambda p:p[1])
+        return {'temp':point[1],'extreme':kind,'extreme_at':point[0],
+                'last_observation':points[-1][0],'first_observation':points[0][0],
+                'count':len(points),'fetched_at':fetched},None
+    except (TypeError,ValueError,OverflowError):return None,'Некорректные наблюдения METAR'
 
 
 def _quote(book,now,fee_rate):
@@ -230,21 +330,41 @@ def _quote(book,now,fee_rate):
     except (ValueError,TypeError,KeyError,IndexError,OverflowError):return None
 
 
-def _evaluate(item,coords,reason,now,fee_rate,model_cache=None):
+def _evaluate(item,coords,reason,now,fee_rate,model_cache=None,metar_cache=None,observation_cache=None):
     station=item.get('station');day=item.get('date');kind=item.get('extreme')
     result={k:item.get(k) for k in ('token','position_id','opened','condition_id','event_slug','title','label','station','date','extreme')}
     result['observed_at']=now;result['models']=[];result['quote']=_quote(item.get('book'),now,fee_rate)
     if not coords:
         result['reason']=reason or 'Станция разрешения неизвестна';return result
     result['timezone']=coords[2]
+    obs=None;obs_reason=None
+    try:
+        start,end=_day_bounds(day,coords[2])
+        if kind not in ('max','min'):obs_reason='Неизвестен тип температурного события'
+        elif now>=end:obs_reason='Местные сутки уже закончились'
+        elif now>=start:
+            key=(station,day,kind)
+            if observation_cache is not None and key in observation_cache:
+                obs,obs_reason=observation_cache[key]
+            else:
+                if metar_cache is None:
+                    with db.get_db() as c:record=c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',(station,)).fetchone()
+                    metar_row=dict(record) if record else {}
+                else:metar_row=metar_cache.get(station,{})
+                obs,obs_reason=_metar_observation(metar_row,start,end,now,kind)
+                if observation_cache is not None:observation_cache[key]=(obs,obs_reason)
+            if obs:result['observation']=obs
+    except (ValueError,TypeError,OverflowError,OSError):obs_reason='Неизвестны местные сутки или часовой пояс'
     for name,(_,expected) in MODELS.items():
         row=model_cache.get((station,name),{}) if model_cache is not None else _load_cache(station,name)
         entry={'name':name,'fetched_at':row.get('fetched')}
         try:
-            if not row.get('payload') or not row.get('fetched') or (row.get('lat'),row.get('lon'))!=tuple(coords[:2]) or not 0<=now-row['fetched']<=TTL:
+            if obs_reason:
+                entry['reason']=obs_reason
+            elif not row.get('payload') or not row.get('fetched') or (row.get('lat'),row.get('lon'))!=tuple(coords[:2]) or not 0<=now-row['fetched']<=TTL:
                 entry['reason']=row.get('error') or 'Ожидается обновление модели'
             else:
-                distribution,error=model_distribution(row['payload'] if isinstance(row['payload'],dict) else json.loads(row['payload']),day,coords[2],kind,item.get('label'),expected,now)
+                distribution,error=model_distribution(row['payload'] if isinstance(row['payload'],dict) else json.loads(row['payload']),day,coords[2],kind,item.get('label'),expected,now,obs)
                 if error:entry['reason']=error
                 else:
                     entry.update(distribution)
@@ -272,9 +392,15 @@ def capture_entry(connection,position_id,item):
     models=[]
     for model in value.get('models',[]):
         model=dict(model);no=model.get('no');fetched=model.get('fetched_at');start=model.get('local_start')
+        end=model.get('local_end');obs=value.get('observation');evaluated=value.get('observed_at')
+        timeline=(type(start) in (int,float) and (start>now or
+            (type(end) in (int,float) and start<=now<end and isinstance(obs,dict) and
+             type(evaluated) in (int,float) and start<=evaluated<=now and
+             type(obs.get('fetched_at')) in (int,float) and 0<=now-obs['fetched_at']<=METAR_MAX_AGE and obs['fetched_at']<=evaluated and
+             type(obs.get('last_observation')) in (int,float) and 0<=now-obs['last_observation']<=METAR_GAP and obs['last_observation']<=obs['fetched_at'])))
         valid=(type(no) in (int,float) and math.isfinite(no) and 0<=no<=1 and
                type(fetched) in (int,float) and 0<=now-fetched<=TTL and
-               type(start) in (int,float) and start>now)
+               timeline)
         if not valid:
             model.pop('yes',None);model.pop('no',None);model.pop('gross_edge',None);model.pop('net_hold_edge',None)
             model['reason']='Модель недоступна или устарела на момент входа'
@@ -315,6 +441,7 @@ def overview(event,now=None):
         location=c.execute('SELECT lat,lon,payload,station_expires FROM web_scalp_forecast_cache WHERE code=?',(station,)).fetchone()
         rows=c.execute('SELECT * FROM web_scalp_ensemble_cache WHERE station=?',(station,)).fetchall()
         control=c.execute('SELECT last_run,blocked_until FROM web_scalp_ensemble_control WHERE id=1').fetchone()
+        metar=c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',(station,)).fetchone()
     coords=None
     try:
         zone=json.loads(location['payload'] or '{}')['open']['timezone'] if location and location['station_expires']>now else None
@@ -327,10 +454,7 @@ def overview(event,now=None):
             if entry.get('payload'):entry['payload']=json.loads(entry['payload'])
         except (ValueError,TypeError):entry['payload']=None;entry['error']='Некорректные данные модели'
         cache[(entry['station'],entry['model'])]=entry
-    started=False
-    if coords:
-        try:started=_day_bounds(day,coords[2])[0]<=now
-        except (ValueError,TypeError,OverflowError):pass
+    metar_cache={station:dict(metar)} if metar else {};obs_cache={}
     outcomes=[];seen=set();markets=event.get('markets',[])
     if not isinstance(markets,list):markets=[]
     for market in markets[:100]:
@@ -339,10 +463,8 @@ def overview(event,now=None):
         if not isinstance(label,str) or len(label)>200 or not pair or pair[0]['no'] in seen:continue
         seen.add(pair[0]['no'])
         item={'token':pair[0]['no'],'station':station,'date':day,'extreme':kind,'label':label}
-        result=_evaluate(item,coords,'Ожидание координат и часового пояса станции',now,0,cache)
+        result=_evaluate(item,coords,'Ожидание координат и часового пояса станции',now,0,cache,metar_cache,obs_cache)
         result['token_yes']=pair[0]['yes']
-        if started:
-            result['models']=[{'name':name,'reason':'Местные сутки уже начались; наблюдения дня не учтены'} for name in MODELS]
         outcomes.append(result)
     # A token appearing twice is ambiguous; never attach its estimate to a row.
     counts={}
@@ -355,6 +477,8 @@ def overview(event,now=None):
 
 
 def _prune(connection,now):
+    connection.execute('DELETE FROM web_scalp_ensemble_metar WHERE next_attempt<?',(now-RETAIN,))
+    connection.execute('DELETE FROM web_scalp_ensemble_metar WHERE station NOT IN (SELECT station FROM web_scalp_ensemble_metar ORDER BY next_attempt DESC LIMIT 100)')
     connection.execute('DELETE FROM web_scalp_ensemble_views WHERE touched<?',(now-VIEW_LEASE,))
     connection.execute('DELETE FROM web_scalp_ensemble_results WHERE updated<?',(now-RETAIN,))
     connection.execute('DELETE FROM web_scalp_ensemble_snapshots WHERE captured<?',(now-RETAIN,))
@@ -404,7 +528,7 @@ def run_once(now=None):
     except (TypeError,ValueError):rate='0.05'
     station_items=items+[{'station':v['station'],'date':v['day']} for v in views]
     stations=list(dict.fromkeys(x.get('station') for x in station_items if isinstance(x.get('station'),str) and re.fullmatch(r'[A-Z][A-Z0-9]{3}',x['station'])))
-    coords_by_station={};reasons={};model_cache={}
+    coords_by_station={};reasons={};model_cache={};metar_cache={}
     if stations:
         # One read transaction instead of hundreds of connections when many
         # candidates share stations. No network or computation inside it.
@@ -412,37 +536,43 @@ def run_once(now=None):
         with db.get_db() as c:
             locations=c.execute(f'SELECT code,lat,lon,payload,station_expires FROM web_scalp_forecast_cache WHERE code IN ({marks})',stations).fetchall()
             cached=c.execute(f'SELECT * FROM web_scalp_ensemble_cache WHERE station IN ({marks})',stations).fetchall()
+            metars=c.execute(f'SELECT * FROM web_scalp_ensemble_metar WHERE station IN ({marks})',stations).fetchall()
         for row in locations:
             try:
                 zone=json.loads(row['payload'] or '{}')['open']['timezone'] if row['station_expires']>now else None
                 if row['lat'] and row['lon'] and scalp_forecast.forecast_ensemble.valid_timezone(zone):coords_by_station[row['code']]=(row['lat'],row['lon'],zone)
             except (KeyError,ValueError,TypeError):pass
         model_cache={(row['station'],row['model']):dict(row) for row in cached}
+        metar_cache={row['station']:dict(row) for row in metars}
     chosen=None
     if stations:
         # Round-robin prevents one busy market starving other stations.
         for offset in range(len(stations)):
             i=(_cursor+offset)%len(stations);code=stations[i];coords=coords_by_station.get(code)
+            current=False
             if coords:
                 future=False
                 for item in station_items:
                     if item.get('station')!=code:continue
-                    try:future=future or _day_bounds(item.get('date'),coords[2])[0]>now
+                    try:
+                        start,end=_day_bounds(item.get('date'),coords[2]);future=future or end>now;current=current or start<=now<end
                     except (ValueError,TypeError,OverflowError):pass
                 if not future:continue
-            if any(now>=model_cache.get((code,name),{}).get('next_attempt',0) for name in MODELS):
+            if (any(now>=model_cache.get((code,name),{}).get('next_attempt',0) for name in MODELS) or
+                (current and now>=metar_cache.get(code,{}).get('next_attempt',0))):
                 chosen=code;_cursor=(i+1)%len(stations);break
     if chosen:
-        with db.get_db() as c:blocked=c.execute('SELECT blocked_until FROM web_scalp_ensemble_control WHERE id=1').fetchone()[0]
-        if now>=blocked:
-            try:coords_by_station[chosen],reasons[chosen]=_refresh_station(chosen,now,[x.get('date') for x in station_items if x.get('station')==chosen])
-            except Exception:coords_by_station[chosen]=None;reasons[chosen]='Не удалось обновить ансамбль'
-            with db.get_db() as c:updated=c.execute('SELECT * FROM web_scalp_ensemble_cache WHERE station=?',(chosen,)).fetchall()
-            for row in updated:model_cache[(chosen,row['model'])]=dict(row)
+        try:coords_by_station[chosen],reasons[chosen]=_refresh_station(chosen,now,[x.get('date') for x in station_items if x.get('station')==chosen])
+        except Exception:coords_by_station[chosen]=None;reasons[chosen]='Не удалось обновить ансамбль'
+        with db.get_db() as c:
+            updated=c.execute('SELECT * FROM web_scalp_ensemble_cache WHERE station=?',(chosen,)).fetchall()
+            metar=c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',(chosen,)).fetchone()
+        for row in updated:model_cache[(chosen,row['model'])]=dict(row)
+        if metar:metar_cache[chosen]=dict(metar)
     observed=time.time() if live else now
-    records=[];snapshots=[]
+    records=[];snapshots=[];observation_cache={}
     for item in items:
-        code=item.get('station');result=_evaluate(item,coords_by_station.get(code),reasons.get(code),observed,rate,model_cache)
+        code=item.get('station');result=_evaluate(item,coords_by_station.get(code),reasons.get(code),observed,rate,model_cache,metar_cache,observation_cache)
         encoded=json.dumps(result,ensure_ascii=True,allow_nan=False,separators=(',',':'))
         records.append((item['token'],encoded,observed))
         if item.get('position_id') and any('no' in m for m in result['models']) and observed>=item['opened']:

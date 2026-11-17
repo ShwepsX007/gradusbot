@@ -341,6 +341,19 @@ async function loadOverviewEnsemble(){
   }catch(e){if(seq!==ensembleSeq||viewEpoch!==weatherViewEpoch||slug!==state.market||!overviewActive())return;overviewEnsemble={slug,error:e.message}}
   finally{if(seq===ensembleSeq){ensembleLoading=false;if(slug===state.market&&overviewActive())renderOverviewEnsemble()}}
 }
+function ensembleMetarText(obs){
+  if(!obs||!Number.isFinite(Number(obs.temp)))return '';
+  const c=Number(obs.temp),which=obs.extreme==='min'?'минимум':'максимум';
+  return `METAR · ${which} ${prettyNumber(c)}°C / ${prettyNumber(c*9/5+32)}°F (${copyTime(obs.extreme_at)}) · последнее наблюдение ${copyTime(obs.last_observation)}`;
+}
+function ensembleCurrent(m,row,now){
+  const stamp=Number(m.fetched_at),start=Number(m.local_start),end=m.local_end==null?null:Number(m.local_end);
+  if(!Number.isFinite(stamp)||stamp<=0||now<stamp||now-stamp>21600||!Number.isFinite(start)||start<=0)return false;
+  if(end!==null&&(!Number.isFinite(end)||now>=end))return false;
+  if(start>now)return true;
+  const obs=row?.observation,at=Number(row?.observed_at),fetched=Number(obs?.fetched_at),last=Number(obs?.last_observation);
+  return end!==null&&!!obs&&Number.isFinite(at)&&start<=at&&at<=now&&now-at<=360&&Number.isFinite(fetched)&&0<=now-fetched&&now-fetched<=900&&Number.isFinite(last)&&0<=now-last&&now-last<=7200;
+}
 function renderOverviewEnsemble(){
   const data=overviewEnsemble?.slug===state.market?overviewEnsemble:null,now=Date.now()/1000;
   let status=data?.error||data?.reason||(!data?'ожидание данных':`${data.station||'станция неизвестна'} · ${data.date||'дата неизвестна'} · ${data.timezone||'часовой пояс ожидается'}`);
@@ -352,10 +365,11 @@ function renderOverviewEnsemble(){
     const messages=[];
     if(row?.reason)messages.push(row.reason);
     else if(row&&Array.isArray(row.models)&&row.models.length){
+      if(row.observation)messages.push(ensembleMetarText(row.observation));
       for(const m of row.models){
-        const stamp=Number(m.fetched_at),start=Number(m.local_start);
+        const stamp=Number(m.fetched_at);
         if(m.reason)messages.push(`${m.name}: ${m.reason}`);
-        else if(!Number.isFinite(stamp)||!Number.isFinite(start)||now<stamp||now-stamp>21600||start<=now)messages.push(`${m.name}: данные устарели или сутки начались`);
+        else if(!ensembleCurrent(m,row,now))messages.push(`${m.name}: данные устарели или сутки закончились`);
         else if(Number.isInteger(m.members)&&m.members>0&&Number.isInteger(m.yes_count)&&Number.isInteger(m.no_count)&&m.yes_count+m.no_count===m.members){
           const pct=v=>new Intl.NumberFormat('ru-RU',{maximumFractionDigits:1}).format(v*100)+'%';
           messages.push(`${m.name}: YES ${pct(m.yes_count/m.members)} (${m.yes_count}/${m.members}), NO ${pct(m.no_count/m.members)} (${m.no_count}/${m.members}) · ${new Date(stamp*1000).toLocaleString('ru-RU')}`);
@@ -1434,11 +1448,11 @@ function scalpForecastDetail(info){
 }
 function scalpEnsembleModel(m,observed,quote){
   if(m.no==null||!Number.isFinite(Number(m.no)))return `<small>${esc(m.name)}: ${esc(m.reason||'нет данных')}</small>`;
-  const begun=Number(m.local_start)*1000<=Date.now();
+  const current=ensembleCurrent(m,observed,Date.now()/1000),historical=!!observed.historical;
   let edge='';
-  if(!observed.stale&&!begun&&quote&&Date.now()/1000-Number(quote.fetched_at)<=120&&Date.now()/1000>=Number(quote.fetched_at)&&Number.isFinite(Number(m.gross_edge))&&Number.isFinite(Number(m.net_hold_edge)))
+  if(!observed.stale&&current&&!historical&&quote&&Date.now()/1000-Number(quote.fetched_at)<=120&&Date.now()/1000>=Number(quote.fetched_at)&&Number.isFinite(Number(m.gross_edge))&&Number.isFinite(Number(m.net_hold_edge)))
     edge=` · к ASK ${esc(scalpNumber(Number(m.gross_edge)*100))} п.п. до комиссии / ${esc(scalpNumber(Number(m.net_hold_edge)*100))} п.п. с оценкой комиссии входа, при удержании до разрешения`;
-  return `<small>${esc(m.name)}: YES ${esc(scalpNumber(Number(m.yes)*100))}% (${esc(m.yes_count)}/${esc(m.members)}), NO ${esc(scalpNumber(Number(m.no)*100))}% (${esc(m.no_count)}/${esc(m.members)})${edge} · получено ${esc(copyTime(m.fetched_at))}${begun?' · сутки начались: только историческая оценка':''}</small>`;
+  return `<small>${esc(m.name)}: YES ${esc(scalpNumber(Number(m.yes)*100))}% (${esc(m.yes_count)}/${esc(m.members)}), NO ${esc(scalpNumber(Number(m.no)*100))}% (${esc(m.no_count)}/${esc(m.members)})${edge} · получено ${esc(copyTime(m.fetched_at))}${historical?' · исторический снимок':!current?' · оценка устарела':''}</small>`;
 }
 function scalpEnsembleRender(observation){
   const control=observation.control||{},rows=Array.isArray(observation.results)?observation.results:[],last=control.last_run;
@@ -1446,14 +1460,14 @@ function scalpEnsembleRender(observation){
   $('#scalp-ensemble').innerHTML=rows.length?rows.map(row=>{
     const q=row.quote,quote=q?`ASK NO ${scalpNumber(q.ask)} pUSD · ${scalpNumber(q.size)} долей · снимок ${copyTime(q.fetched_at)}${Date.now()/1000-Number(q.fetched_at)>120?' · котировка устарела':''} · оценочная комиссия входа ${scalpNumber(q.fee_per_share)} pUSD/долю`: 'Свежий ASK NO не получен; разница не рассчитана.';
     const models=Array.isArray(row.models)?row.models:[];
-    return `<article class="scalp-row"><b>${esc(row.title||'Рынок')} · ${esc(row.label||'—')} · NO ${row.position_id?'· демо-позиция':'· кандидат'}</b><small>${esc(row.station||'Станция неизвестна')} · ${esc(row.date||'дата неизвестна')} · ${esc(row.timezone||'часовой пояс неизвестен')} · ${esc(copyTime(row.observed_at))}</small>${row.stale?'<small class="scalp-warning">Снимок устарел; значения не использовать как текущие.</small>':''}<small>${esc(row.reason||quote)}</small>${models.map(m=>scalpEnsembleModel(m,row,q)).join('')}<small>Границы расширены на 0,5° единицы рынка как приближение; часовые значения могут быть интерполированы. Это не проверенное преимущество и не гарантия результата.</small>${copyEventLink(row.event_slug)} ${quickOpenButton(row.event_slug,row.token,row.condition_id)}</article>`;
+    return `<article class="scalp-row"><b>${esc(row.title||'Рынок')} · ${esc(row.label||'—')} · NO ${row.position_id?'· демо-позиция':'· кандидат'}</b><small>${esc(row.station||'Станция неизвестна')} · ${esc(row.date||'дата неизвестна')} · ${esc(row.timezone||'часовой пояс неизвестен')} · ${esc(copyTime(row.observed_at))}</small>${row.stale?'<small class="scalp-warning">Снимок устарел; значения не использовать как текущие.</small>':''}<small>${esc(row.reason||quote)}</small>${row.observation?`<small>${esc(ensembleMetarText(row.observation))}</small>`:''}${models.map(m=>scalpEnsembleModel(m,row,q)).join('')}<small>Границы расширены на 0,5° единицы рынка как приближение; часовые значения могут быть интерполированы. Это не проверенное преимущество и не гарантия результата.</small>${copyEventLink(row.event_slug)} ${quickOpenButton(row.event_slug,row.token,row.condition_id)}</article>`;
   }).join(''):'Пока нет подходящих открытых демо-позиций или кандидатов с данными наблюдателя.';
 }
 function scalpEntrySnapshot(info){
   if(!info)return '';
   const models=Array.isArray(info.models)?info.models:[];
   const exact=info.snapshot_kind==='at_entry',stamp=info.captured_at||info.observed_at;
-  return `<small>${exact?'Снимок, доступный на момент демо-входа':'Первый доступный снимок после входа (не оценка на момент покупки)'}: ${esc(copyTime(stamp))} · модель получена ранее.</small>${models.map(m=>scalpEnsembleModel(m,{stale:true},null)).join('')}`;
+  return `<small>${exact?'Снимок, доступный на момент демо-входа':'Первый доступный снимок после входа (не оценка на момент покупки)'}: ${esc(copyTime(stamp))} · модель получена ранее.</small>${info.observation?`<small>${esc(ensembleMetarText(info.observation))}</small>`:''}${models.map(m=>scalpEnsembleModel(m,{stale:true,historical:true},null)).join('')}`;
 }
 function scalpChart(journal){
   const sells=journal.filter(x=>x.kind==='SELL'&&x.pnl!==null&&Number.isFinite(Number(x.pnl))).slice().reverse();

@@ -41,10 +41,10 @@ class EnsembleTests(unittest.TestCase):
         result,error=ens.model_distribution(self.ec,self.day,'UTC','max','33°C',51,self.now)
         self.assertIsNone(result);self.assertIn('Неполные',error)
         result,error=ens.model_distribution(self.gf,self.day,'UTC','max','33°C',31,self.start+1)
-        self.assertIsNone(result);self.assertIn('сутки уже начались',error)
+        self.assertIsNone(result);self.assertIn('METAR',error)
         self.gf['hourly']['time'][10]+=1
         result,error=ens.model_distribution(self.gf,self.day,'UTC','max','33°C',31,self.now)
-        self.assertIsNone(result);self.assertIn('сутки',error)
+        self.assertIsNone(result);self.assertIn('часов',error)
     def test_dst_and_half_hour_zone(self):
         for day,zone in [('2027-03-28','Europe/London'),('2027-10-31','Europe/London'),('2027-06-01','Asia/Kolkata')]:
             start,end=ens._day_bounds(day,zone);base=int(start//3600*3600)-3600
@@ -128,7 +128,7 @@ class EnsembleTests(unittest.TestCase):
         del event['description'];event['markets'].append(dict(event['markets'][0]))
         self.assertEqual([o['token'] for o in ens.overview(event,self.now)['outcomes']],['212'])
 
-    def test_view_lease_expiry_and_started_day_dont_request_models(self):
+    def test_view_lease_expiry_and_started_day_requires_metar(self):
         event=self.overview_event()
         ens.overview(event,self.now)
         with patch.object(ens,'fetch_model',side_effect=AssertionError('expired')):
@@ -136,10 +136,10 @@ class EnsembleTests(unittest.TestCase):
         with db.get_db() as c:
             c.execute('INSERT INTO web_scalp_forecast_cache(code,lat,lon,station_expires,payload) VALUES(?,?,?,?,?)',('EGLL','51','0',self.start+5000,json.dumps({'open':{'timezone':'UTC'}})))
         ens.overview(event,self.start+1)
-        with patch.object(ens,'fetch_model',side_effect=AssertionError('day started')):
+        with patch.object(ens,'fetch_model',return_value=(None,'offline',False)),patch.object(ens,'_refresh_metar'):
             ens.run_once(self.start+1)
         result=ens.overview(event,self.start+1)
-        self.assertTrue(all('сутки уже начались' in m['reason'] and 'yes' not in m for r in result['outcomes'] for m in r['models']))
+        self.assertTrue(all('METAR' in m['reason'] and 'yes' not in m for r in result['outcomes'] for m in r['models']))
 
     def test_overview_endpoint_auth_csrf_and_server_side_event(self):
         from web import app as web
@@ -195,9 +195,120 @@ class EnsembleTests(unittest.TestCase):
             ens._refresh_station('EGLL',self.now,[self.day]);ens._refresh_station('EGLL',self.now+1,[self.day])
         self.assertEqual(fetch.call_count,1)
         with db.get_db() as c:self.assertGreater(c.execute('SELECT blocked_until FROM web_scalp_ensemble_control').fetchone()[0],self.now)
-    def test_started_day_never_requests_ensemble(self):
-        with patch.object(ens,'_coordinates',return_value=(('51','0','UTC'),None)),patch.object(ens,'fetch_model') as fetch:
-            ens._refresh_station('EGLL',self.start+1,[self.day])
-        fetch.assert_not_called()
+    def test_intraday_max_min_use_observations_and_future_only(self):
+        now=self.start+12*3600+1800;data=fixture(self.start-3600,31,[30]*31)
+        # Forecast extrema from before the current instant must not leak in.
+        data['hourly']['temperature_2m'][0]=50
+        data['hourly']['temperature_2m_member01'][0]=-50
+        data['hourly']['temperature_2m_member02']=[33]*72
+        data['hourly']['temperature_2m_member03']=[28]*72
+        observed={'temp':31}
+        result,error=ens.model_distribution(data,self.day,'UTC','max','31°C',31,now,observed)
+        self.assertIsNone(error);self.assertEqual((result['yes_count'],result['no_count']),(30,1))
+        result,error=ens.model_distribution(data,self.day,'UTC','min','28°C',31,now,{'temp':29})
+        self.assertIsNone(error);self.assertEqual((result['yes_count'],result['no_count']),(1,30))
+        result,error=ens.model_distribution(data,self.day,'UTC','max','88°F',31,now,observed)
+        self.assertIsNone(error);self.assertEqual(result['yes_count'],30)
+        self.assertIsNone(ens.model_distribution(data,self.day,'UTC','max','31°C',31,now,None)[0])
+        self.assertIsNone(ens.model_distribution(data,self.day,'UTC','max','31°C',31,self.start+86400,observed)[0])
+
+    def test_intraday_boundary_interpolation_dst_and_half_hour_zone(self):
+        for day,zone in [('2027-03-28','Europe/London'),('2027-10-31','Europe/London'),('2027-06-01','Asia/Kolkata')]:
+            start,end=ens._day_bounds(day,zone);now=start+12*3600+1500
+            base=int(start//3600*3600)-3600;data=fixture(base,31,[20]*31)
+            result,error=ens.model_distribution(data,day,zone,'max','20°C',31,now,{'temp':19})
+            self.assertIsNone(error,(day,error));self.assertEqual(result['yes_count'],31)
+            # Even at the end of the day a bracketing forecast is required.
+            result,error=ens.model_distribution(data,day,zone,'max','20°C',31,end-60,{'temp':19})
+            self.assertIsNone(error,(day,error));self.assertEqual(result['yes_count'],31)
+            truncated=fixture(base,31,[20]*31)
+            h=truncated['hourly'];right=next(i for i,t in enumerate(h['time']) if t>=end)
+            for key in h:h[key]=h[key][:right]
+            result,error=ens.model_distribution(truncated,day,zone,'max','20°C',31,now,{'temp':19})
+            self.assertIsNone(result);self.assertIn('остаток',error)
+
+    def test_metar_completeness_freshness_and_times(self):
+        start=self.start;now=start+5*3600
+        points=[[start+600+i*3600,20+i] for i in range(5)]
+        row={'payload':json.dumps(points),'fetched':now-30}
+        obs,error=ens._metar_observation(row,start,start+86400,now,'max')
+        self.assertIsNone(error);self.assertEqual(obs['temp'],24);self.assertEqual(obs['last_observation'],points[-1][0]);self.assertEqual(obs['count'],5)
+        obs,error=ens._metar_observation(row,start,start+86400,now,'min');self.assertEqual(obs['temp'],20)
+        for changed in ({'payload':json.dumps(points),'fetched':now-901}, {'payload':json.dumps(points[3:]),'fetched':now},
+                        {'payload':json.dumps(points[:1]+points[3:]),'fetched':now}, {'payload':json.dumps(points[:2]),'fetched':now},
+                        {'payload':json.dumps(points),'fetched':now+1}):
+            self.assertIsNone(ens._metar_observation(changed,start,start+86400,now,'max')[0])
+
+    def test_intraday_worker_overview_snapshot_and_no_trade_effect(self):
+        now=self.start+12*3600;event=self.overview_event();prior=scalp.status()
+        with db.get_db() as c:c.execute('INSERT INTO web_scalp_forecast_cache(code,lat,lon,station_expires,payload) VALUES(?,?,?,?,?)',('EGLL','51','0',now+10000,json.dumps({'open':{'timezone':'UTC'}})))
+        def metar(code,at):
+            points=[[self.start+600+i*3600,31] for i in range(12)]
+            with db.get_db() as c:c.execute('INSERT OR REPLACE INTO web_scalp_ensemble_metar VALUES(?,?,?,?,?)',(code,json.dumps(points),now,now+300,None))
+        with patch.object(ens.time,'time',return_value=now),patch.object(ens,'fetch_model',side_effect=lambda a,b,m:(self.ec if m=='ecmwf_ifs025' else self.gf,None,False)) as fetch,patch.object(ens,'_refresh_metar',side_effect=metar) as get_metar:
+            self.assertIn('METAR',ens.overview(event)['outcomes'][0]['models'][0]['reason'])
+            ens.run_once();out=ens.overview(event)
+            self.assertEqual(fetch.call_count,2);get_metar.assert_called_once()
+            result=out['outcomes'][0];self.assertEqual(result['observation']['temp'],31)
+            self.assertEqual([x['yes_count'] for x in result['models']],[10,5])
+            self.assertEqual(scalp.status()['positions'],prior['positions']);self.assertEqual(scalp.status()['journal'],prior['journal'])
+            # Same data may be captured only when the result was available at entry.
+            item={'token':'112','condition_id':'condition','event_slug':event['slug'],'label':'33°C','station':'EGLL','date':self.day,'extreme':'max','opened':now+1,'entry_price':'.9','entry_fee':'.01','original':'5'}
+            result.update({k:item[k] for k in ('condition_id','event_slug','label','station','date','extreme')})
+            with db.get_db() as c:
+                c.execute('INSERT INTO web_scalp_ensemble_results VALUES(?,?,?)',('112',json.dumps(result),now))
+                ens.capture_entry(c,1,item)
+                saved=json.loads(c.execute('SELECT payload FROM web_scalp_ensemble_snapshots WHERE position_id=1').fetchone()['payload'])
+                self.assertEqual(saved['snapshot_kind'],'at_entry');self.assertEqual(saved['observation']['temp'],31)
+                result['observation']['fetched_at']=now+20
+                c.execute('UPDATE web_scalp_ensemble_results SET payload=? WHERE token=?',(json.dumps(result),'112'))
+                ens.capture_entry(c,2,item)
+                self.assertIsNone(c.execute('SELECT payload FROM web_scalp_ensemble_snapshots WHERE position_id=2').fetchone())
+
+    def test_metar_refresh_when_models_cached_and_provider_blocked(self):
+        now=self.start+12*3600;event=self.overview_event()
+        with db.get_db() as c:
+            c.execute('INSERT INTO web_scalp_forecast_cache(code,lat,lon,station_expires,payload) VALUES(?,?,?,?,?)',('EGLL','51','0',now+10000,json.dumps({'open':{'timezone':'UTC'}})))
+            c.execute('UPDATE web_scalp_ensemble_control SET blocked_until=?',(now+1800,))
+            for name,payload in [('ECMWF IFS',self.ec),('GEFS',self.gf)]:
+                c.execute('INSERT INTO web_scalp_ensemble_cache(station,model,payload,fetched,lat,lon,next_attempt) VALUES(?,?,?,?,?,?,?)',('EGLL',name,json.dumps(payload),now-60,'51','0',now+3600))
+        with patch.object(ens.time,'time',return_value=now),patch.object(ens,'fetch_model',side_effect=AssertionError('models cached')),patch.object(ens,'_refresh_metar') as metar:
+            ens.overview(event);ens.run_once();metar.assert_called_once()
+
+    def test_metar_network_failure_blocks_fabricated_data_and_retries(self):
+        now=self.now
+        with patch.object(ens.utils,'_AWC_STATE',{'blocked_until':0,'strikes':0,'last_error':''}),patch.object(ens.utils.AWC_LIMITER,'allow',return_value=True),patch.object(ens.utils.SESSION,'get',side_effect=RuntimeError('offline')) as get:
+            ens._refresh_metar('EGLL',now);ens._refresh_metar('EGLL',now+1);self.assertEqual(get.call_count,1)
+        with db.get_db() as c:
+            row=dict(c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',('EGLL',)).fetchone())
+            self.assertIsNone(row['payload']);self.assertIsNone(ens._metar_observation(row,now-3600,now+86400,now,'max')[0])
+
+    def test_metar_network_fetch_limits_and_conflicting_corrections(self):
+        now=self.now;start=now-3600
+        class Response:
+            status_code=200
+            def __init__(self,data):self.data=data
+            def raise_for_status(self):pass
+            def iter_content(self,n):yield json.dumps(self.data).encode()
+            def close(self):pass
+        data=[{'icaoId':'EGLL','obsTime':int(start),'temp':12},{'icaoId':'EGLL','obsTime':int(now-60),'temp':13}]
+        with patch.object(ens.utils,'_AWC_STATE',{'blocked_until':0,'strikes':0,'last_error':''}),patch.object(ens.utils.AWC_LIMITER,'allow',return_value=True),patch.object(ens.utils.SESSION,'get',return_value=Response(data)) as get:
+            ens._refresh_metar('EGLL',now);ens._refresh_metar('EGLL',now+1)
+            self.assertEqual(get.call_count,1)
+            self.assertEqual(get.call_args.kwargs['params'],{'ids':'EGLL','format':'json','hours':48})
+        with db.get_db() as c:
+            row=dict(c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',('EGLL',)).fetchone())
+            self.assertEqual(len(json.loads(row['payload'])),2)
+        conflict=data+[{'icaoId':'EGLL','obsTime':int(now-60),'temp':14}]
+        with patch.object(ens.utils,'_AWC_STATE',{'blocked_until':0,'strikes':0,'last_error':''}),patch.object(ens.utils.AWC_LIMITER,'allow',return_value=True),patch.object(ens.utils.SESSION,'get',return_value=Response(conflict)):
+            ens._refresh_metar('EGLL',now+301)
+        with db.get_db() as c:
+            row=c.execute('SELECT * FROM web_scalp_ensemble_metar WHERE station=?',('EGLL',)).fetchone()
+            self.assertIsNone(row['payload']);self.assertIn('неполны',row['error'])
+
+    def test_started_day_requests_models_and_metar_and_expired_day_does_not(self):
+        with patch.object(ens,'_coordinates',return_value=(('51','0','UTC'),None)),patch.object(ens,'fetch_model',return_value=(None,'offline',False)) as fetch,patch.object(ens,'_refresh_metar') as metar:
+            ens._refresh_station('EGLL',self.start+1,[self.day]);self.assertEqual(fetch.call_count,2);metar.assert_called_once()
+            fetch.reset_mock();metar.reset_mock();ens._refresh_station('EGLL',self.start+86401,[self.day]);fetch.assert_not_called();metar.assert_not_called()
 
 if __name__=='__main__':unittest.main()
